@@ -134,7 +134,7 @@ def main():
                 print(f"Error: External rules file '{args.rules_file}' not found. Exiting.")
                 sys.exit(1)
                 
-            # FIX: Use 'latin-1' encoding instead of 'utf-8' to prevent decoding errors
+            # Use 'latin-1' encoding instead of 'utf-8' to prevent decoding errors
             with open(args.rules_file, 'r', encoding='latin-1') as f:
                 external_rules = [line.strip() for line in f if line.strip() and not line.startswith('#')]
             
@@ -552,7 +552,7 @@ def main():
         words_to_process_file_in = f"words_to_process_d{current_depth}.tmp"
         words_to_process_file_out = f"words_to_process_d{current_depth+1}.tmp"
         
-        # --- START ZMIENIONEJ LOGIKI ŁADOWANIA SŁÓW DLA D > 1 ---
+        # --- START MODIFIED LOGIC FOR LOADING WORDS FOR D > 1 ---
         if current_depth > 1 and os.path.exists(words_to_process_file_in):
             words_with_chains = [] # Reset for the new depth
             print(f"Loading words and previous chains from temporary file: {words_to_process_file_in}")
@@ -567,12 +567,12 @@ def main():
                 print(f"Error reading temporary file: {e}. Stopping.")
                 break
 
-        # Słowa do przetworzenia w tej partii (tylko słowa, GPU nie widzi łańcuchów)
+        # Words to process in this batch (only words, GPU does not see chains)
         words_to_process = [word for word, chain in words_with_chains]
-        # Mapa do łączenia łańcuchów PO przetworzeniu GPU
+        # Map for combining chains AFTER GPU processing
         word_to_chain_map = {word: chain for word, chain in words_with_chains}
 
-        # --- KONIEC ZMIENIONEJ LOGIKI ŁADOWANIA SŁÓW ---
+        # --- END MODIFIED LOGIC FOR LOADING WORDS ---
         
         if not words_to_process:
             if current_depth > 1:
@@ -617,7 +617,7 @@ def main():
                                         np.uint32(max_word_len),
                                         np.uint32(max_rule_len_padded + 1), 
                                         np.uint32(max_output_len_padded))
-                                            
+                                                
                     # Get results back from GPU
                     host_results_flat = np.zeros(global_size * max_output_len_padded, dtype=np.uint8)
                     cl.enqueue_copy(queue, host_results_flat, result_buf).wait()
@@ -633,35 +633,35 @@ def main():
                         except UnicodeDecodeError:
                             transformed_word = None
                             
-                        # --- START ZMIENIONEJ LOGIKI REJESTROWANIA WYNIKÓW ---
+                        # --- START MODIFIED LOGIC FOR RESULT REGISTRATION ---
                         if transformed_word and transformed_word in word_set:
                             base_word_idx = j // num_rules
                             rule_idx = j % num_rules
                             base_word = batch_words[base_word_idx]
                             new_rule = all_rules[rule_idx]
 
-                            # Pobierz poprzedni łańcuch reguł i utwórz pełny łańcuch
+                            # Get the previous rule chain and create the full chain
                             previous_chain = word_to_chain_map.get(base_word, "")
                             
-                            # Utwórz pełny łańcuch dla znalezionego trafienia: R1 R2... Rn
+                            # Create the full chain for the found hit: R1 R2... Rn
                             if previous_chain:
                                 full_chain = f"{previous_chain} {new_rule}"
                             else:
                                 full_chain = new_rule
                             
-                            # Warunek: upewnij się, że słowo faktycznie się zmieniło
+                            # Condition: ensure the word was actually changed
                             if transformed_word != base_word:
                                 # Count only unique hits for the FULL CHAIN
                                 extracted_rules_with_hits[full_chain] += 1
                                 
-                                # Sprawdzanie, czy słowo powinno być użyte w następnej głębokości
+                                # Check if the word should be used in the next depth
                                 if transformed_word not in unique_next_depth_words:
                                     unique_next_depth_words.add(transformed_word)
-                                    # Zapisz słowo i ŁAŃCUCH REGUL do pliku tymczasowego
+                                    # Save the word and the RULE CHAIN to the temporary file
                                     # Format: transformed_word\tfull_chain_for_next_step
                                     f_out.write(f"{transformed_word}\t{full_chain}\n")
-                        # --- KONIEC ZMIENIONEJ LOGIKI REJESTROWANIA WYNIKÓW ---
-                                        
+                        # --- END MODIFIED LOGIC FOR RESULT REGISTRATION ---
+                                                
                     words_buf.release()
                     result_buf.release()
                     pbar.update(num_words_batch)
@@ -679,8 +679,9 @@ def main():
         if current_depth > 1 and os.path.exists(words_to_process_file_in):
             os.remove(words_to_process_file_in)
             
-        # Przygotowujemy słowa do przetworzenia na następnej głębokości (pobieramy je z pliku, który właśnie zapisaliśmy)
-        words_with_chains = [] # Zostaną ponownie wczytane na początku następnej pętli
+        # Prepare words for processing at the next depth 
+        # (they will be reloaded at the start of the next loop)
+        words_with_chains = [] # Will be reloaded at the start of the next loop
         
     print(f"\nGPU-based extraction finished.")
     
@@ -704,6 +705,9 @@ def main():
         temp_file = f"words_to_process_d{i}.tmp"
         if os.path.exists(temp_file):
             os.remove(temp_file)
+            
+    if args.chain_depth > 1:
+        print("Temporary files cleaned up.")
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
