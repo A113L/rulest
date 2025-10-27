@@ -1,4 +1,4 @@
-**GPU-Accelerated Rule Mining for Password Cracking Wordlists (Full Chain Extraction)**
+**GPU-Accelerated Rule Mining for Hash Cracking Wordlists (Full Chain Extraction)**
 
 This project implements a highly optimized tool for extracting effective word-transformation rule chains by leveraging PyOpenCL to run the transformation logic on a Graphics Processing Unit (GPU). It uses a Breadth-First Search (BFS) approach to efficiently explore multi-step rule combinations (chains) that convert base dictionary words into target dictionary words.
 
