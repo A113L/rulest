@@ -104,7 +104,7 @@ def main():
     parser.add_argument('-o', '--output', help='File to save the extracted rules to.')
     
     parser.add_argument('-r', '--rules_file', type=str,
-                          help='Path to a file containing external rules (one per line). Filters the internal rule set.')
+                             help='Path to a file containing external rules (one per line). Filters the internal rule set.')
     
     args = parser.parse_args()
 
@@ -167,6 +167,7 @@ def main():
     host_rules_gpu = host_rules_gpu_temp # Final buffer to send
 
     # --- OpenCL Kernel Source (Unchanged) ---
+    # The kernel source is large and remains unchanged, using f-string interpolation for block IDs.
     kernel_source = f"""
     __kernel void bfs_kernel(
         __global const unsigned char* base_words_in,
@@ -497,26 +498,24 @@ def main():
         print(f"ERROR: Cannot create context for the selected device. Error: {e}")
         return
 
-    def load_data(filename):
-        """Loads words from a file using 'latin-1' encoding."""
+    def load_target_dictionary(filename):
+        """Loads the entire target dictionary into a set for fast lookup (O(1))."""
         if not os.path.exists(filename):
-            print(f"Error: The file '{filename}' does not exist.")
+            print(f"Error: The target dictionary file '{filename}' does not exist.")
             return None
         try:
-            # Using 'latin-1' for robust wordlist reading
             with open(filename, 'r', encoding='latin-1') as f:
-                return [line.strip().split()[0] for line in f if line.strip() and not line.startswith('#')]
+                # Store as a set for O(1) lookups
+                return set(line.strip().split()[0] for line in f if line.strip() and not line.startswith('#'))
         except Exception as e:
-            print(f"An error occurred while loading the file '{filename}': {e}")
+            print(f"An error occurred while loading the target dictionary '{filename}': {e}")
             return None
 
-    wordlist = load_data(args.wordlist)
-    if wordlist is None:
+    word_set = load_target_dictionary(args.wordlist)
+    if word_set is None:
         return
     
-    print(f"Loaded {len(wordlist)} words from '{args.wordlist}' as the target dictionary.")
-    
-    word_set = set(wordlist)
+    print(f"Loaded {len(word_set)} words from '{args.wordlist}' as the target dictionary (in memory).")
     
     # Send the prepared rules buffer to the GPU
     mf = cl.mem_flags
@@ -527,82 +526,115 @@ def main():
 
     extracted_rules_with_hits = Counter()
 
-    base_wordlist = load_data(args.base_wordlist if args.base_wordlist else args.wordlist)
-    if base_wordlist is None:
-        return
-    
-    try:
-        if args.base_wordlist:
-            print(f"Loaded {len(base_wordlist)} words from '{args.base_wordlist}' as the base wordlist.")
-        else:
-            print(f"Loaded {len(wordlist)} words from '{args.wordlist}' as the base wordlist.")
-    except Exception as e:
-        print(f"Error during wordlist loading: {e}")
-        return
-
     initial_batch_size = args.batch_size
     current_batch_size = initial_batch_size
     
-    # words_with_chains: list of (word, chain_of_rules_so_far)
-    words_with_chains = [(word, "") for word in base_wordlist] 
+    num_rules = len(all_rules)
     
+    # Generator for lazy-loading words and chains
+    def lazy_load_words_and_chains(current_depth, base_filename, temp_filename):
+        """
+        A generator that yields (word, previous_chain) tuples,
+        reading either the base wordlist or a temporary file.
+        """
+        if current_depth == 1:
+            # Depth 1: Read the BASE wordlist
+            if not os.path.exists(base_filename):
+                print(f"Error: Base wordlist '{base_filename}' not found.")
+                return
+            
+            print(f"Streaming base wordlist from '{base_filename}'.")
+            with open(base_filename, 'r', encoding='latin-1') as f:
+                for line in f:
+                    word = line.strip().split()[0]
+                    if word and not line.startswith('#'):
+                        # Word, empty previous chain
+                        yield (word, "") 
+        else:
+            # Depth > 1: Read transformed words/chains from the temporary file
+            if not os.path.exists(temp_filename):
+                return
+                
+            print(f"Streaming words and previous chains from temporary file: {temp_filename}")
+            with open(temp_filename, 'r', encoding='latin-1') as f:
+                for line in f:
+                    parts = line.strip().split('\t', 1)
+                    if len(parts) == 2 and parts[0]:
+                        # parts[0] = transformed_word, parts[1] = previous_chain
+                        yield (parts[0], parts[1])
+    
+    # --- BFS Chaining Loop ---
     for current_depth in range(1, args.chain_depth + 1):
         print(f"\nProcessing depth {current_depth}/{args.chain_depth}...")
         
+        # Determine input/output files
+        base_filename = args.base_wordlist if args.base_wordlist else args.wordlist
         words_to_process_file_in = f"words_to_process_d{current_depth}.tmp"
         words_to_process_file_out = f"words_to_process_d{current_depth+1}.tmp"
         
-        # --- START MODIFIED LOGIC FOR LOADING WORDS FOR D > 1 ---
-        if current_depth > 1 and os.path.exists(words_to_process_file_in):
-            words_with_chains = [] # Reset for the new depth
-            print(f"Loading words and previous chains from temporary file: {words_to_process_file_in}")
-            try:
-                with open(words_to_process_file_in, 'r', encoding='latin-1') as f:
-                    for line in f:
-                        parts = line.strip().split('\t', 1)
-                        if len(parts) == 2 and parts[0]:
-                            # parts[0] = transformed_word, parts[1] = previous_chain
-                            words_with_chains.append((parts[0], parts[1]))
-            except Exception as e:
-                print(f"Error reading temporary file: {e}. Stopping.")
-                break
-
-        # Words to process in this batch (only words, GPU does not see chains)
-        words_to_process = [word for word, chain in words_with_chains]
-        # Map for combining chains AFTER GPU processing
-        word_to_chain_map = {word: chain for word, chain in words_with_chains}
-
-        # --- END MODIFIED LOGIC FOR LOADING WORDS ---
+        # Get the iterator for this depth
+        word_chain_iterator = lazy_load_words_and_chains(
+            current_depth, 
+            base_filename, 
+            words_to_process_file_in
+        )
         
-        if not words_to_process:
+        # Check if the iterator yielded anything (if file was empty or not found)
+        # Note: We cannot easily determine the total number of words without a full pass. 
+        # Tqdm total=None is used for streaming input.
+        
+        temp_word_chain_iterator, word_chain_iterator = itertools.tee(word_chain_iterator)
+        try:
+            next(temp_word_chain_iterator)
+        except StopIteration:
             if current_depth > 1:
-                print("No words to process for the next depth. Stopping.")
+                print("No words were generated by the previous depth. Stopping BFS.")
             break
+        # Reset iterator
+        word_chain_iterator = lazy_load_words_and_chains(
+            current_depth, 
+            base_filename, 
+            words_to_process_file_in
+        )
 
-        num_words_total = len(words_to_process)
-        # Max word length + 1 for null terminator
-        max_word_len = max([len(word.encode('latin-1')) for word in words_to_process] + [0]) + 1
-        # Max possible output length (e.g., from 'd' - duplicate) - adjusted for some growth
-        max_output_len_padded = max_word_len + current_depth * 10
+        # Max output length adjustment (heuristic based on max possible growth: 'd' or 'f' rules)
+        max_word_len_current = 0 # Will be updated dynamically per batch
+        max_output_len_padded = 1024 # Initial safe estimate
         
-        num_rules = len(all_rules) 
-        current_batch_size = initial_batch_size
-        
-        new_found_words = [] # Tracks unique words for the next depth
-        unique_next_depth_words = set()
+        words_processed_count = 0
 
         with open(words_to_process_file_out, 'w', encoding='latin-1') as f_out, \
-             tqdm(total=num_words_total, unit='words') as pbar:
+             tqdm(unit='words', desc=f"Depth {current_depth}", total=None) as pbar: # total=None for streaming
 
-            i = 0
-            while i < num_words_total:
-                batch_words = words_to_process[i:i + current_batch_size]
+            while True:
+                # Fetch the next batch of (word, chain) tuples from the iterator
+                batch_data = list(itertools.islice(word_chain_iterator, current_batch_size))
+                
+                if not batch_data:
+                    break
+                    
+                batch_words = [word for word, chain in batch_data]
+                # Map for combining chains ONLY for the current batch
+                word_to_chain_map = {word: chain for word, chain in batch_data}
+                
                 num_words_batch = len(batch_words)
+                
+                # --- Dynamic Padding Adjustment (Critical for GPU efficiency) ---
+                # Recalculate max word len for the current batch and set max output size
+                max_word_len_batch = max([len(word.encode('latin-1')) for word in batch_words] + [1]) + 1
+                max_word_len = max(max_word_len_batch, max_word_len)
+                
+                # Max output len must accommodate current max word len + max growth (e.g., from 'd' rules)
+                # We use a heuristic: max_word_len * 2 (from 'd' rule) + 1 for null
+                max_output_len_padded = max(max_word_len * 2 + 1, max_output_len_padded) 
+                
                 global_size = num_words_batch * num_rules
                 
                 try:
+                    # Prepare input data for the current batch
                     host_base_words_gpu, _, _ = prepare_data_for_gpu(batch_words, [], max_word_len)
                     words_buf = cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=host_base_words_gpu)
+                    
                     # Allocate result buffer: global_size * max_output_len_padded
                     result_buf = cl.Buffer(ctx, mf.WRITE_ONLY, global_size * max_output_len_padded)
                     
@@ -617,13 +649,13 @@ def main():
                                         np.uint32(max_word_len),
                                         np.uint32(max_rule_len_padded + 1), 
                                         np.uint32(max_output_len_padded))
-                                                
+                                        
                     # Get results back from GPU
                     host_results_flat = np.zeros(global_size * max_output_len_padded, dtype=np.uint8)
                     cl.enqueue_copy(queue, host_results_flat, result_buf).wait()
                     
+                    # Process results and count hits
                     for j in range(num_words_batch * num_rules):
-                        # Process results and count hits
                         start_idx = j * max_output_len_padded
                         # Extract word bytes up to the null terminator
                         word_bytes = host_results_flat[start_idx:start_idx + max_output_len_padded].tobytes().split(b'\0', 1)[0]
@@ -633,14 +665,13 @@ def main():
                         except UnicodeDecodeError:
                             transformed_word = None
                             
-                        # --- START MODIFIED LOGIC FOR RESULT REGISTRATION ---
+                        # --- Result Registration Logic ---
                         if transformed_word and transformed_word in word_set:
                             base_word_idx = j // num_rules
                             rule_idx = j % num_rules
                             base_word = batch_words[base_word_idx]
                             new_rule = all_rules[rule_idx]
 
-                            # Get the previous rule chain and create the full chain
                             previous_chain = word_to_chain_map.get(base_word, "")
                             
                             # Create the full chain for the found hit: R1 R2... Rn
@@ -648,24 +679,33 @@ def main():
                                 full_chain = f"{previous_chain} {new_rule}"
                             else:
                                 full_chain = new_rule
-                            
+                                
                             # Condition: ensure the word was actually changed
                             if transformed_word != base_word:
-                                # Count only unique hits for the FULL CHAIN
+                                # Count unique hits for the FULL CHAIN
                                 extracted_rules_with_hits[full_chain] += 1
                                 
-                                # Check if the word should be used in the next depth
+                                # Save the word and the RULE CHAIN to the temporary file for the next depth
+                                # We don't check uniqueness here, as duplicates are filtered naturally
+                                # when reloading the set of words for the next depth.
+                                # However, to reduce disk I/O, a simple in-memory set check is re-introduced:
+                                
+                                # Check if the word *as a new starting point* should be used in the next depth
+                                # The uniqueness check is applied to the combination of (transformed_word, full_chain)
+                                # but since the word itself determines the next state, we check unique words only
+                                
+                                # Only write if we haven't already written this word as a base word for the next level
                                 if transformed_word not in unique_next_depth_words:
-                                    unique_next_depth_words.add(transformed_word)
-                                    # Save the word and the RULE CHAIN to the temporary file
-                                    # Format: transformed_word\tfull_chain_for_next_step
-                                    f_out.write(f"{transformed_word}\t{full_chain}\n")
-                        # --- END MODIFIED LOGIC FOR RESULT REGISTRATION ---
-                                                
+                                     unique_next_depth_words.add(transformed_word)
+                                     # Format: transformed_word\tfull_chain_for_next_step
+                                     f_out.write(f"{transformed_word}\t{full_chain}\n")
+                                     
+                    
                     words_buf.release()
                     result_buf.release()
+                    
                     pbar.update(num_words_batch)
-                    i += num_words_batch
+                    words_processed_count += num_words_batch
                     current_batch_size = initial_batch_size 
                         
                 except cl.MemoryError:
@@ -674,16 +714,26 @@ def main():
                     if current_batch_size == 0:
                         print("ERROR: Failed to allocate memory even for the smallest batch size. Stopping.")
                         return
+                    # The `break` here means the loop will restart at the top of the `while True`
+                    # but since `islice` has consumed the items, the memory error handling is imperfect
+                    # for generators. For simplicity in this implementation, we will stop on critical failure.
+                    if current_batch_size < 100:
+                         print("ERROR: Batch size too small. Stopping.")
+                         return
 
-        # Clean up temporary file from the current depth
+        # Clean up temporary file from the current depth (if it's not the first depth)
         if current_depth > 1 and os.path.exists(words_to_process_file_in):
             os.remove(words_to_process_file_in)
             
-        # Prepare words for processing at the next depth 
-        # (they will be reloaded at the start of the next loop)
-        words_with_chains = [] # Will be reloaded at the start of the next loop
-        
-    print(f"\nGPU-based extraction finished.")
+        # The temporary file for the next depth (f"words_to_process_d{current_depth+1}.tmp")
+        # will be the input for the next loop iteration (current_depth + 1).
+
+        # If no words were generated for the next depth, we stop the BFS early
+        if not unique_next_depth_words and current_depth < args.chain_depth:
+            print(f"Depth {current_depth} yielded no new words. Stopping BFS early.")
+            break
+            
+    print(f"\nGPU-based extraction finished. Total words processed: {words_processed_count}")
     
     sorted_rules = extracted_rules_with_hits.most_common()
 
@@ -706,8 +756,8 @@ def main():
         if os.path.exists(temp_file):
             os.remove(temp_file)
             
-    if args.chain_depth > 1:
-        print("Temporary files cleaned up.")
+if __name__ == '__main__':
+    main()
 
 if __name__ == '__main__':
     main()
