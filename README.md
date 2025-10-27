@@ -34,7 +34,7 @@ Argument,        Short Description
 --chain-depth,   -d,  Number of rules to chain together.
 --batch-size,         Number of words to process per GPU batch.
 --output,        -o,  File to save the extracted rule chains to.
---rules_file,    -r,  Path to an external file to filter the internal rule set.,Internal set
+--rules_file,    -r,  Path to an external file to filter the internal rule set.
 ```
 **Examples**
 
