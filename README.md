@@ -51,6 +51,8 @@ Find rule chains of length two (R1 R2) that lead to a hit.
 3. Using a Filtered Rule Set
 Only test rules specified in common_leetspeak.rule for a three-step chain.
 
+https://hcrulestools.pages.dev/rulest.static_workflow
+
 ```python rulest.py -w target.txt -b base.txt -d 3 -r common_leetspeak.rule -o leet_chains_d3.txt```
 
 
