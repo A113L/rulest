@@ -51,6 +51,109 @@ Find rule chains of length two (R1 R2) that lead to a hit.
 3. Using a Filtered Rule Set
 Only test rules specified in common_leetspeak.rule for a three-step chain.
 
+**Rules supported by script**
+
+*Simple Rules* (10 rules)
+l - Lowercase all letters
+
+u - Uppercase all letters
+
+c - Capitalize first letter, lowercase rest
+
+C - Lowercase first letter, uppercase rest
+
+t - Toggle case of all letters
+
+r - Reverse the word
+
+k - Swap first two characters
+
+: - Identity/no change
+
+d - Duplicate word
+
+f - Reflect word (word + reverse)
+
+*Toggle/Delete Rules* (20 rules)
+
+- T0-T9 - Toggle case at position 0-9
+
+- D0-D9 - Delete character at position 0-9
+
+*Substitution Rules* (1,296 + leetspeak rules)
+
+- sXY - Substitute character X with Y
+
+- X,Y ∈ (0-9, a-z) = 36 × 36 = 1,296 rules
+
+*Leetspeak substitutions* (24 rules):
+
+- sa@, sA@, s@a, se3, sE3, s3e, si1, sI1, s1i, so0, sO0, s0o, ss5, sS5, s5s, st7, sT7, s7t, sl1, sL1, s1l, sz2, sZ2, s2z
+
+*Group A Rules* (282 rules)
+
+- ^X - Prepend character X (94 rules)
+
+- $X - Append character X (94 rules)
+
+- @X - Delete all instances of character X (94 rules)
+
+Where X ∈ (0-9, a-z, A-Z, punctuation) = 94 characters
+
+*Group B - New Hashcat Rules* (545 rules)
+
+*Duplication Rules*
+
+- p0-p9 - Duplicate word N times (10 rules)
+
+- q - Duplicate all characters (1 rule)
+
+*Rotation Rules*
+
+- { - Rotate left (1 rule)
+
+- } - Rotate right (1 rule)
+
+*Truncation Rules*
+
+- [ - Delete first character (1 rule)
+
+- ] - Delete last character (1 rule)
+
+*Extraction Rules*
+
+- xNM - Extract range starting at N, length M (90 rules)
+
+- N ∈ (0-9), M ∈ (1-9) = 10 × 9 = 90 rules
+
+*Omission Rules*
+
+- ONM - Omit range starting at N, length M (90 rules)
+
+- N ∈ (0-9), M ∈ (1-9) = 10 × 9 = 90 rules
+
+*Insertion Rules*
+
+- iNX - Insert character X at position N (160 rules)
+
+- N ∈ (0-9), X ∈ (0-9, a-z) = 10 × 16 = 160 rules
+
+*Overwrite Rules*
+
+- oNX - Overwrite character at position N with X (160 rules)
+
+- N ∈ (0-9), X ∈ (0-9, a-z) = 10 × 16 = 160 rules
+
+*Truncate Position Rules*
+
+- '0-'9 - Truncate at position N (10 rules)
+
+*Character Duplication Rules*
+
+- z0-z9 - Duplicate first character N times (10 rules)
+
+- Z0-Z9 - Duplicate last character N times (10 rules)
+
 https://hcrulestools.pages.dev/rulest.static_workflow
 
 ```python rulest.py -w target.txt -b base.txt -d 3 -r common_leetspeak.rule -o leet_chains_d3.txt```
