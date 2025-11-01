@@ -112,6 +112,64 @@ def generate_all_rules():
     
     rules.extend(new_rules)
     
+    # --- NEW COMPREHENSIVE RULES ---
+    comprehensive_rules = []
+    
+    # 'K' - Swap last two characters
+    comprehensive_rules.append('K')
+    
+    # '*NM' - Swap character at position N with character at position M
+    for n in range(10):
+        for m in range(10):
+            if n != m:  # No point swapping same position
+                comprehensive_rules.append(f'*{n}{m}')
+    
+    # 'LN' - Bitwise shift left character @ N
+    for n in range(10):
+        comprehensive_rules.append(f'L{n}')
+    
+    # 'RN' - Bitwise shift right character @ N  
+    for n in range(10):
+        comprehensive_rules.append(f'R{n}')
+    
+    # '+N' - ASCII increment character @ N by 1
+    for n in range(10):
+        comprehensive_rules.append(f'+{n}')
+    
+    # '-N' - ASCII decrement character @ N by 1
+    for n in range(10):
+        comprehensive_rules.append(f'-{n}')
+    
+    # '.N' - Replace character @ N with value at @ N plus 1
+    for n in range(10):
+        comprehensive_rules.append(f'.{n}')
+    
+    # ',N' - Replace character @ N with value at @ N minus 1
+    for n in range(10):
+        comprehensive_rules.append(f',{n}')
+    
+    # 'yN' - Duplicate first N characters
+    for n in range(1, 10):  # 1-9, 0 doesn't make sense
+        comprehensive_rules.append(f'y{n}')
+    
+    # 'YN' - Duplicate last N characters
+    for n in range(1, 10):  # 1-9, 0 doesn't make sense
+        comprehensive_rules.append(f'Y{n}')
+    
+    # 'E' - Title case
+    comprehensive_rules.append('E')
+    
+    # 'eX' - Title case with custom separator
+    for x in ['-', '_', '.', ',', ';']:
+        comprehensive_rules.append(f'e{x}')
+    
+    # '3NX' - Toggle case after Nth instance of separator char
+    for n in range(1, 5):  # 1-4 instances
+        for x in ['-', '_', '.', ',', ';', ' ']:
+            comprehensive_rules.append(f'3{n}{x}')
+    
+    rules.extend(comprehensive_rules)
+    
     return rules
 
 def prepare_data_for_gpu(words, rules, max_word_len):
@@ -172,7 +230,7 @@ def main():
     num_a_rules = len(string.digits + string.ascii_letters + string.punctuation) * 3
     
     # Calculate new Group B rules count
-    num_new_rules = (
+    num_groupB_rules = (
         10 +  # pN (0-9)
         4 +   # {, }, [, ]
         90 +  # xNM (10*9)
@@ -185,11 +243,29 @@ def main():
         1     # q
     )
     
+    # Calculate comprehensive rules count
+    num_comprehensive_rules = (
+        1 +   # K
+        90 +  # *NM (10*10 - 10 same positions)
+        10 +  # LN
+        10 +  # RN
+        10 +  # +N
+        10 +  # -N
+        10 +  # .N
+        10 +  # ,N
+        9 +   # yN (1-9)
+        9 +   # YN (1-9)
+        1 +   # E
+        5 +   # eX
+        30    # 3NX (5 separators * 6 N values)
+    )
+    
     start_id_simple = 0
     start_id_TD = num_simple_rules
     start_id_s = start_id_TD + num_td_rules
     start_id_A = start_id_s + num_s_rules
-    start_id_new = start_id_A + num_a_rules
+    start_id_groupB = start_id_A + num_a_rules
+    start_id_comprehensive = start_id_groupB + num_groupB_rules
     
     # Create the reference map: rule string -> original ID
     rule_id_map_reference = {rule: i for i, rule in enumerate(all_rules_reference)}
@@ -293,10 +369,10 @@ __kernel void bfs_kernel(
     unsigned int end_id_s = start_id_s + {num_s_rules};
     unsigned int start_id_A = {start_id_A};
     unsigned int end_id_A = start_id_A + {num_a_rules};
-    
-    // --- NEW rule ID range (Group B) ---
-    unsigned int start_id_new = {start_id_new}; 
-    unsigned int end_id_new = start_id_new + {num_new_rules};
+    unsigned int start_id_groupB = {start_id_groupB};
+    unsigned int end_id_groupB = start_id_groupB + {num_groupB_rules};
+    unsigned int start_id_comprehensive = {start_id_comprehensive};
+    unsigned int end_id_comprehensive = start_id_comprehensive + {num_comprehensive_rules};
     
     // --- Kernel Logic (Rule Transformation) ---
     
@@ -546,8 +622,8 @@ __kernel void bfs_kernel(
             out_len = temp_idx;
         }}
     }}
-    // --- START NEW GROUP B RULES ---
-    else if (rule_id >= start_id_new && rule_id < end_id_new) {{ 
+    // --- START GROUP B RULES ---
+    else if (rule_id >= start_id_groupB && rule_id < end_id_groupB) {{ 
         
         // Default to copying the word for modification
         for(unsigned int i=0; i<word_len; i++) result_ptr[i] = current_word_ptr[i];
@@ -759,7 +835,173 @@ __kernel void bfs_kernel(
         }}
 
     }}
-    // --- END NEW GROUP B RULES ---
+    // --- END GROUP B RULES ---
+    
+    // --- START COMPREHENSIVE RULES ---
+    else if (rule_id >= start_id_comprehensive && rule_id < end_id_comprehensive) {{ 
+        
+        // Default to copying the word for modification
+        for(unsigned int i=0; i<word_len; i++) result_ptr[i] = current_word_ptr[i];
+        out_len = word_len;
+
+        unsigned char cmd = rule_ptr[0];
+        unsigned int N = (rule_ptr[1] != 0) ? char_to_pos(rule_ptr[1]) : 0xFFFFFFFF;
+        unsigned int M = (rule_ptr[2] != 0) ? char_to_pos(rule_ptr[2]) : 0xFFFFFFFF;
+        unsigned char X = (rule_ptr[2] != 0) ? rule_ptr[2] : 0;
+        unsigned char separator = rule_ptr[1];
+
+        if (cmd == 'K') {{ // 'K' (Swap last two characters)
+            if (word_len >= 2) {{
+                result_ptr[word_len - 1] = current_word_ptr[word_len - 2];
+                result_ptr[word_len - 2] = current_word_ptr[word_len - 1];
+                changed_flag = true;
+            }}
+        }}
+        else if (cmd == '*') {{ // '*NM' (Swap character at position N with character at position M)
+            if (N != 0xFFFFFFFF && M != 0xFFFFFFFF && N < word_len && M < word_len && N != M) {{
+                unsigned char temp = result_ptr[N];
+                result_ptr[N] = result_ptr[M];
+                result_ptr[M] = temp;
+                changed_flag = true;
+            }}
+        }}
+        else if (cmd == 'L') {{ // 'LN' (Bitwise shift left character @ N)
+            if (N != 0xFFFFFFFF && N < word_len) {{
+                result_ptr[N] = current_word_ptr[N] << 1;
+                changed_flag = true;
+            }}
+        }}
+        else if (cmd == 'R') {{ // 'RN' (Bitwise shift right character @ N)
+            if (N != 0xFFFFFFFF && N < word_len) {{
+                result_ptr[N] = current_word_ptr[N] >> 1;
+                changed_flag = true;
+            }}
+        }}
+        else if (cmd == '+') {{ // '+N' (ASCII increment character @ N by 1)
+            if (N != 0xFFFFFFFF && N < word_len) {{
+                result_ptr[N] = current_word_ptr[N] + 1;
+                changed_flag = true;
+            }}
+        }}
+        else if (cmd == '-') {{ // '-N' (ASCII decrement character @ N by 1)
+            if (N != 0xFFFFFFFF && N < word_len) {{
+                result_ptr[N] = current_word_ptr[N] - 1;
+                changed_flag = true;
+            }}
+        }}
+        else if (cmd == '.') {{ // '.N' (Replace character @ N with value at @ N plus 1)
+            if (N != 0xFFFFFFFF && N + 1 < word_len) {{
+                result_ptr[N] = current_word_ptr[N + 1];
+                changed_flag = true;
+            }}
+        }}
+        else if (cmd == ',') {{ // ',N' (Replace character @ N with value at @ N minus 1)
+            if (N != 0xFFFFFFFF && N > 0 && N < word_len) {{
+                result_ptr[N] = current_word_ptr[N - 1];
+                changed_flag = true;
+            }}
+        }}
+        else if (cmd == 'y') {{ // 'yN' (Duplicate first N characters)
+            if (N != 0xFFFFFFFF && N > 0 && N <= word_len) {{
+                unsigned int total_len = word_len + N;
+                if (total_len < max_output_len_padded) {{
+                    // Shift original word right by N positions
+                    for (int i = word_len - 1; i >= 0; i--) {{
+                        result_ptr[i + N] = result_ptr[i];
+                    }}
+                    // Duplicate first N characters at the beginning
+                    for (unsigned int i = 0; i < N; i++) {{
+                        result_ptr[i] = current_word_ptr[i];
+                    }}
+                    out_len = total_len;
+                    changed_flag = true;
+                }}
+            }}
+        }}
+        else if (cmd == 'Y') {{ // 'YN' (Duplicate last N characters)
+            if (N != 0xFFFFFFFF && N > 0 && N <= word_len) {{
+                unsigned int total_len = word_len + N;
+                if (total_len < max_output_len_padded) {{
+                    // Append last N characters
+                    for (unsigned int i = 0; i < N; i++) {{
+                        result_ptr[word_len + i] = current_word_ptr[word_len - N + i];
+                    }}
+                    out_len = total_len;
+                    changed_flag = true;
+                }}
+            }}
+        }}
+        else if (cmd == 'E') {{ // 'E' (Title case)
+            // First lowercase everything
+            for (unsigned int i = 0; i < word_len; i++) {{
+                unsigned char c = current_word_ptr[i];
+                if (c >= 'A' && c <= 'Z') {{
+                    result_ptr[i] = c + 32;
+                }} else {{
+                    result_ptr[i] = c;
+                }}
+            }}
+            
+            // Then uppercase first letter and letters after spaces
+            bool capitalize_next = true;
+            for (unsigned int i = 0; i < word_len; i++) {{
+                if (capitalize_next && result_ptr[i] >= 'a' && result_ptr[i] <= 'z') {{
+                    result_ptr[i] = result_ptr[i] - 32;
+                    changed_flag = true;
+                }}
+                capitalize_next = (result_ptr[i] == ' ');
+            }}
+            out_len = word_len;
+        }}
+        else if (cmd == 'e') {{ // 'eX' (Title case with custom separator)
+            // First lowercase everything
+            for (unsigned int i = 0; i < word_len; i++) {{
+                unsigned char c = current_word_ptr[i];
+                if (c >= 'A' && c <= 'Z') {{
+                    result_ptr[i] = c + 32;
+                }} else {{
+                    result_ptr[i] = c;
+                }}
+            }}
+            
+            // Then uppercase first letter and letters after custom separator
+            bool capitalize_next = true;
+            for (unsigned int i = 0; i < word_len; i++) {{
+                if (capitalize_next && result_ptr[i] >= 'a' && result_ptr[i] <= 'z') {{
+                    result_ptr[i] = result_ptr[i] - 32;
+                    changed_flag = true;
+                }}
+                capitalize_next = (result_ptr[i] == separator);
+            }}
+            out_len = word_len;
+        }}
+        else if (cmd == '3') {{ // '3NX' (Toggle case after Nth instance of separator char)
+            unsigned int separator_count = 0;
+            unsigned int target_count = N;
+            unsigned char sep_char = X;
+            
+            if (target_count != 0xFFFFFFFF) {{
+                for (unsigned int i = 0; i < word_len; i++) {{
+                    if (current_word_ptr[i] == sep_char) {{
+                        separator_count++;
+                        if (separator_count == target_count && i + 1 < word_len) {{
+                            // Toggle the case of the character after the separator
+                            unsigned char c = current_word_ptr[i + 1];
+                            if (c >= 'a' && c <= 'z') {{
+                                result_ptr[i + 1] = c - 32;
+                                changed_flag = true;
+                            }} else if (c >= 'A' && c <= 'Z') {{
+                                result_ptr[i + 1] = c + 32;
+                                changed_flag = true;
+                            }}
+                            break;
+                        }}
+                    }}
+                }}
+            }}
+        }}
+    }}
+    // --- END COMPREHENSIVE RULES ---
     
     // Final output processing
     if (changed_flag && out_len > 0) {{
