@@ -154,6 +154,34 @@ Where X ∈ (0-9, a-z, A-Z, punctuation) = 94 characters
 
 - Z0-Z9 - Duplicate last character N times (10 rules)
 
+**Other rules**
+
+- K - Swap last two characters
+
+- *NM - Swap characters at positions N and M
+
+- LN - Bitwise shift left
+
+- RN - Bitwise shift right
+
+- +N - ASCII increment
+
+- -N - ASCII decrement
+
+- .N - Replace with next character
+
+- ,N - Replace with previous character
+
+- yN - Duplicate first N characters
+
+- YN - Duplicate last N characters
+
+- E - Title case
+
+- eX - Title case with custom separator
+
+- 3NX - Toggle case after Nth separator
+
 https://hcrulestools.pages.dev/rulest.static_workflow
 
 ```python rulest.py -w target.txt -b base.txt -d 3 -r common_leetspeak.rule -o leet_chains_d3.txt```
