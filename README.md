@@ -54,25 +54,26 @@ Only test rules specified in common_leetspeak.rule for a three-step chain.
 **Rules supported by script**
 
 *Simple Rules* (10 rules)
-l - Lowercase all letters
 
-u - Uppercase all letters
+- l - Lowercase all letters
 
-c - Capitalize first letter, lowercase rest
+- u - Uppercase all letters
 
-C - Lowercase first letter, uppercase rest
+- c - Capitalize first letter, lowercase rest
 
-t - Toggle case of all letters
+- C - Lowercase first letter, uppercase rest
 
-r - Reverse the word
+- t - Toggle case of all letters
 
-k - Swap first two characters
+- r - Reverse the word
 
-: - Identity/no change
+- k - Swap first two characters
 
-d - Duplicate word
+- : - Identity/no change
 
-f - Reflect word (word + reverse)
+- d - Duplicate word
+
+- f - Reflect word (word + reverse)
 
 *Toggle/Delete Rules* (20 rules)
 
