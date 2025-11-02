@@ -155,7 +155,7 @@ Where X ∈ (0-9, a-z, A-Z, punctuation) = 94 characters
 
 - Z0-Z9 - Duplicate last character N times (10 rules)
 
-**Comprehsive rules**
+*Comprehsive rules*
 
 - K - Swap last two characters
 
