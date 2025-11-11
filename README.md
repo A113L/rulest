@@ -186,7 +186,7 @@ Where X ∈ (0-9, a-z, A-Z, punctuation) = 94 characters
 
 - 3NX - Toggle case after Nth separator
 
-https://hcrulestools.pages.dev/rulest.static_workflow
+https://hcrt.pages.dev/rulest.static_workflow
 
 
 
