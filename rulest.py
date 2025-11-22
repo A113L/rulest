@@ -1243,5 +1243,3 @@ __kernel void bfs_kernel(
 if __name__ == '__main__':
     main()
 
-if __name__ == '__main__':
-    main()
