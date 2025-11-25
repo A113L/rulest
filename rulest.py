@@ -8,6 +8,19 @@ import itertools
 from collections import Counter
 from tqdm import tqdm
 
+# --- Color formatting constants ---
+class Colors:
+    RED = '\033[91m'
+    GREEN = '\033[92m'
+    YELLOW = '\033[93m'
+    BLUE = '\033[94m'
+    MAGENTA = '\033[95m'
+    CYAN = '\033[96m'
+    WHITE = '\033[97m'
+    BOLD = '\033[1m'
+    UNDERLINE = '\033[4m'
+    END = '\033[0m'
+
 # --- Data Preparation for GPU ---
 
 def generate_leetspeak_rules():
@@ -207,7 +220,10 @@ def prepare_data_for_gpu(words, rules, max_word_len):
 
 # --- Main Logic ---
 def main():
-    parser = argparse.ArgumentParser(description='OpenCL GPU Wrapper for rule extraction. Supports external rule files and rule chaining (BFS).')
+    parser = argparse.ArgumentParser(
+        description=f'{Colors.CYAN}OpenCL GPU Wrapper for rule extraction. Supports external rule files and rule chaining (BFS).{Colors.END}',
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     parser.add_argument('-w', '--wordlist', required=True, help='Path to the single wordlist file (target dictionary).')
     parser.add_argument('-b', '--base-wordlist', help='Optional path to a base wordlist file. If not specified, --wordlist is used as the base.')
     parser.add_argument('-d', '--chain-depth', type=int, default=1, help='Number of rules to chain together. Default: 1.')
@@ -219,8 +235,14 @@ def main():
     
     args = parser.parse_args()
 
+    # Print banner
+    print(f"\n{Colors.BOLD}{Colors.CYAN}{'='*80}{Colors.END}")
+    print(f"{Colors.BOLD}{Colors.CYAN}                    GPU RULE EXTRACTION TOOL{Colors.END}")
+    print(f"{Colors.BOLD}{Colors.CYAN}{'='*80}{Colors.END}\n")
+
     # --- Generate Full Rule Set and Calculate Block IDs ---
     # We ALWAYS generate the full set to know the correct reference IDs
+    print(f"{Colors.YELLOW}🔧 Generating full rule set...{Colors.END}")
     all_rules_reference = generate_all_rules()
 
     # Calculate Block IDs for the OpenCL kernel
@@ -272,10 +294,10 @@ def main():
 
     # --- Rule Filtering ---
     if args.rules_file:
-        print(f"Loading and filtering rules from external file: '{args.rules_file}'")
+        print(f"{Colors.BLUE}📁 Loading and filtering rules from external file: '{args.rules_file}'{Colors.END}")
         try:
             if not os.path.exists(args.rules_file):
-                print(f"Error: External rules file '{args.rules_file}' not found. Exiting.")
+                print(f"{Colors.RED}❌ Error: External rules file '{args.rules_file}' not found. Exiting.{Colors.END}")
                 sys.exit(1)
                 
             # FIX: Use 'latin-1' encoding instead of 'utf-8' to prevent decoding errors
@@ -286,16 +308,16 @@ def main():
             all_rules = [r for r in external_rules if r in rule_id_map_reference]
             
             if not all_rules:
-                print("Error: No valid implemented rules found in the external file. Falling back to all internal rules.")
+                print(f"{Colors.YELLOW}⚠️  Warning: No valid implemented rules found in the external file. Falling back to all internal rules.{Colors.END}")
                 all_rules = all_rules_reference
             else:
-                print(f"Filtered {len(all_rules)} valid rules for GPU testing.")
+                print(f"{Colors.GREEN}✅ Filtered {len(all_rules)} valid rules for GPU testing.{Colors.END}")
             
         except Exception as e:
-            print(f"Error loading external rules file: {e}. Falling back to all internal rules.")
+            print(f"{Colors.RED}❌ Error loading external rules file: {e}. Falling back to all internal rules.{Colors.END}")
             all_rules = all_rules_reference
     else:
-        print("Using internal static rule generation.")
+        print(f"{Colors.BLUE}🔧 Using internal static rule generation.{Colors.END}")
         all_rules = all_rules_reference
     # --- End Rule Filtering ---
 
@@ -1027,29 +1049,29 @@ __kernel void bfs_kernel(
         chosen_device = chosen_platform.get_devices()[0]
         ctx = cl.Context([chosen_device])
         queue = cl.CommandQueue(ctx)
-        print(f"Selected device: {chosen_device.name}")
+        print(f"{Colors.GREEN}✅ Selected device: {Colors.BOLD}{chosen_device.name}{Colors.END}")
     except (IndexError, cl.Error) as e:
-        print(f"ERROR: Cannot create context for the selected device. Error: {e}")
+        print(f"{Colors.RED}❌ ERROR: Cannot create context for the selected device. Error: {e}{Colors.END}")
         return
 
     def load_data(filename):
         """Loads words from a file using 'latin-1' encoding."""
         if not os.path.exists(filename):
-            print(f"Error: The file '{filename}' does not exist.")
+            print(f"{Colors.RED}❌ Error: The file '{filename}' does not exist.{Colors.END}")
             return None
         try:
             # Using 'latin-1' for robust wordlist reading
             with open(filename, 'r', encoding='latin-1') as f:
                 return [line.strip().split()[0] for line in f if line.strip() and not line.startswith('#')]
         except Exception as e:
-            print(f"An error occurred while loading the file '{filename}': {e}")
+            print(f"{Colors.RED}❌ An error occurred while loading the file '{filename}': {e}{Colors.END}")
             return None
 
     wordlist = load_data(args.wordlist)
     if wordlist is None:
         return
     
-    print(f"Loaded {len(wordlist)} words from '{args.wordlist}' as the target dictionary.")
+    print(f"{Colors.GREEN}✅ Loaded {Colors.BOLD}{len(wordlist)}{Colors.END}{Colors.GREEN} words from '{args.wordlist}' as the target dictionary.{Colors.END}")
     
     word_set = set(wordlist)
     
@@ -1068,11 +1090,11 @@ __kernel void bfs_kernel(
     
     try:
         if args.base_wordlist:
-            print(f"Loaded {len(base_wordlist)} words from '{args.base_wordlist}' as the base wordlist.")
+            print(f"{Colors.GREEN}✅ Loaded {Colors.BOLD}{len(base_wordlist)}{Colors.END}{Colors.GREEN} words from '{args.base_wordlist}' as the base wordlist.{Colors.END}")
         else:
-            print(f"Loaded {len(wordlist)} words from '{args.wordlist}' as the base wordlist.")
+            print(f"{Colors.GREEN}✅ Loaded {Colors.BOLD}{len(wordlist)}{Colors.END}{Colors.GREEN} words from '{args.wordlist}' as the base wordlist.{Colors.END}")
     except Exception as e:
-        print(f"Error during wordlist loading: {e}")
+        print(f"{Colors.RED}❌ Error during wordlist loading: {e}{Colors.END}")
         return
 
     initial_batch_size = args.batch_size
@@ -1082,7 +1104,7 @@ __kernel void bfs_kernel(
     words_with_chains = [(word, "") for word in base_wordlist] 
     
     for current_depth in range(1, args.chain_depth + 1):
-        print(f"\nProcessing depth {current_depth}/{args.chain_depth}...")
+        print(f"\n{Colors.BOLD}{Colors.MAGENTA}🔍 Processing depth {current_depth}/{args.chain_depth}...{Colors.END}")
         
         words_to_process_file_in = f"words_to_process_d{current_depth}.tmp"
         words_to_process_file_out = f"words_to_process_d{current_depth+1}.tmp"
@@ -1090,7 +1112,7 @@ __kernel void bfs_kernel(
         # --- START MODIFIED WORD LOADING LOGIC FOR D > 1 ---
         if current_depth > 1 and os.path.exists(words_to_process_file_in):
             words_with_chains = [] # Reset for the new depth
-            print(f"Loading words and previous chains from temporary file: {words_to_process_file_in}")
+            print(f"{Colors.BLUE}📖 Loading words and previous chains from temporary file: {words_to_process_file_in}{Colors.END}")
             try:
                 with open(words_to_process_file_in, 'r', encoding='latin-1') as f:
                     for line in f:
@@ -1099,7 +1121,7 @@ __kernel void bfs_kernel(
                             # parts[0] = transformed_word, parts[1] = previous_chain
                             words_with_chains.append((parts[0], parts[1]))
             except Exception as e:
-                print(f"Error reading temporary file: {e}. Stopping.")
+                print(f"{Colors.RED}❌ Error reading temporary file: {e}. Stopping.{Colors.END}")
                 break
 
         # Words to process in this batch (only words, GPU does not see chains)
@@ -1111,7 +1133,7 @@ __kernel void bfs_kernel(
         
         if not words_to_process:
             if current_depth > 1:
-                print("No words to process for the next depth. Stopping.")
+                print(f"{Colors.YELLOW}⚠️  No words to process for the next depth. Stopping.{Colors.END}")
             break
 
         num_words_total = len(words_to_process)
@@ -1127,7 +1149,7 @@ __kernel void bfs_kernel(
         unique_next_depth_words = set()
 
         with open(words_to_process_file_out, 'w', encoding='latin-1') as f_out, \
-             tqdm(total=num_words_total, unit='words') as pbar:
+             tqdm(total=num_words_total, unit='words', bar_format='{l_bar}%s{bar}%s{r_bar}' % (Colors.CYAN, Colors.END)) as pbar:
 
             i = 0
             while i < num_words_total:
@@ -1204,10 +1226,10 @@ __kernel void bfs_kernel(
                     current_batch_size = initial_batch_size 
                         
                 except cl.MemoryError:
-                    print(f"\n[Warning] Memory allocation failed for batch size {current_batch_size}. Retrying with smaller batch size.")
+                    print(f"\n{Colors.YELLOW}⚠️ [Warning] Memory allocation failed for batch size {current_batch_size}. Retrying with smaller batch size.{Colors.END}")
                     current_batch_size //= 2
                     if current_batch_size == 0:
-                        print("ERROR: Failed to allocate memory even for the smallest batch size. Stopping.")
+                        print(f"{Colors.RED}❌ ERROR: Failed to allocate memory even for the smallest batch size. Stopping.{Colors.END}")
                         return
 
         # Clean up temporary file from the current depth
@@ -1217,28 +1239,32 @@ __kernel void bfs_kernel(
         # Prepare words for processing at the next depth (they will be re-read at the start of the next loop)
         words_with_chains = [] # Will be reloaded at the start of the next loop
         
-    print(f"\nGPU-based extraction finished.")
+    print(f"\n{Colors.BOLD}{Colors.GREEN}✅ GPU-based extraction finished.{Colors.END}")
     
     sorted_rules = extracted_rules_with_hits.most_common()
 
-    print(f"Total unique rules chains extracted: {len(sorted_rules)}")
+    print(f"{Colors.BOLD}{Colors.CYAN}📊 Total unique rules chains extracted: {Colors.WHITE}{len(sorted_rules)}{Colors.END}")
 
     if args.output:
-        print(f"\nSaving extracted rule chains to '{args.output}'...")
+        print(f"\n{Colors.BLUE}💾 Saving extracted rule chains to '{args.output}'...{Colors.END}")
         try:
             # Save the final rule chains
             with open(args.output, 'w', encoding='utf-8') as f:
                 for full_chain, count in sorted_rules:
                     f.write(f"{full_chain}\n")
-            print("Done.")
+            print(f"{Colors.GREEN}✅ Done.{Colors.END}")
         except Exception as e:
-            print(f"Error: Could not save rules to file '{args.output}'. Error: {e}")
+            print(f"{Colors.RED}❌ Error: Could not save rules to file '{args.output}'. Error: {e}{Colors.END}")
 
     # Remove all temporary files
     for i in range(1, args.chain_depth + 2):
         temp_file = f"words_to_process_d{i}.tmp"
         if os.path.exists(temp_file):
             os.remove(temp_file)
+
+    print(f"\n{Colors.BOLD}{Colors.CYAN}{'='*80}{Colors.END}")
+    print(f"{Colors.BOLD}{Colors.CYAN}                    EXTRACTION COMPLETE{Colors.END}")
+    print(f"{Colors.BOLD}{Colors.CYAN}{'='*80}{Colors.END}\n")
 
 if __name__ == '__main__':
     main()
