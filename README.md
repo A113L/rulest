@@ -190,6 +190,7 @@ Where X ∈ (0-9, a-z, A-Z, punctuation) = 94 characters
 
 https://hcrt.pages.dev/rulest.static_workflow
 
+**Credits:**
 
-
+https://github.com/synacktiv/rulesfinder
 
