@@ -84,4 +84,5 @@ https://hcrt.pages.dev/rulest.static_workflow
 **Credits:**
 
 https://github.com/synacktiv/rulesfinder
+https://github.com/hashcat/hashcat-utils/blob/master/src/cleanup-rules.c
 
