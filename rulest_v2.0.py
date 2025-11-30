@@ -408,21 +408,49 @@ def generate_bloom_filter(target_words):
 # --- RULE MANAGEMENT ---
 # ====================================================================
 
-def load_rules_from_file(filename):
-    """Load rules from file"""
+def load_rules_from_file(filename, slow_mode=False):
+    """Load rules from file with proper error handling"""
     rules = []
     print(f"{blue('📊')} {bold('Loading rules from:')} {filename}")
+    
+    if not os.path.exists(filename):
+        print(f"{red('❌')} {bold('ERROR:')} Rule file not found: {filename}")
+        return []
+    
     try:
-        with open(filename, 'r', encoding='latin-1') as f:
+        with open(filename, 'r', encoding='latin-1', errors='ignore') as f:
             for line in tqdm(f, desc="Reading rules", leave=False):
                 rule = line.strip()
+                # Skip empty lines, comments, and lines with spaces
                 if rule and not rule.startswith('#') and ' ' not in rule: 
-                     rules.append(rule)
-        rules = list(set(rules))
-        print(f"{green('✅')} {bold('Loaded:')} {cyan(f'{len(rules):,}')} {bold('rules')}")
-        return rules
-    except FileNotFoundError:
-        print(f"{red('❌')} {bold('ERROR:')} Rule file not found")
+                    rules.append(rule)
+        
+        rules = list(set(rules))  # Remove duplicates
+        
+        # Filter valid rules
+        valid_rules = []
+        for rule in rules:
+            if len(rule) == 1:
+                valid_rules.append(rule)
+            elif len(rule) == 2:
+                if rule[0] in ['T', 'D', 'M'] and rule[1] in '0123456789abcdef':
+                    valid_rules.append(rule)
+            elif len(rule) == 3:
+                if rule[0] in ['i', 'o', 's', 'y']:
+                    valid_rules.append(rule)
+            else:
+                if rule.startswith(('^', '$', '@', 'P')):
+                    valid_rules.append(rule)
+        
+        print(f"{green('✅')} {bold('Loaded:')} {cyan(f'{len(valid_rules):,}')} {bold('rules from file')}")
+        
+        if slow_mode and len(valid_rules) > 1000:
+            print(f"{yellow('⚠️')} {bold('Large rule file detected in SLOW MODE - this may take a while!')}")
+        
+        return valid_rules
+        
+    except Exception as e:
+        print(f"{red('❌')} {bold('ERROR loading rules:')} {e}")
         return []
 
 # ====================================================================
@@ -1014,26 +1042,35 @@ def fast_gpu_rule_chaining_flattened(base_words, target_words, rules, max_depth,
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
-        description=f"{bold('🚀 GPU Rule Chaining (All Hashcat Rules + Slow Mode)')}",
+        description=f"{bold('🚀 GPU Rule Chaining (All Hashcat Rules + External Rule Files)')}",
         formatter_class=argparse.RawTextHelpFormatter
     )
     
     parser.add_argument('base_wordlist', help='Base wordlist path')
     parser.add_argument('target_wordlist', help='Target wordlist path')
-    parser.add_argument('-r', '--rules', type=str, default=None, help='Rules file path')
-    parser.add_argument('-d', '--depth', type=int, default=2, help='Max chain depth (1-3)')
-    parser.add_argument('-o', '--output', type=str, default='found_chains.txt', help='Output file')
-    parser.add_argument('--slow', action='store_true', help='Enable SLOW mode with comprehensive Hashcat rules')
+    parser.add_argument('--rules', type=str, default=None, 
+                       help='Path to external rule file (Hashcat .rule format)')
+    parser.add_argument('-d', '--depth', type=int, default=2, 
+                       help='Max chain depth (1-3, default: 2)')
+    parser.add_argument('-o', '--output', type=str, default='found_chains.txt', 
+                       help='Output file (default: found_chains.txt)')
+    parser.add_argument('--slow', action='store_true', 
+                       help='Enable SLOW mode with comprehensive rule coverage')
     
     args = parser.parse_args()
 
     print(f"\n{bold(green('=' * 70))}")
-    print(f"{bold('🚀 GPU RULE CHAINING (ALL HASHCAT RULES + SLOW MODE)')}")
+    print(f"{bold('🚀 GPU RULE CHAINING (ALL HASHCAT RULES + EXTERNAL RULE FILES)')}")
     print(f"{bold(green('=' * 70))}{Colors.END}\n")
     
     if args.slow:
-        print(f"{yellow('⚠️')} {bold('SLOW MODE ENABLED - This will use comprehensive Hashcat rules')}")
-        print(f"{yellow('⚠️')} {bold('Expect significantly longer processing times!')}\n")
+        print(f"{yellow('⚠️')} {bold('SLOW MODE ENABLED - Comprehensive rule coverage')}")
+        print(f"{yellow('⚠️')} {bold('Expect significantly longer processing times!')}")
+    
+    if args.rules:
+        print(f"{blue('📁')} {bold('Using external rule file:')} {cyan(args.rules)}")
+    
+    print()
     
     # Load data
     base_words = load_wordlist_fast(args.base_wordlist)
@@ -1043,13 +1080,17 @@ if __name__ == '__main__':
         sys.exit(1)
     
     # Load/generate rules
-    if args.rules and os.path.exists(args.rules):
-        rules = load_rules_from_file(args.rules)
-        print(f"{blue('📊')} {bold('Using rules from file:')} {cyan(f'{len(rules):,}')} {bold('rules')}")
+    if args.rules:
+        rules = load_rules_from_file(args.rules, slow_mode=args.slow)
+        if not rules:
+            print(f"{red('❌')} {bold('No valid rules found in file, falling back to generated rules')}")
+            rules = generate_comprehensive_hashcat_rules(slow_mode=args.slow)
     else:
+        print(f"{blue('🔧')} {bold('No external rule file specified, generating rules...')}")
         rules = generate_comprehensive_hashcat_rules(slow_mode=args.slow)
     
     if not rules:
+        print(f"{red('❌')} {bold('No rules available. Exiting.')}")
         sys.exit(1)
     
     # Find chains
@@ -1070,6 +1111,13 @@ if __name__ == '__main__':
     print(f"{blue('🔧')} {bold('Rules:')} {cyan(f'{len(rules):,}')}")
     print(f"{blue('📏')} {bold('Max depth:')} {cyan(f'{min(args.depth, 3)}')}")
     print(f"{blue('⚡')} {bold('Mode:')} {cyan('SLOW' if args.slow else 'FAST')}")
+    if args.rules:
+        print(f"{blue('📁')} {bold('Rule source:')} {cyan('EXTERNAL FILE')}")
+    else:
+        print(f"{blue('📁')} {bold('Rule source:')} {cyan('GENERATED')}")
+    print(f"{green('✅')} {bold('Chains found:')} {cyan(f'{len(chains):,}')}")
+    print(f"{blue('💾')} {bold('Output:')} {bold(args.output)}")
+    print(f"{bold(green('=' * 70))}{Colors.END}")
     print(f"{green('✅')} {bold('Chains found:')} {cyan(f'{len(chains):,}')}")
     print(f"{blue('💾')} {bold('Output:')} {bold(args.output)}")
     print(f"{bold(green('=' * 70))}{Colors.END}")
