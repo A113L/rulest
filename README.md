@@ -33,9 +33,6 @@ A high-performance OpenCL-based tool for extracting and testing Hashcat rules us
 -b, --base-wordlist	Base wordlist for rule application
 -r, --rules_file	External rules file to test
 -d, --chain-depth	Rule chaining depth (default: 1)
---batch-size	Words per GPU batch (auto-calculated)
---max-memory	Max GPU memory in MB (auto-detected)
---work-size	OpenCL work group size (default: 256)
 -o, --output	Output file for extracted rules
 ```
 **Examples**
