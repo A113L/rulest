@@ -57,13 +57,13 @@ OPTIONAL ARGUMENTS:
 
 EXAMPLES:
   Fast extraction (1,188 rules):
-    rulestv1.py -w rockyou.txt -o fast_rules.rule
+    rulest.py -w rockyou.txt -o fast_rules.rule
   Comprehensive extraction (16,000+ rules):
-    rulestv1.py -w rockyou.txt -c -o comp_rules.rule
+    rulest.py -w rockyou.txt -c -o comp_rules.rule
   With chaining depth 4:
     rulestv1.py -w rockyou.txt -b base.txt -d 4 --batch-size 500 -o chains.rule
   Comprehensive with depth 2:
-    rulestv1.py -w rockyou.txt -c -d 2 --batch-size 200 -o comp_depth2.rule
+    rulest.py -w rockyou.txt -c -d 2 --batch-size 200 -o comp_depth2.rule
 
 PERFORMANCE TIPS:
   • FAST MODE: 1,188 rules - use batch-size 5000-10000
