@@ -71,23 +71,6 @@ PERFORMANCE TIPS:
   • Chain depth 1-2 for comprehensive, 3-4 for fast mode
   • Use --list-rules to see all implemented rules
 ```
-**Examples**
-
-1. Extracting Single Rules (Depth 1)
-Find all single rules that transform a base word into a target word, saving the results to my_rules_d1.txt.
-
-```python rulest.py -w target_passwords.txt -b base_words.txt -d 1 -o my_rules_d1.txt```
-
-2. Extracting Two-Step Rule Chains (Depth 2)
-Find rule chains of length two (R1 R2) that lead to a hit.
-
-```python rulest.py -w target_passwords.txt -b base_words.txt -d 2 -o my_rules_d2.txt```
-
-3. Using a Filtered Rule Set
-Only test rules specified in common_leetspeak.rule for a three-step chain.
-
-```python rulest.py -w target.txt -b base.txt -d 3 -r common_leetspeak.rule -o leet_chains_d3.txt```
-
 
 🎯 **Performance Tips**
 
