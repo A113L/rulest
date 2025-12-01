@@ -29,7 +29,7 @@ A high-performance OpenCL-based tool for extracting and testing Hashcat rules us
 ```pip install numpy pyopencl tqdm```
 
 ```
-python3 rulestv1.py -h
+python3 rulest.py -h
 
 ╔══════════════════════════════════════════════════════════════════════╗
 ║                GPU-ACCELERATED HASHCAT RULE EXTRACTOR                ║
