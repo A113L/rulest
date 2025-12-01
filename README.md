@@ -29,11 +29,47 @@ A high-performance OpenCL-based tool for extracting and testing Hashcat rules us
 ```pip install numpy pyopencl tqdm```
 
 ```
--w, --wordlist	Target dictionary file (required)
--b, --base-wordlist	Base wordlist for rule application
--r, --rules_file	External rules file to test
--d, --chain-depth	Rule chaining depth (default: 1)
--o, --output	Output file for extracted rules
+python3 rulestv1.py -h
+
+╔══════════════════════════════════════════════════════════════════════╗
+║                GPU-ACCELERATED HASHCAT RULE EXTRACTOR                ║
+╚══════════════════════════════════════════════════════════════════════╝
+
+DESCRIPTION:
+  Blazing-fast OpenCL GPU rule extraction with BFS chaining.
+  Finds rule sequences that transform base words into target words.
+
+USAGE:
+  rulest.py -w WORDLIST [OPTIONS]
+
+REQUIRED ARGUMENTS:
+  -w, --wordlist WORDLIST    Path to target wordlist/dictionary
+
+OPTIONAL ARGUMENTS:
+  -h, --help               Show this help message
+  --list-rules             List all supported rules and exit
+  -c, --comprehensive      Use comprehensive mode (16,000+ rules)
+  -b, --base-wordlist FILE Base wordlist (default: target wordlist)
+  -d, --chain-depth N      Rules to chain together (default: 1)
+  --batch-size N           GPU batch size (default: 5000)
+  -o, --output FILE        Save extracted rules to file
+  -r, --rules_file FILE    Filter external rules file
+
+EXAMPLES:
+  Fast extraction (1,188 rules):
+    rulestv1.py -w rockyou.txt -o fast_rules.rule
+  Comprehensive extraction (16,000+ rules):
+    rulestv1.py -w rockyou.txt -c -o comp_rules.rule
+  With chaining depth 4:
+    rulestv1.py -w rockyou.txt -b base.txt -d 4 --batch-size 500 -o chains.rule
+  Comprehensive with depth 2:
+    rulestv1.py -w rockyou.txt -c -d 2 --batch-size 200 -o comp_depth2.rule
+
+PERFORMANCE TIPS:
+  • FAST MODE: 1,188 rules - use batch-size 5000-10000
+  • COMPREHENSIVE MODE: 16,000+ rules - use batch-size 200-500
+  • Chain depth 1-2 for comprehensive, 3-4 for fast mode
+  • Use --list-rules to see all implemented rules
 ```
 **Examples**
 
