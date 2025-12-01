@@ -100,7 +100,7 @@ Only test rules specified in common_leetspeak.rule for a three-step chain.
 
 *Memory Management*
 
-- Automatic GPU memory detection
+- Automatic GPU memory detection (v2.0)
 - Memory-mapped file I/O for large wordlists (v2.0)
 - Smart batch sizing with safety margins
 - Retry logic for memory allocation failures
