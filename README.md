@@ -12,7 +12,7 @@ A high-performance OpenCL-based tool for extracting and testing Hashcat rules us
 🚀 **Features**
 
 - GPU Accelerated: Uses OpenCL for massive parallel rule processing
-- Memory Optimized: Implements memory-mapped I/O for large files
+- Memory Optimized: Implements memory-mapped I/O for large files (v2.0)
 - Smart Batching: Automatic batch size calculation based on GPU memory
 - Rule Chaining: Supports multi-depth rule chaining (BFS approach)
 - Flexible Input: Works with internal rules or external rule files
@@ -95,14 +95,13 @@ Only test rules specified in common_leetspeak.rule for a three-step chain.
 - Adjust Batch Size - Larger batches for more GPU memory
 - Filter Rules - Use -r to test specific rule sets
 - Chain Depth - Start with depth 1, increase gradually
-- Monitor Memory - Use --max-memory on limited GPUs
 
 🔧 **Technical Details**
 
 *Memory Management*
 
 - Automatic GPU memory detection
-- Memory-mapped file I/O for large wordlists
+- Memory-mapped file I/O for large wordlists (v2.0)
 - Smart batch sizing with safety margins
 - Retry logic for memory allocation failures
 
