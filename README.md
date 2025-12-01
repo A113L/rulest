@@ -61,7 +61,7 @@ EXAMPLES:
   Comprehensive extraction (16,000+ rules):
     rulest.py -w rockyou.txt -c -o comp_rules.rule
   With chaining depth 4:
-    rulestv1.py -w rockyou.txt -b base.txt -d 4 --batch-size 500 -o chains.rule
+    rulest.py -w rockyou.txt -b base.txt -d 4 --batch-size 500 -o chains.rule
   Comprehensive with depth 2:
     rulest.py -w rockyou.txt -c -d 2 --batch-size 200 -o comp_depth2.rule
 
