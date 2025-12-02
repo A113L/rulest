@@ -72,13 +72,6 @@ PERFORMANCE TIPS:
   • Use --list-rules to see all implemented rules
 ```
 
-🎯 **Performance Tips**
-
-- Use SSD Storage - Faster file reading
-- Adjust Batch Size - Larger batches for more GPU memory
-- Filter Rules - Use -r to test specific rule sets
-- Chain Depth - Start with depth 1, increase gradually
-
 🔧 **Technical Details**
 
 *Memory Management*
