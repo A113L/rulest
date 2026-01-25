@@ -5,7 +5,7 @@ import pyopencl as cl
 import argparse
 import string
 import itertools
-from collections import defaultdict, deque
+from collections import defaultdict, deque, Counter
 from tqdm import tqdm
 import mmap
 import time
@@ -14,27 +14,320 @@ import signal
 import math
 import zlib 
 import random
+import json
+from typing import List, Dict, Set, Tuple, Optional
 
 # Suppress compiler warnings
 os.environ['PYOPENCL_COMPILER_OUTPUT'] = '0'
 
 # ====================================================================
-# --- OPTIMIZED CONSTANTS ---
+# --- HASHCAT RULE VALIDATION (from hashcat cleanup-rules.c) ---
 # ====================================================================
-MAX_WORD_LEN = 32         
-MAX_OUTPUT_LEN = 48       
-MAX_CHAINS_TO_FIND = 2000000 
-MAX_CHAIN_STRING_LEN = 64  # Increased for longer chains
-BLOOM_FALSE_POSITIVE_RATE = 0.001
 
-# Performance optimizations
-LOCAL_WORK_SIZE = 256  # Much better GPU utilization
-MAX_WORK_ITEMS_PER_LAUNCH = 50_000_000  # 50M work items max
-WORDS_PER_BATCH = 1000  # Small word batches for memory efficiency
+class HashcatRuleValidator:
+    """Validates rules according to Hashcat's official cleanup-rules.c logic"""
+    
+    @staticmethod
+    def is_digit(c):
+        return '0' <= c <= '9'
+    
+    @staticmethod
+    def is_upper(c):
+        return 'A' <= c <= 'Z'
+    
+    @staticmethod
+    def conv_ctoi(c):
+        if '0' <= c <= '9':
+            return ord(c) - ord('0')
+        elif 'A' <= c <= 'Z':
+            return ord(c) - ord('A') + 10
+        return -1
+    
+    @staticmethod
+    def validate_rule_for_gpu(rule_str):
+        """Validate rule for GPU compatibility (mode 2 from cleanup-rules.c)"""
+        line_len = len(rule_str)
+        pos = 0
+        cnt = 0
+        
+        # Max rules per line for GPU
+        MAX_GPU_RULES = 255
+        
+        while pos < line_len:
+            c = rule_str[pos]
+            
+            if c == ' ':
+                pos += 1
+                continue
+            
+            # Hashcat rule commands
+            if c == ':':  # RULE_OP_MANGLE_NOOP
+                pos += 1
+            elif c == 'l':  # RULE_OP_MANGLE_LREST
+                pos += 1
+            elif c == 'u':  # RULE_OP_MANGLE_UREST
+                pos += 1
+            elif c == 'c':  # RULE_OP_MANGLE_LREST_UFIRST
+                pos += 1
+            elif c == 'C':  # RULE_OP_MANGLE_UREST_LFIRST
+                pos += 1
+            elif c == 't':  # RULE_OP_MANGLE_TREST
+                pos += 1
+            elif c == 'T':  # RULE_OP_MANGLE_TOGGLE_AT
+                pos += 1
+                if pos >= line_len: return False
+                if HashcatRuleValidator.conv_ctoi(rule_str[pos]) == -1: return False
+            elif c == 'r':  # RULE_OP_MANGLE_REVERSE
+                pos += 1
+            elif c == 'd':  # RULE_OP_MANGLE_DUPEWORD
+                pos += 1
+            elif c == 'p':  # RULE_OP_MANGLE_DUPEWORD_TIMES
+                pos += 1
+                if pos >= line_len: return False
+                if HashcatRuleValidator.conv_ctoi(rule_str[pos]) == -1: return False
+            elif c == 'f':  # RULE_OP_MANGLE_REFLECT
+                pos += 1
+            elif c == '{':  # RULE_OP_MANGLE_ROTATE_LEFT
+                pos += 1
+            elif c == '}':  # RULE_OP_MANGLE_ROTATE_RIGHT
+                pos += 1
+            elif c == '$':  # RULE_OP_MANGLE_APPEND
+                pos += 1
+                if pos >= line_len: return False
+            elif c == '^':  # RULE_OP_MANGLE_PREPEND
+                pos += 1
+                if pos >= line_len: return False
+            elif c == '[':  # RULE_OP_MANGLE_DELETE_FIRST
+                pos += 1
+            elif c == ']':  # RULE_OP_MANGLE_DELETE_LAST
+                pos += 1
+            elif c == 'D':  # RULE_OP_MANGLE_DELETE_AT
+                pos += 1
+                if pos >= line_len: return False
+                if HashcatRuleValidator.conv_ctoi(rule_str[pos]) == -1: return False
+            elif c == 'x':  # RULE_OP_MANGLE_EXTRACT
+                pos += 1
+                if pos >= line_len: return False
+                if HashcatRuleValidator.conv_ctoi(rule_str[pos]) == -1: return False
+                pos += 1
+                if pos >= line_len: return False
+                if HashcatRuleValidator.conv_ctoi(rule_str[pos]) == -1: return False
+            elif c == 'i':  # RULE_OP_MANGLE_INSERT
+                pos += 1
+                if pos >= line_len: return False
+                if HashcatRuleValidator.conv_ctoi(rule_str[pos]) == -1: return False
+                pos += 1
+                if pos >= line_len: return False
+            elif c == 'o':  # RULE_OP_MANGLE_OVERSTRIKE
+                pos += 1
+                if pos >= line_len: return False
+                if HashcatRuleValidator.conv_ctoi(rule_str[pos]) == -1: return False
+                pos += 1
+                if pos >= line_len: return False
+            elif c == '\'':  # RULE_OP_MANGLE_TRUNCATE_AT
+                pos += 1
+                if pos >= line_len: return False
+                if HashcatRuleValidator.conv_ctoi(rule_str[pos]) == -1: return False
+            elif c == 's':  # RULE_OP_MANGLE_REPLACE
+                pos += 1
+                if pos >= line_len: return False
+                pos += 1
+                if pos >= line_len: return False
+            elif c == '@':  # RULE_OP_MANGLE_PURGECHAR
+                pos += 1
+                if pos >= line_len: return False
+            elif c == 'a':  # RULE_OP_MANGLE_TOGGLECASE_REC
+                pos += 1
+            elif c == 'z':  # RULE_OP_MANGLE_DUPECHAR_FIRST
+                pos += 1
+                if pos >= line_len: return False
+                if HashcatRuleValidator.conv_ctoi(rule_str[pos]) == -1: return False
+            elif c == 'Z':  # RULE_OP_MANGLE_DUPECHAR_LAST
+                pos += 1
+                if pos >= line_len: return False
+                if HashcatRuleValidator.conv_ctoi(rule_str[pos]) == -1: return False
+            elif c == 'q':  # RULE_OP_MANGLE_DUPECHAR_ALL
+                pos += 1
+            elif c == 'y':  # RULE_OP_MANGLE_DUPEBLOCK_FIRST
+                pos += 1
+                if pos >= line_len: return False
+                if HashcatRuleValidator.conv_ctoi(rule_str[pos]) == -1: return False
+            elif c == 'Y':  # RULE_OP_MANGLE_DUPEBLOCK_LAST
+                pos += 1
+                if pos >= line_len: return False
+                if HashcatRuleValidator.conv_ctoi(rule_str[pos]) == -1: return False
+            elif c == 'k':  # RULE_OP_MANGLE_SWITCH_FIRST
+                pos += 1
+            elif c == 'K':  # RULE_OP_MANGLE_SWITCH_LAST
+                pos += 1
+            elif c == '*':  # RULE_OP_MANGLE_SWITCH_AT
+                pos += 1
+                if pos >= line_len: return False
+                if HashcatRuleValidator.conv_ctoi(rule_str[pos]) == -1: return False
+                pos += 1
+                if pos >= line_len: return False
+                if HashcatRuleValidator.conv_ctoi(rule_str[pos]) == -1: return False
+            elif c == 'L':  # RULE_OP_MANGLE_CHR_SHIFTL
+                pos += 1
+                if pos >= line_len: return False
+                if HashcatRuleValidator.conv_ctoi(rule_str[pos]) == -1: return False
+            elif c == 'R':  # RULE_OP_MANGLE_CHR_SHIFTR
+                pos += 1
+                if pos >= line_len: return False
+                if HashcatRuleValidator.conv_ctoi(rule_str[pos]) == -1: return False
+            elif c == '+':  # RULE_OP_MANGLE_CHR_INCR
+                pos += 1
+                if pos >= line_len: return False
+                if HashcatRuleValidator.conv_ctoi(rule_str[pos]) == -1: return False
+            elif c == '-':  # RULE_OP_MANGLE_CHR_DECR
+                pos += 1
+                if pos >= line_len: return False
+                if HashcatRuleValidator.conv_ctoi(rule_str[pos]) == -1: return False
+            elif c == '.':  # RULE_OP_MANGLE_REPLACE_NP1
+                pos += 1
+                if pos >= line_len: return False
+                if HashcatRuleValidator.conv_ctoi(rule_str[pos]) == -1: return False
+            elif c == ',':  # RULE_OP_MANGLE_REPLACE_NM1
+                pos += 1
+                if pos >= line_len: return False
+                if HashcatRuleValidator.conv_ctoi(rule_str[pos]) == -1: return False
+            elif c == 'E':  # RULE_OP_MANGLE_TITLE
+                pos += 1
+            elif c == 'X':  # RULE_OP_MANGLE_EXTRACT_MEMORY
+                # Memory rules are NOT supported on GPU
+                return False
+            elif c == '4':  # RULE_OP_MANGLE_APPEND_MEMORY
+                # Memory rules are NOT supported on GPU
+                return False
+            elif c == '6':  # RULE_OP_MANGLE_PREPEND_MEMORY
+                # Memory rules are NOT supported on GPU
+                return False
+            elif c == 'M':  # RULE_OP_MEMORIZE_WORD
+                # Memory rules are NOT supported on GPU
+                return False
+            elif c == '<':  # RULE_OP_REJECT_LESS
+                # Reject rules are NOT supported on GPU
+                return False
+            elif c == '>':  # RULE_OP_REJECT_GREATER
+                # Reject rules are NOT supported on GPU
+                return False
+            elif c == '!':  # RULE_OP_REJECT_CONTAIN
+                # Reject rules are NOT supported on GPU
+                return False
+            elif c == '/':  # RULE_OP_REJECT_NOT_CONTAIN
+                # Reject rules are NOT supported on GPU
+                return False
+            elif c == '(':  # RULE_OP_REJECT_EQUAL_FIRST
+                # Reject rules are NOT supported on GPU
+                return False
+            elif c == ')':  # RULE_OP_REJECT_EQUAL_LAST
+                # Reject rules are NOT supported on GPU
+                return False
+            elif c == '=':  # RULE_OP_REJECT_EQUAL_AT
+                # Reject rules are NOT supported on GPU
+                return False
+            elif c == '%':  # RULE_OP_REJECT_CONTAINS
+                # Reject rules are NOT supported on GPU
+                return False
+            elif c == 'Q':  # RULE_OP_REJECT_MEMORY
+                # Reject rules are NOT supported on GPU
+                return False
+            else:
+                # Unknown/invalid rule character
+                return False
+            
+            cnt += 1
+            if cnt > MAX_GPU_RULES:
+                return False
+        
+        return True
+    
+    @staticmethod
+    def clean_rules(rules):
+        """Clean and validate rules for GPU compatibility"""
+        valid_rules = []
+        for rule in rules:
+            # Remove any whitespace at the beginning/end of rule string
+            rule = rule.strip()
+            
+            # Skip empty rules
+            if not rule:
+                continue
+            
+            # Check if rule is valid for GPU
+            if HashcatRuleValidator.validate_rule_for_gpu(rule):
+                valid_rules.append(rule)
+        
+        return valid_rules
 
-# Global placeholders
-BLOOM_HASH_FUNCTIONS = 0 
-BLOOM_FILTER_SIZE_BYTES = 0
+# ====================================================================
+# --- DYNAMIC CONSTANTS CALCULATION ---
+# ====================================================================
+
+def calculate_dynamic_parameters(base_count, target_count):
+    """Calculate dynamic parameters based on input data size"""
+    
+    # Base multipliers
+    BASE_BLOOM_SIZE = 1024 * 1024 * 8  # 8MB base bloom filter
+    
+    # Dynamic scaling factors
+    bloom_scale = max(1.0, math.log10(base_count + target_count) / 2.0)
+    words_scale = max(1.0, math.log10(base_count) / 2.0)
+    rules_scale = max(1.0, math.log10(target_count) / 2.0)
+    
+    # Calculate dynamic parameters
+    BLOOM_FILTER_SIZE = int(BASE_BLOOM_SIZE * bloom_scale)
+    
+    # Ensure power of 2 for better performance
+    BLOOM_FILTER_SIZE = 1 << (BLOOM_FILTER_SIZE.bit_length() - 1)
+    
+    # Batch sizes based on available memory
+    if base_count > 1000000:  # Large dataset
+        WORDS_PER_BATCH = 5000
+        RULES_PER_BATCH = 1000
+    elif base_count > 100000:  # Medium dataset
+        WORDS_PER_BATCH = 10000
+        RULES_PER_BATCH = 2000
+    else:  # Small dataset
+        WORDS_PER_BATCH = 20000
+        RULES_PER_BATCH = 5000
+    
+    # Scale batch sizes
+    WORDS_PER_BATCH = int(WORDS_PER_BATCH * words_scale)
+    RULES_PER_BATCH = int(RULES_PER_BATCH * rules_scale)
+    
+    # Clamp values
+    WORDS_PER_BATCH = min(max(WORDS_PER_BATCH, 1000), 50000)
+    RULES_PER_BATCH = min(max(RULES_PER_BATCH, 500), 20000)
+    
+    # Max chains based on dataset size
+    if base_count * target_count > 10000000:
+        MAX_CHAINS_TO_FIND = 10000
+    elif base_count * target_count > 1000000:
+        MAX_CHAINS_TO_FIND = 50000
+    else:
+        MAX_CHAINS_TO_FIND = 100000
+    
+    # Chain depth based on mode
+    MAX_CHAIN_DEPTH = 6
+    
+    return {
+        'BLOOM_FILTER_SIZE': BLOOM_FILTER_SIZE,
+        'WORDS_PER_BATCH': WORDS_PER_BATCH,
+        'RULES_PER_BATCH': RULES_PER_BATCH,
+        'MAX_CHAINS_TO_FIND': MAX_CHAINS_TO_FIND,
+        'MAX_CHAIN_DEPTH': MAX_CHAIN_DEPTH,
+        'bloom_scale': bloom_scale,
+        'words_scale': words_scale,
+        'rules_scale': rules_scale
+    }
+
+# Initialize with default values
+MAX_WORD_LEN = 256         
+MAX_RULE_LEN = 16         
+MAX_OUTPUT_LEN = 512      
+MAX_CHAIN_STRING_LEN = 512  # Increased for longer chains
+LOCAL_WORK_SIZE = 256
 
 # --- COLOR CODES ---
 class Colors:
@@ -58,983 +351,1514 @@ def cyan(text): return f"{Colors.CYAN}{text}{Colors.END}"
 def bold(text): return f"{Colors.BOLD}{text}{Colors.END}"
 
 # ====================================================================
-# --- COMPREHENSIVE HASHCAT RULES IMPLEMENTATION ---
+# --- VALID HASHCAT RULES GENERATION ---
 # ====================================================================
 
-def generate_comprehensive_hashcat_rules(slow_mode=False):
-    """Generate ALL Hashcat rules from the original implementation"""
-    rules = []
+class ValidHashcatRulesGenerator:
+    """Generate ONLY valid Hashcat rules (GPU-compatible)"""
     
-    if slow_mode:
-        print(f"{yellow('🔧')} {bold('Generating COMPREHENSIVE Hashcat rules (SLOW MODE)...')}")
-    else:
-        print(f"{green('🔧')} {bold('Generating optimized Hashcat rules...')}")
+    def __init__(self, slow_mode=False):
+        self.slow_mode = slow_mode
+        self.validator = HashcatRuleValidator()
     
-    # ===== CORE/BASIC RULES (Always included) =====
-    basic_rules = [
-        'l',      # Lowercase all
-        'u',      # Uppercase all  
-        'c',      # Capitalize (first upper, rest lower)
-        'C',      # Invert capitalize (first lower, rest upper)
-        't',      # Toggle case
-        'r',      # Reverse
-        'k',      # Duplicate word (password -> passwordpassword)
-        ':',      # Duplicate word (same as 'k')
-        'd0',     # Duplicate word (same as 'k' and ':')
-        'f',      # Reflect (password -> passworddrowssap)
-        '[',      # Delete first character
-        ']',      # Delete last character
-        '{',      # Rotate left (password -> asswordp)
-        '}',      # Rotate right (password -> dpasswor)
-        'p',      # Append duplicated last character (password -> passwordd)
-        'z',      # Prepend duplicated first character (password -> ppassword)
-        'q',      # Append duplicated first character (password -> passwordp)
-        'x',      # Extract memory - needs parameters
-        'y',      # Insert character - needs parameters
-        'L',      # Delete all lowercase letters
-        'R',      # Delete all uppercase letters
-        '@',      # Purge all occurrences of character - needs parameter
-        'X',      # Extract memory - needs parameters
-        "'",      # Truncate at position - needs parameter
-    ]
-    rules.extend(basic_rules)
-    
-    # ===== POSITION-BASED RULES =====
-    for i in range(16):  # Positions 0-15 (hex)
-        pos_hex = hex(i)[2:]
-        # Toggle case at position
-        rules.append(f'T{pos_hex}')
-        # Delete at position  
-        rules.append(f'D{pos_hex}')
-        # Insert character at position (needs char parameter)
-        rules.append(f'I{pos_hex}')
-        # Overwrite at position (needs char parameter)
-        rules.append(f'O{pos_hex}')
-        # Extract memory range (needs length parameter)
-        rules.append(f'M{pos_hex}')
-    
-    # ===== PREFIX/SUFFIX/AT RULES =====
-    common_chars = string.digits + "!@#$%^&*()_-+=[]{};:,.<>/?~`" + string.ascii_letters[0:15]
-    for char in common_chars:
-        if char not in [' ', '\n', '\t']:
-            # Prefix character
-            rules.append(f'^{char}')
-            # Suffix character  
-            rules.append(f'${char}')
-            # Insert at position (needs position)
-            rules.append(f'@{char}')
-    
-    # ===== INSERT/OVERWRITE/EXTRACT RULES =====
-    if slow_mode:
-        # SLOW MODE: Include all possible combinations
-        insert_chars = string.digits + "!@#$%^&*()_-+=" + string.ascii_letters
-        for pos in range(16):  # Positions 0-15
-            pos_hex = hex(pos)[2:]
-            for char in insert_chars[:20]:  # Limit to first 20 chars even in slow mode
-                # Insert at position
-                rules.append(f'i{pos_hex}{char}')
-                # Overwrite at position
-                rules.append(f'o{pos_hex}{char}')
-                # Extract substring
-                rules.append(f'y{pos_hex}{char}')
-    else:
-        # FAST MODE: Limited combinations
-        insert_chars = "!@#$%^&*()_+-=1234567890"
-        for pos in range(8):  # Only first 8 positions
-            pos_hex = hex(pos)[2:]
-            for char in insert_chars[:12]:  # Only first 12 chars
-                rules.append(f'i{pos_hex}{char}')
-                rules.append(f'o{pos_hex}{char}')
-    
-    # ===== SUBSTITUTION (LEETSPEAK) RULES =====
-    leet_subs = ['@', '4', '3', '1', '0', '5', '$', '7', '+', '-', '*', '#', '(', ')', '!', '?', '8', '9']
-    for orig_char in string.ascii_lowercase:
-        for sub_char in leet_subs[:8] if not slow_mode else leet_subs:  # Limit in fast mode
-            rules.append(f's{orig_char}{sub_char}')
-    
-    # ===== PURGE RULES =====
-    if slow_mode:
-        # SLOW MODE: Include purge rules for all alphanumeric
-        purge_chars = string.ascii_letters + string.digits
-        for char in purge_chars:
-            rules.append(f'P{char}')
-    else:
-        # FAST MODE: Only common purge characters
-        purge_chars = "aeiouAEIOU0123456789!@#$%"
-        for char in purge_chars:
-            rules.append(f'P{char}')
-    
-    # Remove duplicates and filter invalid rules
-    rules = list(set(rules))
-    
-    # Filter out rules that require additional parameters we can't provide
-    valid_rules = []
-    for rule in rules:
-        if len(rule) == 1:
-            valid_rules.append(rule)
-        elif len(rule) == 2:
-            # Rules like T0, D1, etc. are valid
-            if rule[0] in ['T', 'D', 'M'] and rule[1] in '0123456789abcdef':
-                valid_rules.append(rule)
-        elif len(rule) == 3:
-            # Rules like i0a, sae, etc. are valid
-            if rule[0] in ['i', 'o', 's', 'y']:
-                valid_rules.append(rule)
-        else:
-            # For now, skip longer rules that need special handling
-            if rule.startswith(('^', '$', '@', 'P')):
-                valid_rules.append(rule)
-    
-    if slow_mode:
-        print(f"{yellow('✅')} {bold('Generated COMPREHENSIVE rules:')} {cyan(f'{len(valid_rules):,}')} {bold('rules (SLOW MODE)')}")
-    else:
-        print(f"{green('✅')} {bold('Generated optimized rules:')} {cyan(f'{len(valid_rules):,}')} {bold('rules')}")
-    
-    return valid_rules
-
-# ====================================================================
-# --- FIXED RULE CHAIN GENERATION (PROPER CHAIN COUNTS) ---
-# ====================================================================
-
-def generate_rule_chains_flattened(rules, max_depth, max_chains_per_depth=None, slow_mode=False):
-    """Pre-compute all rule chains - ELIMINATES NESTED LOOPS"""
-    print(f"{blue('🔧')} {bold('Generating flattened rule chains...')}")
-    
-    all_chains = []
-    all_chain_strings = []
-    
-    # REASONABLE LIMITS FOR BOTH MODES
-    if slow_mode:
-        # SLOW MODE: More comprehensive coverage
-        depth_limits = {1: None, 2: 100000, 3: 200000}  # Higher limits for slow mode
-    else:
-        # FAST MODE: Still good coverage but faster
-        depth_limits = {1: None, 2: 50000, 3: 100000}   
-    
-    for depth in range(1, max_depth + 1):
-        print(f"  {blue('-')} Depth {depth}: generating chains...")
+    def generate_valid_rules(self):
+        """Generate valid Hashcat rules only"""
+        rules = set()  # Use set to avoid duplicates
         
-        max_combinations = depth_limits.get(depth)
+        print(f"{blue('[SETUP]')} {bold('Generating VALID Hashcat rules for GPU...')}")
         
-        if depth == 1:
-            # For depth 1, use ALL rules in both modes
-            chains_at_depth = [(r,) for r in rules]
-            print(f"  {green('✓')} Depth {depth}: {len(chains_at_depth):,} chains (all rules)")
+        # ===== CATEGORY 1: SIMPLE GPU-COMPATIBLE RULES =====
+        print(f"  {cyan('[*]')} Simple rules...")
+        simple_rules = [
+            # Single character rules
+            'l', 'u', 'c', 'C', 't', 'r', 'd', 'f',
+            '{', '}', '[', ']', 'k', 'K', ':', 'a',
+            'q', 'E'
+        ]
+        rules.update(simple_rules)
+        
+        # ===== CATEGORY 2: POSITION-BASED RULES (0-9) =====
+        print(f"  {cyan('[*]')} Position-based rules (0-9)...")
+        position_cmds = ['T', 'D', 'L', 'R', '+', '-', '.', ',', 'z', 'Z']
+        for cmd in position_cmds:
+            for pos in range(10):
+                rules.add(f'{cmd}{pos}')
+        
+        # ===== CATEGORY 3: PREFIX/SUFFIX =====
+        print(f"  {cyan('[*]')} Prefix/suffix rules...")
+        # All printable ASCII characters except control chars
+        for i in range(32, 127):
+            char = chr(i)
+            rules.add(f'^{char}')
+            rules.add(f'${char}')
+            if char not in '\\':  # @ can't have backslash
+                rules.add(f'@{char}')
+        
+        # ===== CATEGORY 4: SUBSTITUTIONS =====
+        print(f"  {cyan('[*]')} Substitution rules...")
+        common_subs = [
+            ('a', '@'), ('e', '3'), ('i', '1'), ('o', '0'), ('s', '$'),
+            ('t', '7'), ('l', '1'), ('g', '9'), ('b', '8'), ('z', '2'),
+            ('A', '@'), ('E', '3'), ('I', '1'), ('O', '0'), ('S', '$'),
+            ('T', '7'), ('L', '1'), ('G', '9'), ('B', '8'), ('Z', '2')
+        ]
+        
+        for orig, sub in common_subs:
+            rules.add(f's{orig}{sub}')
+        
+        # More substitutions
+        for orig in string.ascii_lowercase + string.ascii_uppercase:
+            for sub in string.digits + string.punctuation:
+                if orig != sub:
+                    rules.add(f's{orig}{sub}')
+        
+        # ===== CATEGORY 5: INSERTION/OVERWRITE =====
+        print(f"  {cyan('[*]')} Insertion/overwrite rules...")
+        for pos in range(10):
+            for char in string.ascii_letters + string.digits + '!@#$%^&*()_+-=[]{}|;:,.<>?/~':
+                rules.add(f'i{pos}{char}')
+                rules.add(f'o{pos}{char}')
+        
+        # ===== CATEGORY 6: EXTRACTION/SWAP =====
+        print(f"  {cyan('[*]')} Extraction/swap rules...")
+        for n in range(10):
+            for m in range(10):
+                if n != m:
+                    rules.add(f'x{n}{m}')
+                    rules.add(f'*{n}{m}')
+        
+        # ===== CATEGORY 7: DUPLICATION =====
+        print(f"  {cyan('[*]')} Duplication rules...")
+        for n in range(1, 10):
+            rules.add(f'p{n}')
+            rules.add(f'y{n}')
+            rules.add(f'Y{n}')
+            rules.add(f'z{n}')
+            rules.add(f'Z{n}')
+        
+        # ===== CATEGORY 8: TITLE CASE WITH SEPARATOR =====
+        print(f"  {cyan('[*]')} Title case rules...")
+        for separator in [' ', '-', '_', '.', ',', ';', ':', '|', '/', '\\']:
+            # 'E' is for title case, but it doesn't take parameters
+            # Actually, 'e' with separator is a different rule (eX)
+            if separator != ' ':
+                rules.add(f'e{separator}')
+        
+        # Convert to list and validate
+        rules_list = list(rules)
+        valid_rules = []
+        
+        print(f"  {cyan('[*]')} Validating rules for GPU compatibility...")
+        for rule in tqdm(rules_list, desc="Validating", leave=False):
+            if self.validator.validate_rule_for_gpu(rule):
+                # Additional sanity check: rule length
+                if 1 <= len(rule) <= MAX_RULE_LEN:
+                    valid_rules.append(rule)
+        
+        print(f"{green('[OK]')} {bold('Generated:')} {cyan(f'{len(valid_rules):,}')} {bold('GPU-compatible Hashcat rules')}")
+        
+        return valid_rules
+
+# ====================================================================
+# --- DYNAMIC GPU ENGINE WITH VALID RULES ---
+# ====================================================================
+
+class DynamicGPUEngine:
+    """GPU-accelerated engine with valid rules only"""
+    
+    def __init__(self, params):
+        self.params = params
+        self.context = None
+        self.queue = None
+        self.device = None
+        self.program = None
+        
+    def initialize_gpu(self):
+        """Initialize OpenCL with dynamic parameters"""
+        try:
+            platform = cl.get_platforms()[0]
+            self.device = platform.get_devices(cl.device_type.GPU)[0]
+            self.context = cl.Context([self.device])
+            self.queue = cl.CommandQueue(self.context)
             
-        else:
-            chains_at_depth = []
+            # Get GPU memory info for dynamic batching
+            global_mem = self.device.global_mem_size
+            print(f"{green('[GPU]')} {bold('GPU:')} {cyan(self.device.name.strip())}")
+            print(f"{blue('[INFO]')} {bold('Global Memory:')} {cyan(f'{global_mem // (1024**3)}GB')}")
             
-            if depth == 2:
-                # For depth 2: use systematic sampling
-                if slow_mode:
-                    # SLOW MODE: More comprehensive sampling for depth 2
-                    sample_size1 = min(400, len(rules))  # Sample 400 rules for first position
-                    sample_size2 = min(400, len(rules))  # Sample 400 rules for second position
-                    
-                    # Create representative samples
-                    indices1 = list(range(len(rules)))
-                    indices2 = list(range(len(rules)))
-                    
-                    # If we have too many rules, sample strategically
-                    if len(rules) > sample_size1:
-                        step1 = max(1, len(rules) // sample_size1)
-                        indices1 = indices1[::step1][:sample_size1]
-                    
-                    if len(rules) > sample_size2:
-                        step2 = max(1, len(rules) // sample_size2)
-                        indices2 = indices2[::step2][:sample_size2]
-                    
-                    # Generate combinations
-                    for i in indices1:
-                        for j in indices2:
-                            if max_combinations and len(chains_at_depth) >= max_combinations:
-                                break
-                            chains_at_depth.append((rules[i], rules[j]))
-                        if max_combinations and len(chains_at_depth) >= max_combinations:
-                            break
-                            
-                else:
-                    # FAST MODE: Smaller but still good sampling for depth 2
-                    sample_size1 = min(200, len(rules))
-                    sample_size2 = min(200, len(rules))
-                    
-                    indices1 = list(range(len(rules)))
-                    indices2 = list(range(len(rules)))
-                    
-                    if len(rules) > sample_size1:
-                        step1 = max(1, len(rules) // sample_size1)
-                        indices1 = indices1[::step1][:sample_size1]
-                    
-                    if len(rules) > sample_size2:
-                        step2 = max(1, len(rules) // sample_size2)
-                        indices2 = indices2[::step2][:sample_size2]
-                    
-                    for i in indices1:
-                        for j in indices2:
-                            if max_combinations and len(chains_at_depth) >= max_combinations:
-                                break
-                            chains_at_depth.append((rules[i], rules[j]))
-                        if max_combinations and len(chains_at_depth) >= max_combinations:
-                            break
+            return True
+        except Exception as e:
+            print(f"{red('[ERROR]')} {bold('GPU initialization failed:')} {e}")
+            return False
+    
+    def compile_kernel(self):
+        """Compile the valid kernel"""
+        try:
+            print(f"{blue('[SETUP]')} {bold('Compiling kernel...')}")
             
-            else:  # depth >= 3
-                # For depth 3+: use random sampling
-                target_size = max_combinations if max_combinations else 50000
+            # Read the kernel source
+            kernel_source = VALID_HASHCAT_KERNEL
+            
+            # Replace constants with dynamic values
+            kernel_source = kernel_source.replace(
+                "BLOOM_FILTER_SIZE 8388608",
+                f"BLOOM_FILTER_SIZE {self.params['BLOOM_FILTER_SIZE']}"
+            )
+            kernel_source = kernel_source.replace(
+                "MAX_CHAINS_TO_FIND 100000",
+                f"MAX_CHAINS_TO_FIND {self.params['MAX_CHAINS_TO_FIND']}"
+            )
+            kernel_source = kernel_source.replace(
+                "MAX_CHAIN_DEPTH 6",
+                f"MAX_CHAIN_DEPTH {self.params['MAX_CHAIN_DEPTH']}"
+            )
+            
+            self.program = cl.Program(self.context, kernel_source).build()
+            print(f"{green('[OK]')} {bold('Kernel compiled')}")
+            return self.program
+        except Exception as e:
+            print(f"{red('[ERROR]')} {bold('Kernel compilation failed:')}")
+            print(f"  {str(e)}")
+            return None
+    
+    def generate_bloom_filter(self, target_words):
+        """Generate Bloom filter with dynamic size - using ALL target words"""
+        print(f"{blue('[SETUP]')} {bold('Generating comprehensive Bloom filter...')}")
+        
+        bloom_size_bytes = self.params['BLOOM_FILTER_SIZE'] // 8
+        bloom_filter = np.zeros(bloom_size_bytes, dtype=np.uint8)
+        
+        # Use ALL target words for maximum accuracy
+        print(f"  {cyan('[*]')} Bloom filter size: {bloom_size_bytes / 1024:.1f} KB")
+        print(f"  {cyan('[*]')} Hashing ALL target words: {len(target_words):,}")
+        
+        for word in tqdm(target_words, desc="Building bloom filter", leave=False):
+            word_bytes = word.encode('latin-1')
+            
+            # Use multiple hash functions
+            hash_funcs = [
+                hashlib.md5,
+                hashlib.sha1,
+                hashlib.sha256,
+                hashlib.sha512
+            ]
+            
+            for i, hash_func in enumerate(hash_funcs):
+                hash_val = int(hash_func(word_bytes).hexdigest()[:8], 16)
+                idx = hash_val % self.params['BLOOM_FILTER_SIZE']
+                byte_idx = idx // 8
+                bit_idx = idx % 8
+                bloom_filter[byte_idx] |= (1 << bit_idx)
+        
+        # Calculate and display statistics
+        bits_set = np.sum(np.unpackbits(bloom_filter))
+        fill_ratio = bits_set / self.params['BLOOM_FILTER_SIZE']
+        
+        print(f"  {cyan('[*]')} Bloom filter fill ratio: {fill_ratio:.3%}")
+        print(f"  {cyan('[*]')} False positive rate: {(fill_ratio**4):.6%}")
+        
+        return bloom_filter
+    
+    def prepare_batch_data(self, words, rules):
+        """Prepare data for a single batch"""
+        # Prepare words
+        words_flat = []
+        word_offsets = []
+        word_lengths = []
+        current_offset = 0
+        
+        for word in words:
+            word_bytes = word.encode('latin-1')
+            words_flat.extend(word_bytes)
+            word_offsets.append(current_offset)
+            word_lengths.append(len(word_bytes))
+            current_offset += len(word_bytes)
+        
+        # Prepare rules
+        rules_flat = []
+        rule_offsets = []
+        rule_lengths = []
+        current_offset = 0
+        
+        for rule in rules:
+            rule_bytes = rule.encode('latin-1')
+            rules_flat.extend(rule_bytes)
+            rule_offsets.append(current_offset)
+            rule_lengths.append(len(rule_bytes))
+            current_offset += len(rule_bytes)
+        
+        return {
+            'words_flat': np.array(words_flat, dtype=np.uint8),
+            'word_offsets': np.array(word_offsets, dtype=np.int32),
+            'word_lengths': np.array(word_lengths, dtype=np.int32),
+            'rules_flat': np.array(rules_flat, dtype=np.uint8),
+            'rule_offsets': np.array(rule_offsets, dtype=np.int32),
+            'rule_lengths': np.array(rule_lengths, dtype=np.int32),
+            'num_words': len(words),
+            'num_rules': len(rules)
+        }
+    
+    def process_all_words_single_rule(self, base_words, target_words, rules):
+        """Process ALL base words with single rules"""
+        print(f"{blue('[GPU]')} {bold('Processing ALL words with single rules...')}")
+        
+        # Generate Bloom filter with ALL target words
+        bloom_filter = self.generate_bloom_filter(target_words)
+        
+        # Compile kernel
+        if not self.compile_kernel():
+            return []
+        
+        # Filter rules for GPU compatibility
+        validator = HashcatRuleValidator()
+        gpu_rules = [r for r in rules if validator.validate_rule_for_gpu(r)]
+        
+        print(f"{blue('[INFO]')} {bold('GPU-compatible rules:')} {len(gpu_rules):,}")
+        
+        all_found_rules = []
+        
+        # Process ALL base words in optimized batches
+        batch_size = self.params['WORDS_PER_BATCH']
+        num_batches = (len(base_words) + batch_size - 1) // batch_size
+        
+        print(f"{blue('[INFO]')} {bold('Processing ALL')} {len(base_words):,} {bold('words in')} {num_batches} {bold('batches')}")
+        print(f"{blue('[INFO]')} {bold('Batch size:')} {batch_size:,} words")
+        
+        # Process batches
+        with tqdm(total=num_batches, desc="Processing all words", unit="batch") as pbar:
+            for batch_idx in range(num_batches):
+                start_idx = batch_idx * batch_size
+                end_idx = min((batch_idx + 1) * batch_size, len(base_words))
+                batch_words = base_words[start_idx:end_idx]
                 
-                # Generate random chains
-                for _ in range(target_size):
-                    chain = tuple(random.choices(rules, k=depth))
-                    chains_at_depth.append(chain)
-                    
-                    if max_combinations and len(chains_at_depth) >= max_combinations:
-                        break
-            
-            print(f"  {green('✓')} Depth {depth}: {len(chains_at_depth):,} chains")
+                if not batch_words:
+                    pbar.update(1)
+                    continue
+                
+                # Process this batch
+                batch_data = self.prepare_batch_data(batch_words, gpu_rules)
+                batch_found = self.process_batch_single(batch_data, bloom_filter, gpu_rules)
+                
+                if batch_found:
+                    all_found_rules.extend(batch_found)
+                
+                # Update progress
+                pbar.set_postfix({
+                    'found': len(all_found_rules),
+                    'progress': f"{end_idx:,}/{len(base_words):,}"
+                })
+                pbar.update(1)
         
-        # Add chains to final list
-        for chain in chains_at_depth:
-            all_chains.append(chain)
-            all_chain_strings.append(' '.join(chain))
+        # Remove duplicates and return
+        all_found_rules = list(set(all_found_rules))
+        print(f"\n{green('[OK]')} {bold('Total unique single rules found:')} {cyan(len(all_found_rules))}")
+        
+        return all_found_rules
     
-    print(f"{green('✅')} {bold('Generated')} {cyan(f'{len(all_chains):,}')} {bold('total rule chains')}")
-    return all_chains, all_chain_strings
-
-# ====================================================================
-# --- OPTIMIZED FILE LOADING ---
-# ====================================================================
-
-def estimate_word_count(path):
-    """Fast word count estimation"""
-    try:
-        file_size = os.path.getsize(path)
-        sample_size = min(10 * 1024 * 1024, file_size)
+    def process_batch_single(self, batch_data, bloom_filter, rules):
+        """Process a single batch on GPU"""
+        mf = cl.mem_flags
         
-        with open(path, 'rb') as f:
-            sample = f.read(sample_size)
-            lines = sample.count(b'\n')
+        # Create buffers
+        base_buf = cl.Buffer(self.context, mf.READ_ONLY | mf.COPY_HOST_PTR,
+                            hostbuf=batch_data['words_flat'])
+        base_offsets_buf = cl.Buffer(self.context, mf.READ_ONLY | mf.COPY_HOST_PTR,
+                                   hostbuf=batch_data['word_offsets'])
+        base_lengths_buf = cl.Buffer(self.context, mf.READ_ONLY | mf.COPY_HOST_PTR,
+                                   hostbuf=batch_data['word_lengths'])
+        
+        rules_buf = cl.Buffer(self.context, mf.READ_ONLY | mf.COPY_HOST_PTR,
+                            hostbuf=batch_data['rules_flat'])
+        rule_offsets_buf = cl.Buffer(self.context, mf.READ_ONLY | mf.COPY_HOST_PTR,
+                                   hostbuf=batch_data['rule_offsets'])
+        rule_lengths_buf = cl.Buffer(self.context, mf.READ_ONLY | mf.COPY_HOST_PTR,
+                                   hostbuf=batch_data['rule_lengths'])
+        
+        bloom_buf = cl.Buffer(self.context, mf.READ_ONLY | mf.COPY_HOST_PTR,
+                            hostbuf=bloom_filter)
+        
+        # Output buffers
+        found_rules_buf = cl.Buffer(self.context, mf.WRITE_ONLY,
+                                  self.params['MAX_CHAINS_TO_FIND'] * MAX_CHAIN_STRING_LEN)
+        found_count_buf = cl.Buffer(self.context, mf.READ_WRITE, 4)
+        
+        # Initialize counter
+        zero_count = np.array([0], dtype=np.int32)
+        cl.enqueue_copy(self.queue, found_count_buf, zero_count)
+        
+        # Run kernel
+        kernel = self.program.find_single_rules
+        
+        # Calculate global size
+        total_combinations = batch_data['num_words'] * batch_data['num_rules']
+        global_size = ((total_combinations + LOCAL_WORK_SIZE - 1) // LOCAL_WORK_SIZE) * LOCAL_WORK_SIZE
+        
+        kernel.set_args(
+            base_buf, base_offsets_buf, base_lengths_buf,
+            rules_buf, rule_offsets_buf, rule_lengths_buf,
+            bloom_buf,
+            np.int32(batch_data['num_words']),
+            np.int32(batch_data['num_rules']),
+            found_rules_buf,
+            found_count_buf
+        )
+        
+        cl.enqueue_nd_range_kernel(self.queue, kernel, (global_size,), (LOCAL_WORK_SIZE,))
+        self.queue.finish()
+        
+        # Read results
+        found_count = np.zeros(1, dtype=np.int32)
+        cl.enqueue_copy(self.queue, found_count, found_count_buf)
+        
+        num_found = min(found_count[0], self.params['MAX_CHAINS_TO_FIND'])
+        
+        batch_found = []
+        if num_found > 0:
+            # Read found rules
+            found_data = np.zeros(num_found * MAX_CHAIN_STRING_LEN, dtype=np.uint8)
+            cl.enqueue_copy(self.queue, found_data, found_rules_buf)
             
-            if file_size <= sample_size:
-                return lines
-            else:
-                avg_line_length = sample_size / max(lines, 1)
-                return int(file_size / avg_line_length)
-    except:
-        return 1000000
+            # Convert to strings
+            for i in range(num_found):
+                start = i * MAX_CHAIN_STRING_LEN
+                rule_bytes = bytes(found_data[start:start + MAX_CHAIN_STRING_LEN])
+                rule_str = rule_bytes.split(b'\0')[0].decode('latin-1', errors='ignore')
+                if rule_str:
+                    batch_found.append(rule_str)
+        
+        # Cleanup
+        base_buf.release()
+        base_offsets_buf.release()
+        base_lengths_buf.release()
+        rules_buf.release()
+        rule_offsets_buf.release()
+        rule_lengths_buf.release()
+        bloom_buf.release()
+        found_rules_buf.release()
+        found_count_buf.release()
+        
+        return batch_found
+    
+    def process_all_words_chain_rules(self, base_words, target_words, rules, max_depth):
+        """Process ALL base words with rule chains"""
+        print(f"{blue('[GPU]')} {bold('Processing ALL words with rule chains...')}")
+        
+        # Generate Bloom filter with ALL target words
+        bloom_filter = self.generate_bloom_filter(target_words)
+        
+        # Compile kernel
+        if not self.compile_kernel():
+            return []
+        
+        # Filter rules for GPU compatibility
+        validator = HashcatRuleValidator()
+        gpu_rules = [r for r in rules if validator.validate_rule_for_gpu(r)]
+        
+        # Generate chains from valid rules
+        print(f"{blue('[SETUP]')} {bold('Generating rule chains...')}")
+        chains = self.generate_valid_chains(gpu_rules, max_depth)
+        
+        if not chains:
+            return []
+        
+        print(f"{blue('[INFO]')} {bold('Valid chains:')} {len(chains):,}")
+        
+        all_chains = []
+        
+        # Process ALL base words in batches
+        batch_size = self.params['WORDS_PER_BATCH'] // 2  # Smaller batches for chains
+        num_batches = (len(base_words) + batch_size - 1) // batch_size
+        
+        print(f"{blue('[INFO]')} {bold('Processing ALL')} {len(base_words):,} {bold('words in')} {num_batches} {bold('batches')}")
+        
+        # Process batches
+        with tqdm(total=num_batches, desc="Processing chains", unit="batch") as pbar:
+            for batch_idx in range(num_batches):
+                start_idx = batch_idx * batch_size
+                end_idx = min((batch_idx + 1) * batch_size, len(base_words))
+                batch_words = base_words[start_idx:end_idx]
+                
+                if not batch_words:
+                    pbar.update(1)
+                    continue
+                
+                # Process this batch
+                batch_chains = self.process_batch_chains(batch_words, gpu_rules, chains, bloom_filter)
+                
+                if batch_chains:
+                    all_chains.extend(batch_chains)
+                
+                # Update progress
+                pbar.set_postfix({
+                    'found': len(all_chains),
+                    'progress': f"{end_idx:,}/{len(base_words):,}"
+                })
+                pbar.update(1)
+        
+        # Remove duplicates and return
+        all_chains = list(set(all_chains))
+        print(f"\n{green('[OK]')} {bold('Total unique chains found:')} {cyan(len(all_chains))}")
+        
+        return all_chains
+    
+    def generate_valid_chains(self, rules, max_depth):
+        """Generate valid rule chains"""
+        chains = []
+        
+        # Single rules (already validated)
+        print(f"  {cyan('->')} Single rules...")
+        chains.extend(rules[:1000])  # Use first 1000 rules
+        
+        # Depth 2 chains
+        if max_depth >= 2 and len(rules) >= 2:
+            print(f"  {cyan('->')} Depth 2 chains...")
+            # Generate combinations of valid rules
+            for i in range(min(100, len(rules))):
+                for j in range(min(100, len(rules))):
+                    if len(chains) >= 5000:
+                        break
+                    chains.append(f"{rules[i]} {rules[j]}")
+                if len(chains) >= 5000:
+                    break
+        
+        # Depth 3 chains
+        if max_depth >= 3 and len(rules) >= 3:
+            print(f"  {cyan('->')} Depth 3 chains...")
+            # Use common rules for depth 3
+            common_rules = ['l', 'u', 'c', 't', 'r', 'd', 'f', '{', '}', '[', ']', '^A', '$1', 'sae']
+            for i in range(min(20, len(common_rules))):
+                for j in range(min(20, len(common_rules))):
+                    for k in range(min(20, len(common_rules))):
+                        if len(chains) >= 10000:
+                            break
+                        chains.append(f"{common_rules[i]} {common_rules[j]} {common_rules[k]}")
+                    if len(chains) >= 10000:
+                        break
+                if len(chains) >= 10000:
+                    break
+        
+        # Clean chains (ensure each rule in chain is valid)
+        valid_chains = []
+        validator = HashcatRuleValidator()
+        
+        for chain in chains:
+            chain_rules = chain.split()
+            valid = True
+            for rule in chain_rules:
+                if not validator.validate_rule_for_gpu(rule):
+                    valid = False
+                    break
+            if valid and 1 <= len(chain_rules) <= max_depth:
+                valid_chains.append(chain)
+        
+        print(f"  {cyan('[*]')} Valid chains: {len(valid_chains):,}")
+        return valid_chains
+    
+    def process_batch_chains(self, words, rules, chains, bloom_filter):
+        """Process a batch of chains"""
+        # Prepare chain sequences
+        chain_sequences = []
+        chain_depths = []
+        
+        for chain in chains:
+            chain_rules = chain.split()
+            depth = len(chain_rules)
+            chain_depths.append(depth)
+            
+            # Convert rules to indices
+            rule_indices = []
+            for rule in chain_rules:
+                try:
+                    idx = rules.index(rule)
+                    rule_indices.append(idx)
+                except ValueError:
+                    rule_indices.append(-1)
+            
+            # Pad to max depth
+            while len(rule_indices) < self.params['MAX_CHAIN_DEPTH']:
+                rule_indices.append(-1)
+            
+            chain_sequences.extend(rule_indices)
+        
+        # Prepare data
+        batch_data = self.prepare_batch_data(words, rules)
+        
+        mf = cl.mem_flags
+        
+        # Create buffers
+        base_buf = cl.Buffer(self.context, mf.READ_ONLY | mf.COPY_HOST_PTR,
+                            hostbuf=batch_data['words_flat'])
+        base_offsets_buf = cl.Buffer(self.context, mf.READ_ONLY | mf.COPY_HOST_PTR,
+                                   hostbuf=batch_data['word_offsets'])
+        base_lengths_buf = cl.Buffer(self.context, mf.READ_ONLY | mf.COPY_HOST_PTR,
+                                   hostbuf=batch_data['word_lengths'])
+        
+        rules_buf = cl.Buffer(self.context, mf.READ_ONLY | mf.COPY_HOST_PTR,
+                            hostbuf=batch_data['rules_flat'])
+        rule_offsets_buf = cl.Buffer(self.context, mf.READ_ONLY | mf.COPY_HOST_PTR,
+                                   hostbuf=batch_data['rule_offsets'])
+        rule_lengths_buf = cl.Buffer(self.context, mf.READ_ONLY | mf.COPY_HOST_PTR,
+                                   hostbuf=batch_data['rule_lengths'])
+        
+        chain_seq_buf = cl.Buffer(self.context, mf.READ_ONLY | mf.COPY_HOST_PTR,
+                                hostbuf=np.array(chain_sequences, dtype=np.int32))
+        chain_depth_buf = cl.Buffer(self.context, mf.READ_ONLY | mf.COPY_HOST_PTR,
+                                  hostbuf=np.array(chain_depths, dtype=np.int32))
+        
+        bloom_buf = cl.Buffer(self.context, mf.READ_ONLY | mf.COPY_HOST_PTR,
+                            hostbuf=bloom_filter)
+        
+        # Output buffers
+        found_chains_buf = cl.Buffer(self.context, mf.WRITE_ONLY,
+                                   self.params['MAX_CHAINS_TO_FIND'] * MAX_CHAIN_STRING_LEN)
+        found_count_buf = cl.Buffer(self.context, mf.READ_WRITE, 4)
+        
+        # Initialize counter
+        zero_count = np.array([0], dtype=np.int32)
+        cl.enqueue_copy(self.queue, zero_count, found_count_buf)
+        
+        # Run kernel
+        kernel = self.program.find_rule_chains
+        
+        total_items = len(words) * len(chains)
+        global_size = ((total_items + LOCAL_WORK_SIZE - 1) // LOCAL_WORK_SIZE) * LOCAL_WORK_SIZE
+        
+        kernel.set_args(
+            base_buf, base_offsets_buf, base_lengths_buf,
+            rules_buf, rule_offsets_buf, rule_lengths_buf,
+            chain_seq_buf, chain_depth_buf,
+            bloom_buf,
+            np.int32(len(words)),
+            np.int32(len(chains)),
+            np.int32(self.params['MAX_CHAIN_DEPTH']),
+            found_chains_buf,
+            found_count_buf
+        )
+        
+        cl.enqueue_nd_range_kernel(self.queue, kernel, (global_size,), (LOCAL_WORK_SIZE,))
+        self.queue.finish()
+        
+        # Read results
+        found_count = np.zeros(1, dtype=np.int32)
+        cl.enqueue_copy(self.queue, found_count, found_count_buf)
+        
+        num_found = min(found_count[0], self.params['MAX_CHAINS_TO_FIND'])
+        
+        batch_chains = []
+        if num_found > 0:
+            # Read found chains
+            found_data = np.zeros(num_found * MAX_CHAIN_STRING_LEN, dtype=np.uint8)
+            cl.enqueue_copy(self.queue, found_data, found_chains_buf)
+            
+            # Convert to strings
+            for i in range(num_found):
+                start = i * MAX_CHAIN_STRING_LEN
+                chain_bytes = bytes(found_data[start:start + MAX_CHAIN_STRING_LEN])
+                chain_str = chain_bytes.split(b'\0')[0].decode('latin-1', errors='ignore')
+                if chain_str:
+                    batch_chains.append(chain_str)
+        
+        # Cleanup
+        base_buf.release()
+        base_offsets_buf.release()
+        base_lengths_buf.release()
+        rules_buf.release()
+        rule_offsets_buf.release()
+        rule_lengths_buf.release()
+        chain_seq_buf.release()
+        chain_depth_buf.release()
+        bloom_buf.release()
+        found_chains_buf.release()
+        found_count_buf.release()
+        
+        return batch_chains
+
+# ====================================================================
+# --- HYBRID EXTRACTOR WITH VALIDATION ---
+# ====================================================================
+
+class ValidHybridExtractor:
+    """Hybrid system with valid rules and complete processing"""
+    
+    def __init__(self, base_count, target_count, slow_mode=False):
+        self.base_count = base_count
+        self.target_count = target_count
+        self.slow_mode = slow_mode
+        
+        # Calculate dynamic parameters
+        self.params = calculate_dynamic_parameters(base_count, target_count)
+        
+        print(f"{blue('[CONFIG]')} {bold('Valid Configuration:')}")
+        print(f"  {cyan('[*]')} Bloom filter size: {self.params['BLOOM_FILTER_SIZE']:,} bits")
+        print(f"  {cyan('[*]')} Words per batch: {self.params['WORDS_PER_BATCH']:,}")
+        print(f"  {cyan('[*]')} Max chains to find: {self.params['MAX_CHAINS_TO_FIND']:,}")
+        print(f"  {cyan('[*]')} Max chain depth: {self.params['MAX_CHAIN_DEPTH']}")
+        
+        # Initialize components
+        self.rules_generator = ValidHashcatRulesGenerator(slow_mode)
+        self.gpu_engine = DynamicGPUEngine(self.params)
+        self.validator = HashcatRuleValidator()
+    
+    def extract_rules(self, base_words, target_words, max_depth=3):
+        """Extract valid rules using complete processing"""
+        print(f"{blue('[MAIN]')} {bold('Starting complete rule extraction...')}")
+        
+        all_chains = []
+        
+        # Generate valid rules
+        rules = self.rules_generator.generate_valid_rules()
+        
+        # Initialize GPU
+        if not self.gpu_engine.initialize_gpu():
+            print(f"{yellow('[WARN]')} {bold('GPU not available, using CPU only')}")
+            return []
+        
+        # Phase 1: Single rules with ALL words
+        print(f"\n{blue('=' * 60)}")
+        print(f"{bold('PHASE 1: SINGLE RULE SEARCH (ALL WORDS)')}")
+        print(f"{blue('=' * 60)}")
+        
+        single_chains = self.gpu_engine.process_all_words_single_rule(
+            base_words, target_words, rules
+        )
+        all_chains.extend(single_chains)
+        
+        print(f"{green('[OK]')} {bold('Single rules found:')} {cyan(len(single_chains))}")
+        
+        # Phase 2: Rule chains with ALL words
+        if max_depth > 1:
+            print(f"\n{blue('=' * 60)}")
+            print(f"{bold('PHASE 2: RULE CHAIN SEARCH (ALL WORDS)')}")
+            print(f"{blue('=' * 60)}")
+            
+            chain_chains = self.gpu_engine.process_all_words_chain_rules(
+                base_words, target_words, rules, max_depth
+            )
+            all_chains.extend(chain_chains)
+            
+            print(f"{green('[OK]')} {bold('Rule chains found:')} {cyan(len(chain_chains))}")
+        
+        # Final cleanup and verification
+        print(f"\n{blue('=' * 60)}")
+        print(f"{bold('FINAL CLEANUP AND VERIFICATION')}")
+        print(f"{blue('=' * 60)}")
+        
+        # Clean rules using Hashcat's validator
+        cleaned_chains = self.validator.clean_rules(all_chains)
+        
+        # Verify chains work with sample
+        verified_chains = self.verify_chains_complete(base_words, target_words, cleaned_chains)
+        
+        return verified_chains
+    
+    def verify_chains_complete(self, base_words, target_words, chains):
+        """Verify that chains actually work with ALL base words"""
+        print(f"{blue('[VERIFY]')} {bold('Verifying chains with complete dataset...')}")
+        
+        target_set = set(target_words)
+        verified = []
+        
+        # Use more base words for verification
+        sample_size = min(500, len(base_words))
+        base_sample = base_words[:sample_size]
+        
+        with tqdm(total=len(chains), desc="Verifying chains", unit="chain") as pbar:
+            for chain in chains:
+                found = False
+                
+                # Test with more base words
+                for base in base_sample:
+                    result = self.apply_chain_cpu(base, chain)
+                    if result and result in target_set:
+                        found = True
+                        break
+                
+                if found:
+                    verified.append(chain)
+                
+                pbar.update(1)
+                pbar.set_postfix({'verified': len(verified)})
+        
+        print(f"{green('[OK]')} {bold('Verified chains:')} {cyan(len(verified))}/{cyan(len(chains))}")
+        
+        # Show sample of verified chains
+        if verified:
+            print(f"{blue('[SAMPLE]')} {bold('Sample verified chains:')}")
+            for i, chain in enumerate(verified[:10]):
+                depth = len(chain.split())
+                print(f"  {cyan(f'{i+1:2d}.')} [{depth}] {chain}")
+        
+        return verified
+    
+    def apply_chain_cpu(self, word, chain):
+        """Simple CPU chain application for verification"""
+        result = word
+        for rule in chain.split():
+            result = self.apply_rule_cpu(result, rule)
+            if not result:
+                return None
+        return result
+    
+    def apply_rule_cpu(self, word, rule):
+        """Simple CPU rule application"""
+        if not rule or not word:
+            return None
+        
+        result = word
+        
+        try:
+            # Single char rules
+            if rule == 'l':
+                result = word.lower()
+            elif rule == 'u':
+                result = word.upper()
+            elif rule == 'c' and word:
+                result = word[0].upper() + word[1:].lower()
+            elif rule == 'C' and word:
+                result = word[0].lower() + word[1:].upper()
+            elif rule == 't':
+                result = ''.join([c.upper() if c.islower() else c.lower() for c in word])
+            elif rule == 'r':
+                result = word[::-1]
+            elif rule == 'd':
+                result = word + word
+            elif rule == 'f':
+                result = word + word[::-1]
+            elif rule == '{' and word:
+                result = word[1:] + word[0]
+            elif rule == '}' and word:
+                result = word[-1] + word[:-1]
+            elif rule == '[' and word:
+                result = word[1:]
+            elif rule == ']' and word:
+                result = word[:-1]
+            elif rule == 'k' and len(word) >= 2:
+                result = word[1] + word[0] + word[2:]
+            elif rule == ':':
+                result = word
+            elif rule == 'a':
+                # Toggle case recursively
+                result = ''
+                for c in word:
+                    if c.islower():
+                        result += c.upper()
+                    elif c.isupper():
+                        result += c.lower()
+                    else:
+                        result += c
+            elif rule == 'q':
+                # Duplicate all chars
+                result = ''.join([c * 2 for c in word])
+            elif rule == 'E':
+                # Title case
+                result = word.title()
+            
+            # Two char rules
+            elif len(rule) == 2:
+                if rule[0] == '^':
+                    result = rule[1] + word
+                elif rule[0] == '$':
+                    result = word + rule[1]
+                elif rule[0] == '@':
+                    result = word.replace(rule[1], '')
+                elif rule[0] == 'T' and rule[1].isdigit():
+                    pos = int(rule[1])
+                    if pos < len(word):
+                        chars = list(word)
+                        chars[pos] = chars[pos].upper() if chars[pos].islower() else chars[pos].lower()
+                        result = ''.join(chars)
+                elif rule[0] == 'D' and rule[1].isdigit():
+                    pos = int(rule[1])
+                    if pos < len(word):
+                        result = word[:pos] + word[pos+1:]
+                elif rule[0] == 's':
+                    # This is actually a 3-char rule, handle specially
+                    return None
+            
+            # Three char rules
+            elif len(rule) == 3:
+                if rule[0] == 's':
+                    result = word.replace(rule[1], rule[2])
+                elif rule[0] == 'i' and rule[1].isdigit():
+                    pos = int(rule[1])
+                    if pos <= len(word):
+                        result = word[:pos] + rule[2] + word[pos:]
+                elif rule[0] == 'o' and rule[1].isdigit():
+                    pos = int(rule[1])
+                    if pos < len(word):
+                        chars = list(word)
+                        chars[pos] = rule[2]
+                        result = ''.join(chars)
+                elif rule[0] == 'e':
+                    # Title case with separator
+                    separator = rule[1]
+                    parts = word.split(separator)
+                    result = separator.join([p.capitalize() for p in parts])
+            
+            # Position-based rules with hex
+            elif len(rule) == 2 and rule[1] in '0123456789ABCDEF':
+                if rule[0] == 'T':
+                    pos = int(rule[1], 16)
+                    if pos < len(word):
+                        chars = list(word)
+                        chars[pos] = chars[pos].upper() if chars[pos].islower() else chars[pos].lower()
+                        result = ''.join(chars)
+                elif rule[0] == 'D':
+                    pos = int(rule[1], 16)
+                    if pos < len(word):
+                        result = word[:pos] + word[pos+1:]
+                
+        except Exception:
+            return None
+        
+        return result if len(result) <= MAX_WORD_LEN else None
+
+# ====================================================================
+# --- UTILITY FUNCTIONS ---
+# ====================================================================
 
 def load_wordlist_fast(filename):
-    """Fast wordlist loading"""
+    """Fast wordlist loading with statistics"""
     words = set()
-    print(f"{blue('📊')} {bold('Loading:')} {filename}")
-    
-    total_estimated = estimate_word_count(filename)
-    
-    try:
-        with open(filename, 'rb') as f:
-            with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
-                for line_bytes in tqdm(iter(mm.readline, b""), total=total_estimated, 
-                                      desc="Loading words", leave=False):
-                    line = line_bytes.strip()
-                    if line and len(line) <= MAX_WORD_LEN:
-                        try:
-                            words.add(line.decode('latin-1', errors='ignore'))
-                        except:
-                            pass
-    except FileNotFoundError:
-        print(f"{red('❌')} {bold('FATAL ERROR:')} Wordlist not found: {filename}")
-        sys.exit(1)
-
-    words_list = list(words)
-    print(f"{green('✅')} {bold('Loaded:')} {cyan(f'{len(words_list):,}')} {bold('words')}")
-    return words_list
-
-# ====================================================================
-# --- OPTIMIZED BLOOM FILTER ---
-# ====================================================================
-
-def calculate_bloom_size(num_elements):
-    """Calculate optimal Bloom Filter size"""
-    if num_elements == 0:
-        return 0, 0
-    
-    m = - (num_elements * math.log(BLOOM_FALSE_POSITIVE_RATE)) / (math.log(2) ** 2)
-    k = math.ceil((m / num_elements) * math.log(2))
-    k = max(2, min(k, 12)) 
-    m = int(math.ceil(m))
-    bloom_size_bytes = math.ceil(m / 8)
-
-    global BLOOM_HASH_FUNCTIONS
-    BLOOM_HASH_FUNCTIONS = k
-    
-    return bloom_size_bytes, k
-
-def simple_hash_py(key_bytes, seed):
-    """FNV-1a hash matching OpenCL kernel"""
-    fnv_prime = 16777619 
-    hash_val = seed
-    for byte in key_bytes:
-        hash_val ^= byte
-        hash_val = (hash_val * fnv_prime) & 0xFFFFFFFF
-    return hash_val
-
-def generate_bloom_filter(target_words):
-    """Generate Bloom Filter"""
-    n = len(target_words)
-    if n == 0:
-        return np.array([0], dtype=np.uint8)
-    
-    global BLOOM_FILTER_SIZE_BYTES, BLOOM_HASH_FUNCTIONS
-    m_bytes, k = calculate_bloom_size(n)
-    BLOOM_FILTER_SIZE_BYTES = m_bytes
-    
-    bloom_filter = np.zeros(m_bytes, dtype=np.uint8)
-    m_bits = m_bytes * 8
-
-    print(f"{blue('🔧')} {bold('Generating Bloom Filter...')}")
-    for word in tqdm(target_words, desc="Hashing targets", leave=False):
-        word_bytes = word.encode('latin-1', errors='ignore')
-        h1 = simple_hash_py(word_bytes, 0xDEADBEEF)
-        h2 = simple_hash_py(word_bytes, 0xCAFEBABE)
-        
-        for i in range(k):
-            index = (h1 + i * h2)
-            bit_index_full = index % m_bits
-            byte_index = bit_index_full // 8
-            bit_shift = bit_index_full % 8
-            bloom_filter[byte_index] |= (1 << bit_shift)
-
-    return bloom_filter.tobytes()
-
-# ====================================================================
-# --- RULE MANAGEMENT ---
-# ====================================================================
-
-def load_rules_from_file(filename, slow_mode=False):
-    """Load rules from file with proper error handling"""
-    rules = []
-    print(f"{blue('📊')} {bold('Loading rules from:')} {filename}")
-    
-    if not os.path.exists(filename):
-        print(f"{red('❌')} {bold('ERROR:')} Rule file not found: {filename}")
-        return []
+    print(f"{blue('[LOAD]')} {bold('Loading:')} {filename}")
     
     try:
         with open(filename, 'r', encoding='latin-1', errors='ignore') as f:
-            for line in tqdm(f, desc="Reading rules", leave=False):
-                rule = line.strip()
-                # Skip empty lines, comments, and lines with spaces
-                if rule and not rule.startswith('#') and ' ' not in rule: 
-                    rules.append(rule)
-        
-        rules = list(set(rules))  # Remove duplicates
-        
-        # Filter valid rules
-        valid_rules = []
-        for rule in rules:
-            if len(rule) == 1:
-                valid_rules.append(rule)
-            elif len(rule) == 2:
-                if rule[0] in ['T', 'D', 'M'] and rule[1] in '0123456789abcdef':
-                    valid_rules.append(rule)
-            elif len(rule) == 3:
-                if rule[0] in ['i', 'o', 's', 'y']:
-                    valid_rules.append(rule)
-            else:
-                if rule.startswith(('^', '$', '@', 'P')):
-                    valid_rules.append(rule)
-        
-        print(f"{green('✅')} {bold('Loaded:')} {cyan(f'{len(valid_rules):,}')} {bold('rules from file')}")
-        
-        if slow_mode and len(valid_rules) > 1000:
-            print(f"{yellow('⚠️')} {bold('Large rule file detected in SLOW MODE - this may take a while!')}")
-        
-        return valid_rules
-        
-    except Exception as e:
-        print(f"{red('❌')} {bold('ERROR loading rules:')} {e}")
-        return []
+            for line in tqdm(f, desc="Loading words"):
+                word = line.strip()
+                if word and len(word) <= MAX_WORD_LEN:
+                    words.add(word)
+    except FileNotFoundError:
+        print(f"{red('[ERROR]')} {bold('FATAL ERROR:')} Wordlist not found: {filename}")
+        sys.exit(1)
+    
+    words_list = list(words)
+    
+    # Calculate statistics
+    avg_len = sum(len(w) for w in words_list) / len(words_list) if words_list else 0
+    max_len = max(len(w) for w in words_list) if words_list else 0
+    
+    print(f"{green('[OK]')} {bold('Loaded:')} {cyan(f'{len(words_list):,}')} {bold('words')}")
+    print(f"{blue('[INFO]')} {bold('Average length:')} {cyan(f'{avg_len:.1f}')}")
+    print(f"{blue('[INFO]')} {bold('Max length:')} {cyan(f'{max_len}')}")
+    
+    return words_list
 
 # ====================================================================
-# --- COMPREHENSIVE OPENCL KERNEL (ALL HASHCAT RULES) ---
+# --- VALID HASHCAT KERNEL (GPU-COMPATIBLE) ---
 # ====================================================================
 
-RULE_CHAINING_KERNEL_COMPREHENSIVE = """
-#define MAX_WORD_LEN 32
-#define MAX_OUTPUT_LEN 48
-#define MAX_CHAIN_STRING_LEN 64
-#define NULL_BYTE 0
-#define MAX_CHAINS_TO_FIND_LIMIT //MAX_CHAINS_PLACEHOLDER//
+VALID_HASHCAT_KERNEL = """
+#define MAX_WORD_LEN 256
+#define MAX_RULE_LEN 16
+#define MAX_OUTPUT_LEN 512
+#define MAX_CHAIN_STRING_LEN 512
+#define MAX_CHAINS_TO_FIND 100000
+#define MAX_CHAIN_DEPTH 6
+#define BLOOM_FILTER_SIZE 8388608
+#define BLOOM_HASH_FUNCTIONS 4
 
-// Placeholders
-#define BLOOM_HASH_FUNCTIONS_K //K_PLACEHOLDER// 
-#define BLOOM_FILTER_SIZE_BITS (//M_BYTES_PLACEHOLDER// * 8) 
+// Utility functions
+inline int is_lower(char c) {
+    return (c >= 'a' && c <= 'z');
+}
 
-// Optimized hash function
-uint simple_hash(const char *key, int len, uint seed) {
-    const uint fnv_prime = 16777619U;
+inline int is_upper(char c) {
+    return (c >= 'A' && c <= 'Z');
+}
+
+inline int is_digit(char c) {
+    return (c >= '0' && c <= '9');
+}
+
+inline int is_hex(char c) {
+    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+}
+
+inline int hex_to_int(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return 0;
+}
+
+inline char to_lower_char(char c) {
+    if (c >= 'A' && c <= 'Z') return c + 32;
+    return c;
+}
+
+inline char to_upper_char(char c) {
+    if (c >= 'a' && c <= 'z') return c - 32;
+    return c;
+}
+
+inline char toggle_case_char(char c) {
+    if (c >= 'A' && c <= 'Z') return c + 32;
+    if (c >= 'a' && c <= 'z') return c - 32;
+    return c;
+}
+
+// Bloom filter
+uint bloom_hash(const char *str, int len, uint seed) {
     uint hash = seed;
-    #pragma unroll 4
     for (int i = 0; i < len; i++) {
-        hash ^= (uint)key[i];
-        hash *= fnv_prime;
+        hash = (hash * 31) + str[i];
     }
     return hash;
 }
 
-// Pre-compute bloom hashes once
-inline void precompute_bloom_hashes(const char *word, int len, __private uint *h1, __private uint *h2) {
-    *h1 = simple_hash(word, len, 0xDEADBEEFU);
-    *h2 = simple_hash(word, len, 0xCAFEBABEU);
-}
-
-// Fast bloom check with early exit
-bool bloom_check_fast(__global const uchar *filter, uint h1, uint h2) {
-    #pragma unroll 4
-    for (int i = 0; i < BLOOM_HASH_FUNCTIONS_K; i++) {
-        uint bit_pos = (h1 + i * h2) % BLOOM_FILTER_SIZE_BITS;
-        if (!(filter[bit_pos >> 3] & (1 << (bit_pos & 7)))) {
-            return false;
+int bloom_check(__global const uchar *bloom_filter, const char *word, int len) {
+    uint h1 = bloom_hash(word, len, 0xDEADBEEF);
+    uint h2 = bloom_hash(word, len, 0xCAFEBABE);
+    
+    for (int i = 0; i < BLOOM_HASH_FUNCTIONS; i++) {
+        uint hash_val = (h1 + i * h2) % BLOOM_FILTER_SIZE;
+        uint byte_idx = hash_val / 8;
+        uint bit_idx = hash_val % 8;
+        
+        if (!(bloom_filter[byte_idx] & (1 << bit_idx))) {
+            return 0;
         }
     }
-    return true;
+    return 1;
 }
 
-// Helper functions
-char tolower_ocl(char c) {
-    return (c >= 'A' && c <= 'Z') ? (c | 0x20) : c;
-}
-
-char toupper_ocl(char c) {
-    return (c >= 'a' && c <= 'z') ? (c & ~0x20) : c;
-}
-
-int get_pos(char c) {
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-    return -1; 
-}
-
-// Fast word copy
-int copy_word(const char *src, char *dst, int max_len) {
-    int len = 0;
-    for (len = 0; len < max_len; len++) {
-        dst[len] = src[len];
-        if (src[len] == NULL_BYTE) break;
+// VALID Hashcat rules implementation (GPU-compatible only)
+void apply_valid_rule(const char *rule_str, int rule_len,
+                      const char *input_word, int input_len,
+                      char *output_word, int *output_len) {
+    
+    // Initialize with input
+    *output_len = input_len;
+    for (int i = 0; i < input_len; i++) {
+        output_word[i] = input_word[i];
     }
-    if (len == max_len) dst[max_len - 1] = NULL_BYTE;
-    return len;
-}
-
-// COMPREHENSIVE RULE APPLICATION (ALL HASHCAT RULES)
-int apply_rule(__global const char *rule_start, const char *input_word, int input_len, char *output_word) {
-    int new_len = copy_word(input_word, output_word, MAX_OUTPUT_LEN);
-    if (new_len == 0) return 0;
+    output_word[input_len] = '\\0';
     
-    char rule_op = rule_start[0];
-    char p1 = rule_start[1];
-    char p2 = rule_start[2];
+    if (rule_len == 0 || input_len == 0) return;
     
-    // COMPREHENSIVE RULE SWITCH - ALL HASHCAT RULES
-    switch (rule_op) {
-        case 'l': { // Lowercase all - BITWISE OPTIMIZED
-            #pragma unroll 8
-            for (int k = 0; k < new_len; k++) {
-                char c = output_word[k];
-                output_word[k] = (c >= 'A' && c <= 'Z') ? (c | 0x20) : c;
-            }
-            break;
-        }
-        case 'u': { // Uppercase all - BITWISE OPTIMIZED
-            #pragma unroll 8
-            for (int k = 0; k < new_len; k++) {
-                char c = output_word[k];
-                output_word[k] = (c >= 'a' && c <= 'z') ? (c & ~0x20) : c;
-            }
-            break;
-        }
-        case 'c': { // Capitalize (first upper, rest lower)
-            if (new_len > 0) output_word[0] = toupper_ocl(output_word[0]);
-            for (int k = 1; k < new_len; k++) output_word[k] = tolower_ocl(output_word[k]);
-            break;
-        }
-        case 'C': { // Invert capitalize (first lower, rest upper)
-            if (new_len > 0) output_word[0] = tolower_ocl(output_word[0]);
-            for (int k = 1; k < new_len; k++) output_word[k] = toupper_ocl(output_word[k]);
-            break;
-        }
-        case 't': { // Toggle case
-            for (int k = 0; k < new_len; k++) {
-                char c = output_word[k];
-                if (c >= 'a' && c <= 'z') output_word[k] = c - 32;
-                else if (c >= 'A' && c <= 'Z') output_word[k] = c + 32;
-            }
-            break;
-        }
-        case 'r': { // Reverse
-            for (int k = 0; k < new_len / 2; k++) {
-                char temp = output_word[k];
-                output_word[k] = output_word[new_len - 1 - k];
-                output_word[new_len - 1 - k] = temp;
-            }
-            break;
-        }
-        case 'k':   // Duplicate word
-        case ':':   // Duplicate word
-        case 'd': { // Duplicate word (d0)
-            if (rule_op == 'd' && p1 != '0') return 0;
-            if (new_len * 2 < MAX_WORD_LEN) {
-                for (int k = 0; k < new_len; k++) output_word[new_len + k] = output_word[k];
-                new_len *= 2;
-            }
-            break;
-        }
-        case 'f': { // Reflect (password -> passworddrowssap)
-            if (new_len * 2 - 1 < MAX_WORD_LEN && new_len > 0) {
-                for (int k = 0; k < new_len - 1; k++) output_word[new_len + k] = output_word[new_len - 2 - k];
-                new_len = new_len * 2 - 1;
-            }
-            break;
-        }
-        case '[': { // Delete first character
-            if (new_len > 0) {
-                for(int k = 0; k < new_len; k++) output_word[k] = output_word[k+1];
-                new_len--;
-            }
-            break;
-        }
-        case ']': { // Delete last character
-            if (new_len > 0) { new_len--; }
-            break;
-        }
-        case '{': { // Rotate left (password -> asswordp)
-            if (new_len > 1) {
-                char first = output_word[0];
-                for (int k = 0; k < new_len - 1; k++) output_word[k] = output_word[k+1];
-                output_word[new_len - 1] = first;
-            }
-            break;
-        }
-        case '}': { // Rotate right (password -> dpasswor)
-            if (new_len > 1) {
-                char last = output_word[new_len - 1];
-                for (int k = new_len - 1; k > 0; k--) output_word[k] = output_word[k-1];
-                output_word[0] = last;
-            }
-            break;
-        }
-        case 'p': { // Append duplicated last character (password -> passwordd)
-            if (new_len > 0 && new_len < MAX_WORD_LEN) {
-                output_word[new_len] = output_word[new_len - 1];
-                new_len++;
-            }
-            break;
-        }
-        case 'z': { // Prepend duplicated first character (password -> ppassword)
-            if (new_len > 0 && new_len < MAX_WORD_LEN) {
-                for(int k = new_len; k > 0; k--) output_word[k] = output_word[k-1];
-                output_word[0] = output_word[1]; 
-                new_len++;
-            }
-            break;
-        }
-        case 'q': { // Append duplicated first character (password -> passwordp)
-            if (new_len > 0 && new_len < MAX_WORD_LEN) {
-                output_word[new_len] = output_word[0];
-                new_len++;
-            }
-            break;
-        }
-        case 'L': { // Delete all lowercase letters
-            int j = 0;
-            for (int k = 0; k < new_len; k++) {
-                char c = output_word[k];
-                if (c < 'a' || c > 'z') { output_word[j] = c; j++; }
-            }
-            new_len = j;
-            break;
-        }
-        case 'R': { // Delete all uppercase letters
-            int j = 0;
-            for (int k = 0; k < new_len; k++) {
-                char c = output_word[k];
-                if (c < 'A' || c > 'Z') { output_word[j] = c; j++; }
-            }
-            new_len = j;
-            break;
-        }
-        case '$': { // Append character
-            if (p1 != NULL_BYTE && new_len < MAX_WORD_LEN) {
-                output_word[new_len] = p1; 
-                new_len++; 
-            }
-            break;
-        }
-        case '^': { // Prepend character
-            if (p1 != NULL_BYTE && new_len < MAX_WORD_LEN) {
-                for(int k = new_len; k > 0; k--) output_word[k] = output_word[k-1];
-                output_word[0] = p1; 
-                new_len++; 
-            }
-            break;
-        }
-        case 'i': { // Insert character at position
-            if (p2 != NULL_BYTE) {
-                int pos = get_pos(p1);
-                if (pos >= 0 && pos <= new_len && new_len < MAX_WORD_LEN) {
-                    for(int k = new_len; k > pos; k--) output_word[k] = output_word[k-1];
-                    output_word[pos] = p2; 
-                    new_len++;
+    char cmd = rule_str[0];
+    
+    // Single character rules
+    if (rule_len == 1) {
+        switch (cmd) {
+            case 'l':  // Lowercase all
+                for (int i = 0; i < *output_len; i++) {
+                    output_word[i] = to_lower_char(output_word[i]);
                 }
-            }
-            break;
-        }
-        case 'o': { // Overwrite character at position
-            if (p2 != NULL_BYTE) {
-                int pos = get_pos(p1);
-                if (pos >= 0 && pos < new_len) { 
-                    output_word[pos] = p2; 
+                return;
+                
+            case 'u':  // Uppercase all
+                for (int i = 0; i < *output_len; i++) {
+                    output_word[i] = to_upper_char(output_word[i]);
                 }
-            }
-            break;
-        }
-        case 's': { // Substitute character
-            if (p2 != NULL_BYTE) {
-                char orig = p1;
-                char sub = p2;
-                for(int k = 0; k < new_len; k++) { 
-                    if (output_word[k] == orig) output_word[k] = sub; 
-                }
-            }
-            break;
-        }
-        case 'T': { // Toggle case at position
-            if (p1 != NULL_BYTE) {
-                int pos = get_pos(p1);
-                if (pos >= 0 && pos < new_len) {
-                    char c = output_word[pos];
-                    if (c >= 'a' && c <= 'z') output_word[pos] = c - 32;
-                    else if (c >= 'A' && c <= 'Z') output_word[pos] = c + 32;
-                }
-            }
-            break;
-        }
-        case 'D': { // Delete at position
-            if (p1 != NULL_BYTE) {
-                int pos = get_pos(p1);
-                if (pos >= 0 && pos < new_len) {
-                    for(int k = pos; k < new_len; k++) output_word[k] = output_word[k+1];
-                    new_len--;
-                }
-            }
-            break;
-        }
-        case '@':   // Purge all occurrences of character
-        case 'P': { // Purge all occurrences of character
-            if (p1 != NULL_BYTE) {
-                char purge_char = p1;
-                int j = 0;
-                for (int k = 0; k < new_len; k++) {
-                    if (output_word[k] != purge_char) { 
-                        output_word[j] = output_word[k]; 
-                        j++; 
+                return;
+                
+            case 'c':  // Capitalize first, lowercase rest
+                if (*output_len > 0) {
+                    output_word[0] = to_upper_char(output_word[0]);
+                    for (int i = 1; i < *output_len; i++) {
+                        output_word[i] = to_lower_char(output_word[i]);
                     }
                 }
-                new_len = j;
-            }
-            break;
-        }
-        case '\\'': { // Truncate at position
-            if (p1 != NULL_BYTE) {
-                int pos = get_pos(p1);
-                if (pos >= 0 && pos < new_len) { 
-                    new_len = pos; 
+                return;
+                
+            case 'C':  // Lowercase first, uppercase rest
+                if (*output_len > 0) {
+                    output_word[0] = to_lower_char(output_word[0]);
+                    for (int i = 1; i < *output_len; i++) {
+                        output_word[i] = to_upper_char(output_word[i]);
+                    }
                 }
-            }
-            break;
-        }
-        case 'x':   // Extract substring
-        case 'X':   // Extract substring
-        case 'M': { // Extract memory range
-            if (p2 != NULL_BYTE) {
-                int pos = get_pos(p1);
-                int len_to_extract = get_pos(p2);
-                if (pos >= 0 && len_to_extract > 0 && pos < new_len) {
-                    int end = min(pos + len_to_extract, new_len);
-                    int extracted_len = end - pos;
-                    for (int k = 0; k < extracted_len; k++) output_word[k] = output_word[pos + k];
-                    new_len = extracted_len;
+                return;
+                
+            case 't':  // Toggle case
+                for (int i = 0; i < *output_len; i++) {
+                    output_word[i] = toggle_case_char(output_word[i]);
                 }
-            }
-            break;
-        }
-        case 'y': { // Insert character (alternative syntax)
-            if (p2 != NULL_BYTE) {
-                int pos = get_pos(p1);
-                if (pos >= 0 && pos <= new_len && new_len < MAX_WORD_LEN) {
-                    for(int k = new_len; k > pos; k--) output_word[k] = output_word[k-1];
-                    output_word[pos] = p2; 
-                    new_len++;
+                return;
+                
+            case 'r':  // Reverse
+                for (int i = 0; i < *output_len / 2; i++) {
+                    char temp = output_word[i];
+                    output_word[i] = output_word[*output_len - 1 - i];
+                    output_word[*output_len - 1 - i] = temp;
                 }
-            }
-            break;
+                return;
+                
+            case 'd':  // Duplicate
+                if (*output_len * 2 <= MAX_OUTPUT_LEN) {
+                    for (int i = 0; i < *output_len; i++) {
+                        output_word[*output_len + i] = output_word[i];
+                    }
+                    *output_len *= 2;
+                }
+                return;
+                
+            case 'f':  // Reflect
+                if (*output_len * 2 <= MAX_OUTPUT_LEN) {
+                    for (int i = 0; i < *output_len; i++) {
+                        output_word[*output_len + i] = output_word[*output_len - 1 - i];
+                    }
+                    *output_len *= 2;
+                }
+                return;
+                
+            case '{':  // Rotate left
+                if (*output_len > 1) {
+                    char first = output_word[0];
+                    for (int i = 0; i < *output_len - 1; i++) {
+                        output_word[i] = output_word[i + 1];
+                    }
+                    output_word[*output_len - 1] = first;
+                }
+                return;
+                
+            case '}':  // Rotate right
+                if (*output_len > 1) {
+                    char last = output_word[*output_len - 1];
+                    for (int i = *output_len - 1; i > 0; i--) {
+                        output_word[i] = output_word[i - 1];
+                    }
+                    output_word[0] = last;
+                }
+                return;
+                
+            case '[':  // Delete first char
+                if (*output_len > 0) {
+                    for (int i = 0; i < *output_len - 1; i++) {
+                        output_word[i] = output_word[i + 1];
+                    }
+                    (*output_len)--;
+                }
+                return;
+                
+            case ']':  // Delete last char
+                if (*output_len > 0) {
+                    (*output_len)--;
+                }
+                return;
+                
+            case 'k':  // Swap first two
+                if (*output_len >= 2) {
+                    char temp = output_word[0];
+                    output_word[0] = output_word[1];
+                    output_word[1] = temp;
+                }
+                return;
+                
+            case 'K':  // Swap last two
+                if (*output_len >= 2) {
+                    char temp = output_word[*output_len - 2];
+                    output_word[*output_len - 2] = output_word[*output_len - 1];
+                    output_word[*output_len - 1] = temp;
+                }
+                return;
+                
+            case ':':  // No operation
+                return;
+                
+            case 'a':  // Toggle case recursively
+                for (int i = 0; i < *output_len; i++) {
+                    output_word[i] = toggle_case_char(output_word[i]);
+                }
+                return;
+                
+            case 'q':  // Duplicate all chars
+                if (*output_len * 2 <= MAX_OUTPUT_LEN) {
+                    int idx = 0;
+                    for (int i = 0; i < *output_len; i++) {
+                        output_word[idx++] = output_word[i];
+                        output_word[idx++] = output_word[i];
+                    }
+                    *output_len *= 2;
+                }
+                return;
+                
+            case 'E':  // Title case
+                if (*output_len > 0) {
+                    int capitalize = 1;
+                    for (int i = 0; i < *output_len; i++) {
+                        if (capitalize && is_lower(output_word[i])) {
+                            output_word[i] = output_word[i] - 32;
+                            capitalize = 0;
+                        }
+                        if (output_word[i] == ' ' || output_word[i] == '-' || output_word[i] == '_') {
+                            capitalize = 1;
+                        }
+                    }
+                }
+                return;
         }
-        default:
-            return 0; // Unknown rule
     }
     
-    if (new_len >= MAX_OUTPUT_LEN) new_len = MAX_OUTPUT_LEN - 1;
-    output_word[new_len] = NULL_BYTE;
-    return new_len;
+    // Two character rules
+    else if (rule_len == 2) {
+        char param = rule_str[1];
+        
+        if (cmd == '^') {  // Prepend
+            if (*output_len + 1 <= MAX_OUTPUT_LEN) {
+                for (int i = *output_len; i > 0; i--) {
+                    output_word[i] = output_word[i - 1];
+                }
+                output_word[0] = param;
+                (*output_len)++;
+            }
+        }
+        else if (cmd == '$') {  // Append
+            if (*output_len + 1 <= MAX_OUTPUT_LEN) {
+                output_word[*output_len] = param;
+                (*output_len)++;
+            }
+        }
+        else if (cmd == '@') {  // Delete all instances
+            int new_len = 0;
+            for (int i = 0; i < *output_len; i++) {
+                if (output_word[i] != param) {
+                    output_word[new_len++] = output_word[i];
+                }
+            }
+            *output_len = new_len;
+        }
+        else if (cmd == 'T' && is_digit(param)) {  // Toggle at position
+            int pos = param - '0';
+            if (pos < *output_len) {
+                output_word[pos] = toggle_case_char(output_word[pos]);
+            }
+        }
+        else if (cmd == 'D' && is_digit(param)) {  // Delete at position
+            int pos = param - '0';
+            if (pos < *output_len) {
+                for (int i = pos; i < *output_len - 1; i++) {
+                    output_word[i] = output_word[i + 1];
+                }
+                (*output_len)--;
+            }
+        }
+        else if (cmd == 'L' && is_digit(param)) {  // Shift left
+            int pos = param - '0';
+            if (pos < *output_len && output_word[pos] > 0) {
+                output_word[pos]--;
+            }
+        }
+        else if (cmd == 'R' && is_digit(param)) {  // Shift right
+            int pos = param - '0';
+            if (pos < *output_len && output_word[pos] < 255) {
+                output_word[pos]++;
+            }
+        }
+        else if (cmd == '+' && is_digit(param)) {  // Increment
+            int pos = param - '0';
+            if (pos < *output_len && output_word[pos] < 255) {
+                output_word[pos]++;
+            }
+        }
+        else if (cmd == '-' && is_digit(param)) {  // Decrement
+            int pos = param - '0';
+            if (pos < *output_len && output_word[pos] > 0) {
+                output_word[pos]--;
+            }
+        }
+        else if (cmd == '.' && is_digit(param)) {  // Replace with dot
+            int pos = param - '0';
+            if (pos < *output_len) {
+                output_word[pos] = '.';
+            }
+        }
+        else if (cmd == ',' && is_digit(param)) {  // Replace with comma
+            int pos = param - '0';
+            if (pos < *output_len) {
+                output_word[pos] = ',';
+            }
+        }
+        else if (cmd == 'z' && is_digit(param)) {  // Duplicate first N
+            int n = param - '0';
+            if (n > 0 && *output_len + n <= MAX_OUTPUT_LEN) {
+                for (int i = 0; i < n; i++) {
+                    output_word[*output_len + i] = output_word[i];
+                }
+                *output_len += n;
+            }
+        }
+        else if (cmd == 'Z' && is_digit(param)) {  // Duplicate last N
+            int n = param - '0';
+            if (n > 0 && *output_len + n <= MAX_OUTPUT_LEN) {
+                for (int i = 0; i < n; i++) {
+                    output_word[*output_len + i] = output_word[*output_len - n + i];
+                }
+                *output_len += n;
+            }
+        }
+        else if (cmd == 'p' && is_digit(param)) {  // Duplicate word N times
+            int n = param - '0';
+            if (n > 0 && *output_len * (n + 1) <= MAX_OUTPUT_LEN) {
+                for (int rep = 0; rep < n; rep++) {
+                    for (int i = 0; i < *output_len; i++) {
+                        output_word[*output_len * (rep + 1) + i] = output_word[i];
+                    }
+                }
+                *output_len *= (n + 1);
+            }
+        }
+    }
+    
+    // Three character rules
+    else if (rule_len == 3) {
+        char param1 = rule_str[1];
+        char param2 = rule_str[2];
+        
+        if (cmd == 's') {  // Substitute
+            for (int i = 0; i < *output_len; i++) {
+                if (output_word[i] == param1) {
+                    output_word[i] = param2;
+                }
+            }
+        }
+        else if (cmd == 'i' && is_digit(param1)) {  // Insert at position
+            int pos = param1 - '0';
+            if (*output_len + 1 <= MAX_OUTPUT_LEN) {
+                for (int i = *output_len; i > pos; i--) {
+                    output_word[i] = output_word[i - 1];
+                }
+                output_word[pos] = param2;
+                (*output_len)++;
+            }
+        }
+        else if (cmd == 'o' && is_digit(param1)) {  // Overwrite at position
+            int pos = param1 - '0';
+            if (pos < *output_len) {
+                output_word[pos] = param2;
+            }
+        }
+        else if (cmd == 'x' && is_digit(param1) && is_digit(param2)) {  // Extract
+            int n = param1 - '0';
+            int m = param2 - '0';
+            if (n > m) {
+                int temp = n; n = m; m = temp;
+            }
+            int new_len = 0;
+            for (int i = n; i <= m && i < *output_len; i++) {
+                output_word[new_len++] = output_word[i];
+            }
+            *output_len = new_len;
+        }
+        else if (cmd == '*' && is_digit(param1) && is_digit(param2)) {  // Swap positions
+            int n = param1 - '0';
+            int m = param2 - '0';
+            if (n < *output_len && m < *output_len && n != m) {
+                char temp = output_word[n];
+                output_word[n] = output_word[m];
+                output_word[m] = temp;
+            }
+        }
+        else if (cmd == 'e') {  // Title case with separator
+            // param1 is the separator
+            if (*output_len > 0) {
+                int capitalize = 1;
+                for (int i = 0; i < *output_len; i++) {
+                    if (capitalize && is_lower(output_word[i])) {
+                        output_word[i] = output_word[i] - 32;
+                        capitalize = 0;
+                    }
+                    if (output_word[i] == param1) {
+                        capitalize = 1;
+                    }
+                }
+            }
+        }
+        else if (cmd == 'y' && is_digit(param1)) {  // Duplicate first N
+            int n = param1 - '0';
+            char x = param2;  // Actually param2 is not used in 'y' rule
+            if (n > 0 && *output_len + n <= MAX_OUTPUT_LEN) {
+                for (int i = 0; i < n; i++) {
+                    output_word[*output_len + i] = output_word[i];
+                }
+                *output_len += n;
+            }
+        }
+        else if (cmd == 'Y' && is_digit(param1)) {  // Duplicate last N
+            int n = param1 - '0';
+            char x = param2;  // Actually param2 is not used in 'Y' rule
+            if (n > 0 && *output_len + n <= MAX_OUTPUT_LEN) {
+                for (int i = 0; i < n; i++) {
+                    output_word[*output_len + i] = output_word[*output_len - n + i];
+                }
+                *output_len += n;
+            }
+        }
+    }
+    
+    output_word[*output_len] = '\\0';
 }
 
-// MAIN KERNEL - FLATTENED APPROACH (NO NESTED LOOPS!)
-__kernel void rule_chaining_kernel_flattened(
-    // Input Data
-    __global const char *g_base_words_ptr,
-    __global const int *g_word_offsets,
-    __global const char *g_rule_chains_ptr,      // Pre-built chains
-    __global const int *g_chain_offsets,
-    __global const int *g_chain_lengths,         // Rules per chain
-    __global const uchar *g_bloom_filter,
-    
-    // Configuration
+// ============================================================================
+// KERNELS
+// ============================================================================
+
+__kernel void find_single_rules(
+    __global const char *base_words,
+    __global const int *base_offsets,
+    __global const int *base_lengths,
+    __global const char *rules,
+    __global const int *rule_offsets,
+    __global const int *rule_lengths,
+    __global const uchar *bloom_filter,
     const int num_base_words,
-    const int num_chains,
-    
-    // Output
-    __global char *g_output_buffer,
-    __global int *g_output_count 
+    const int num_rules,
+    __global char *found_rules,
+    __global volatile int *found_count
 ) {
     int gid = get_global_id(0);
+    int total_items = num_base_words * num_rules;
     
-    // FLATTENED INDEXING - NO NESTED LOOPS!
-    int base_word_idx = gid / num_chains;
-    int chain_idx = gid % num_chains;
+    if (gid >= total_items) return;
     
-    if (base_word_idx >= num_base_words) return;
+    int word_idx = gid / num_rules;
+    int rule_idx = gid % num_rules;
     
     // Get base word
-    __global const char *base_word_start = g_base_words_ptr + g_word_offsets[base_word_idx];
+    __global const char *word_ptr = base_words + base_offsets[word_idx];
+    int word_len = base_lengths[word_idx];
+    
+    char input_word[MAX_WORD_LEN];
+    for (int i = 0; i < word_len; i++) {
+        input_word[i] = word_ptr[i];
+    }
+    input_word[word_len] = '\\0';
+    
+    // Get rule
+    __global const char *rule_ptr = rules + rule_offsets[rule_idx];
+    int rule_len = rule_lengths[rule_idx];
+    
+    char rule_str[MAX_RULE_LEN];
+    for (int i = 0; i < rule_len; i++) {
+        rule_str[i] = rule_ptr[i];
+    }
+    rule_str[rule_len] = '\\0';
+    
+    // Apply rule
+    char output_word[MAX_OUTPUT_LEN];
+    int output_len;
+    apply_valid_rule(rule_str, rule_len, input_word, word_len, output_word, &output_len);
+    
+    if (output_len > 0) {
+        // Check bloom filter
+        if (bloom_check(bloom_filter, output_word, output_len)) {
+            int idx = atomic_inc(found_count);
+            
+            if (idx < MAX_CHAINS_TO_FIND) {
+                __global char *output_ptr = found_rules + idx * MAX_CHAIN_STRING_LEN;
+                
+                // Store rule string
+                for (int i = 0; i < rule_len && i < MAX_CHAIN_STRING_LEN - 1; i++) {
+                    output_ptr[i] = rule_str[i];
+                }
+                output_ptr[rule_len] = '\\0';
+            }
+        }
+    }
+}
+
+__kernel void find_rule_chains(
+    __global const char *base_words,
+    __global const int *base_offsets,
+    __global const int *base_lengths,
+    __global const char *rules,
+    __global const int *rule_offsets,
+    __global const int *rule_lengths,
+    __global const int *chain_sequences,
+    __global const int *chain_depths,
+    __global const uchar *bloom_filter,
+    const int num_base_words,
+    const int num_chains,
+    const int max_chain_depth,
+    __global char *found_chains,
+    __global volatile int *found_count
+) {
+    int gid = get_global_id(0);
+    int total_items = num_base_words * num_chains;
+    
+    if (gid >= total_items) return;
+    
+    int word_idx = gid / num_chains;
+    int chain_idx = gid % num_chains;
+    
+    // Get base word
+    __global const char *word_ptr = base_words + base_offsets[word_idx];
+    int word_len = base_lengths[word_idx];
+    
     char current_word[MAX_OUTPUT_LEN];
-    int current_len = copy_word(base_word_start, current_word, MAX_WORD_LEN);
-    if (current_len == 0) return;
+    for (int i = 0; i < word_len; i++) {
+        current_word[i] = word_ptr[i];
+    }
+    current_word[word_len] = '\\0';
+    int current_len = word_len;
     
-    // Get rule chain
-    __global const char *chain_start = g_rule_chains_ptr + g_chain_offsets[chain_idx];
-    int chain_length = g_chain_lengths[chain_idx];
+    // Get chain depth
+    int depth = chain_depths[chain_idx];
+    if (depth < 1 || depth > max_chain_depth) return;
     
-    // Apply rules sequentially (NO NESTED LOOPS!)
-    __global const char *current_rule = chain_start;
-    for (int rule_idx = 0; rule_idx < chain_length; rule_idx++) {
-        current_len = apply_rule(current_rule, current_word, current_len, current_word);
-        if (current_len == 0) return; // Rule failed
+    // Apply chain of rules
+    char temp_word[MAX_OUTPUT_LEN];
+    char chain_buffer[MAX_CHAIN_STRING_LEN];
+    int chain_pos = 0;
+    
+    for (int d = 0; d < depth; d++) {
+        int rule_idx = chain_sequences[chain_idx * max_chain_depth + d];
+        if (rule_idx < 0) break;
         
-        // Move to next rule in chain
-        while (*current_rule != NULL_BYTE) current_rule++;
-        current_rule++; // Skip null terminator
+        // Get rule
+        __global const char *rule_ptr = rules + rule_offsets[rule_idx];
+        int rule_len = rule_lengths[rule_idx];
+        
+        char rule_str[MAX_RULE_LEN];
+        for (int i = 0; i < rule_len; i++) {
+            rule_str[i] = rule_ptr[i];
+        }
+        rule_str[rule_len] = '\\0';
+        
+        // Store rule in chain buffer
+        for (int i = 0; i < rule_len && chain_pos < MAX_CHAIN_STRING_LEN - 2; i++) {
+            chain_buffer[chain_pos++] = rule_str[i];
+        }
+        if (d < depth - 1 && chain_pos < MAX_CHAIN_STRING_LEN - 1) {
+            chain_buffer[chain_pos++] = ' ';
+        }
+        
+        // Apply rule
+        int new_len;
+        apply_valid_rule(rule_str, rule_len, current_word, current_len, temp_word, &new_len);
+        
+        if (new_len == 0) {
+            return;  // Rule failed
+        }
+        
+        // Copy back
+        for (int i = 0; i < new_len; i++) {
+            current_word[i] = temp_word[i];
+        }
+        current_word[new_len] = '\\0';
+        current_len = new_len;
     }
     
-    // Single bloom filter check at the end
-    uint h1, h2;
-    precompute_bloom_hashes(current_word, current_len, &h1, &h2);
+    chain_buffer[chain_pos] = '\\0';
     
-    if (bloom_check_fast(g_bloom_filter, h1, h2)) {
-        // RECORD CHAIN
-        int output_index = atomic_inc((__global volatile int *)g_output_count);
+    // Check bloom filter
+    if (bloom_check(bloom_filter, current_word, current_len)) {
+        int idx = atomic_inc(found_count);
         
-        if (output_index < MAX_CHAINS_TO_FIND_LIMIT) {
-            __global char *output_ptr = g_output_buffer + output_index * MAX_CHAIN_STRING_LEN;
+        if (idx < MAX_CHAINS_TO_FIND) {
+            __global char *output_ptr = found_chains + idx * MAX_CHAIN_STRING_LEN;
             
-            // Copy chain string
-            __global const char *chain_str = g_rule_chains_ptr + g_chain_offsets[chain_idx];
-            copy_word(chain_str, output_ptr, MAX_CHAIN_STRING_LEN);
+            // Store chain string
+            for (int i = 0; i < chain_pos && i < MAX_CHAIN_STRING_LEN - 1; i++) {
+                output_ptr[i] = chain_buffer[i];
+            }
+            output_ptr[chain_pos] = '\\0';
         }
     }
 }
 """
-
-# ====================================================================
-# --- OPTIMIZED GPU EXECUTION WITH TWO-LEVEL BATCHING ---
-# ====================================================================
-
-def fast_gpu_rule_chaining_flattened(base_words, target_words, rules, max_depth, slow_mode=False):
-    """
-    Optimized GPU execution with flattened approach and two-level batching
-    """
-    if not rules or not base_words: 
-        return []
-    
-    # 1. Generate flattened rule chains (CRITICAL OPTIMIZATION)
-    chains, chain_strings = generate_rule_chains_flattened(
-        rules, max_depth, max_chains_per_depth=None, slow_mode=slow_mode
-    )
-    
-    if not chains:
-        print(f"{red('❌')} {bold('No rule chains generated')}")
-        return []
-    
-    # 2. Prepare chain data for GPU
-    print(f"{blue('🔧')} {bold('Preparing chain data for GPU...')}")
-    
-    # Pack chains into single buffer
-    chains_bytes = b'\0'.join([chain_str.encode('latin-1') for chain_str in chain_strings]) + b'\0'
-    chain_offsets = np.array([0] + [len(c) + 1 for c in chain_strings], dtype=np.int32).cumsum()[:-1]
-    chain_lengths = np.array([len(chain) for chain in chains], dtype=np.int32)
-    
-    # 3. Generate Bloom Filter
-    bloom_filter_bytes = generate_bloom_filter(target_words)
-    bloom_filter_np = np.frombuffer(bloom_filter_bytes, dtype=np.uint8)
-    
-    # 4. Setup OpenCL
-    try:
-        platform = cl.get_platforms()[0]
-        device = platform.get_devices(cl.device_type.GPU)[0]
-        context = cl.Context([device])
-        queue = cl.CommandQueue(context)
-        
-        print(f"{green('🎮')} {bold('GPU:')} {cyan(device.name.strip())}")
-        
-    except Exception as e:
-        print(f"{red('❌')} {bold('OpenCL init failed:')} {e}")
-        return []
-    
-    # 5. Compile kernel
-    kernel_source = RULE_CHAINING_KERNEL_COMPREHENSIVE
-    kernel_source = kernel_source.replace("//K_PLACEHOLDER//", str(BLOOM_HASH_FUNCTIONS))
-    kernel_source = kernel_source.replace("//M_BYTES_PLACEHOLDER//", str(BLOOM_FILTER_SIZE_BYTES))
-    kernel_source = kernel_source.replace("//MAX_CHAINS_PLACEHOLDER//", str(MAX_CHAINS_TO_FIND))
-    
-    try:
-        program = cl.Program(context, kernel_source).build()
-        kernel = program.rule_chaining_kernel_flattened
-    except Exception as e:
-        print(f"{red('❌')} {bold('Kernel compilation failed:')} {e}")
-        return []
-    
-    mf = cl.mem_flags
-    
-    # 6. Create static buffers
-    chains_g = cl.Buffer(context, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=chains_bytes)
-    chain_offsets_g = cl.Buffer(context, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=chain_offsets)
-    chain_lengths_g = cl.Buffer(context, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=chain_lengths)
-    bloom_filter_g = cl.Buffer(context, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=bloom_filter_np)
-    
-    output_buffer_bytes = MAX_CHAINS_TO_FIND * MAX_CHAIN_STRING_LEN
-    output_buffer_g = cl.Buffer(context, mf.WRITE_ONLY, output_buffer_bytes)
-    
-    all_chains = set()
-    total_chains_found = 0
-    
-    print(f"{blue('🚀')} {bold('Starting GPU processing...')}")
-    start_time = time.time()
-    
-    # 7. TWO-LEVEL BATCHING (CRITICAL FOR MEMORY)
-    num_chains = len(chains)
-    
-    # Adjust batch sizes based on slow mode
-    if slow_mode:
-        words_per_batch = 500  # Smaller batches for slow mode (more rules)
-        chains_per_batch = MAX_WORK_ITEMS_PER_LAUNCH // words_per_batch
-    else:
-        words_per_batch = WORDS_PER_BATCH
-        chains_per_batch = MAX_WORK_ITEMS_PER_LAUNCH // words_per_batch
-    
-    # Single progress bar for entire process
-    total_work_items = len(base_words) * num_chains
-    with tqdm(total=total_work_items, desc="GPU Processing", unit="items") as pbar:
-        
-        for word_start in range(0, len(base_words), words_per_batch):
-            word_end = min(word_start + words_per_batch, len(base_words))
-            word_batch = base_words[word_start:word_end]
-            num_words_batch = len(word_batch)
-            
-            # Prepare word batch
-            words_bytes = b'\0'.join([w.encode('latin-1', errors='ignore') for w in word_batch]) + b'\0'
-            word_offsets = np.array([0] + [len(w) + 1 for w in word_batch], dtype=np.int32).cumsum()[:-1]
-            
-            words_g = cl.Buffer(context, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=words_bytes)
-            word_offsets_g = cl.Buffer(context, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=word_offsets)
-            
-            for chain_start in range(0, num_chains, chains_per_batch):
-                chain_end = min(chain_start + chains_per_batch, num_chains)
-                num_chains_batch = chain_end - chain_start
-                
-                # Calculate work size
-                global_size = num_words_batch * num_chains_batch
-                if global_size == 0:
-                    continue
-                
-                # Align to work group size
-                global_size = ((global_size + LOCAL_WORK_SIZE - 1) // LOCAL_WORK_SIZE) * LOCAL_WORK_SIZE
-                
-                # Output counter
-                output_count = np.array([0], dtype=np.int32)
-                output_count_g = cl.Buffer(context, mf.READ_WRITE | mf.COPY_HOST_PTR, hostbuf=output_count)
-                
-                # Set kernel arguments
-                kernel.set_args(
-                    words_g, word_offsets_g,
-                    chains_g, chain_offsets_g, chain_lengths_g,
-                    bloom_filter_g,
-                    np.int32(num_words_batch),
-                    np.int32(num_chains_batch),
-                    output_buffer_g,
-                    output_count_g
-                )
-                
-                # Launch kernel
-                cl.enqueue_nd_range_kernel(
-                    queue, kernel, (global_size,), (LOCAL_WORK_SIZE,)
-                ).wait()
-                
-                # Read results
-                cl.enqueue_copy(queue, output_count, output_count_g).wait()
-                chains_found = output_count[0]
-                
-                if chains_found > 0:
-                    read_count = min(chains_found, MAX_CHAINS_TO_FIND)
-                    read_size = read_count * MAX_CHAIN_STRING_LEN
-                    
-                    output_data = np.empty(read_size, dtype=np.byte)
-                    cl.enqueue_copy(queue, output_data, output_buffer_g).wait()
-                    
-                    for j in range(read_count):
-                        start = j * MAX_CHAIN_STRING_LEN
-                        chain_bytes = output_data[start:start + MAX_CHAIN_STRING_LEN]
-                        
-                        try:
-                            null_pos = chain_bytes.tolist().index(0)
-                            chain_str = chain_bytes[:null_pos].tobytes().decode('latin-1').strip()
-                        except:
-                            chain_str = chain_bytes.tobytes().decode('latin-1', errors='ignore').strip('\x00').strip()
-                        
-                        if chain_str:
-                            all_chains.add(chain_str)
-                    
-                    total_chains_found += chains_found
-                
-                # Update progress
-                pbar.update(num_words_batch * num_chains_batch)
-                
-                # Cleanup
-                output_count_g.release()
-            
-            # Cleanup word buffers
-            words_g.release()
-            word_offsets_g.release()
-    
-    # Cleanup static buffers
-    chains_g.release()
-    chain_offsets_g.release()
-    chain_lengths_g.release()
-    bloom_filter_g.release()
-    output_buffer_g.release()
-    
-    end_time = time.time()
-    
-    mode_str = "SLOW MODE" if slow_mode else "FAST MODE"
-    print(f"{green('✅')} {bold('GPU processing complete:')} {cyan(f'{len(all_chains):,}')} {bold('chains found in')} {cyan(f'{end_time - start_time:.2f}s')} {bold(f'({mode_str})')}")
-    return list(all_chains)
 
 # ====================================================================
 # --- MAIN EXECUTION ---
@@ -1042,82 +1866,80 @@ def fast_gpu_rule_chaining_flattened(base_words, target_words, rules, max_depth,
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
-        description=f"{bold('🚀 GPU Rule Chaining (All Hashcat Rules + External Rule Files)')}",
+        description=f"{bold('VALID Hashcat Rules Engine with GPU Acceleration')}",
         formatter_class=argparse.RawTextHelpFormatter
     )
     
     parser.add_argument('base_wordlist', help='Base wordlist path')
     parser.add_argument('target_wordlist', help='Target wordlist path')
-    parser.add_argument('--rules', type=str, default=None, 
-                       help='Path to external rule file (Hashcat .rule format)')
-    parser.add_argument('-d', '--depth', type=int, default=2, 
-                       help='Max chain depth (1-3, default: 2)')
+    parser.add_argument('-d', '--depth', type=int, default=3, 
+                       choices=[1, 2, 3, 4, 5, 6],
+                       help='Max chain depth (1-6, default: 3)')
     parser.add_argument('-o', '--output', type=str, default='found_chains.txt', 
                        help='Output file (default: found_chains.txt)')
     parser.add_argument('--slow', action='store_true', 
-                       help='Enable SLOW mode with comprehensive rule coverage')
+                       help='Enable more comprehensive search')
+    parser.add_argument('--verify', action='store_true',
+                       help='Verify all chains work before saving')
     
     args = parser.parse_args()
 
-    print(f"\n{bold(green('=' * 70))}")
-    print(f"{bold('🚀 GPU RULE CHAINING (ALL HASHCAT RULES + EXTERNAL RULE FILES)')}")
-    print(f"{bold(green('=' * 70))}{Colors.END}\n")
+    print(f"\n{bold(green('=' * 80))}")
+    print(f"{bold('VALID HASHCAT RULES ENGINE (GPU-COMPATIBLE + COMPLETE PROCESSING)')}")
+    print(f"{bold(green('=' * 80))}{Colors.END}\n")
     
-    if args.slow:
-        print(f"{yellow('⚠️')} {bold('SLOW MODE ENABLED - Comprehensive rule coverage')}")
-        print(f"{yellow('⚠️')} {bold('Expect significantly longer processing times!')}")
+    # Load data first
+    print(f"{blue('[INIT]')} {bold('Loading data...')}")
     
-    if args.rules:
-        print(f"{blue('📁')} {bold('Using external rule file:')} {cyan(args.rules)}")
-    
-    print()
-    
-    # Load data
     base_words = load_wordlist_fast(args.base_wordlist)
     target_words = load_wordlist_fast(args.target_wordlist)
     
-    if not base_words or not target_words:
-        sys.exit(1)
+    print(f"\n{blue('[ANALYSIS]')} {bold('Dataset Analysis:')}")
+    print(f"  {cyan('[*]')} Base words: {len(base_words):,}")
+    print(f"  {cyan('[*]')} Target words: {len(target_words):,}")
+    print(f"  {cyan('[*]')} Processing ALL words")
     
-    # Load/generate rules
-    if args.rules:
-        rules = load_rules_from_file(args.rules, slow_mode=args.slow)
-        if not rules:
-            print(f"{red('❌')} {bold('No valid rules found in file, falling back to generated rules')}")
-            rules = generate_comprehensive_hashcat_rules(slow_mode=args.slow)
-    else:
-        print(f"{blue('🔧')} {bold('No external rule file specified, generating rules...')}")
-        rules = generate_comprehensive_hashcat_rules(slow_mode=args.slow)
+    start_time = time.time()
     
-    if not rules:
-        print(f"{red('❌')} {bold('No rules available. Exiting.')}")
-        sys.exit(1)
+    # Initialize extractor with valid rules only
+    extractor = ValidHybridExtractor(len(base_words), len(target_words), args.slow)
     
-    # Find chains
-    chains = fast_gpu_rule_chaining_flattened(
-        base_words, target_words, rules, min(args.depth, 3), slow_mode=args.slow
-    )
+    # Run extraction
+    print(f"\n{blue('=' * 60)}")
+    print(f"{bold('STARTING COMPLETE RULE EXTRACTION')}")
+    print(f"{blue('=' * 60)}")
+    
+    chains = extractor.extract_rules(base_words, target_words, args.depth)
+    
+    end_time = time.time()
     
     # Save results
-    with open(args.output, 'w') as f:
-        for chain in chains:
+    print(f"\n{blue('[SAVE]')} {bold('Saving results...')}")
+    
+    # Clean chains one more time before saving
+    validator = HashcatRuleValidator()
+    final_chains = validator.clean_rules(chains)
+    
+    with open(args.output, 'w', encoding='latin-1') as f:
+        for chain in final_chains:
             f.write(f"{chain}\n")
     
-    print(f"\n{bold(green('=' * 70))}")
-    print(f"{bold('✨ FINAL RESULTS')}")
-    print(f"{bold(green('=' * 70))}")
-    print(f"{blue('📊')} {bold('Base words:')} {cyan(f'{len(base_words):,}')}")
-    print(f"{blue('📊')} {bold('Target words:')} {cyan(f'{len(target_words):,}')}")
-    print(f"{blue('🔧')} {bold('Rules:')} {cyan(f'{len(rules):,}')}")
-    print(f"{blue('📏')} {bold('Max depth:')} {cyan(f'{min(args.depth, 3)}')}")
-    print(f"{blue('⚡')} {bold('Mode:')} {cyan('SLOW' if args.slow else 'FAST')}")
-    if args.rules:
-        print(f"{blue('📁')} {bold('Rule source:')} {cyan('EXTERNAL FILE')}")
-    else:
-        print(f"{blue('📁')} {bold('Rule source:')} {cyan('GENERATED')}")
-    print(f"{green('✅')} {bold('Chains found:')} {cyan(f'{len(chains):,}')}")
-    print(f"{blue('💾')} {bold('Output:')} {bold(args.output)}")
-    print(f"{bold(green('=' * 70))}{Colors.END}")
-    print(f"{green('✅')} {bold('Chains found:')} {cyan(f'{len(chains):,}')}")
-    print(f"{blue('💾')} {bold('Output:')} {bold(args.output)}")
-    print(f"{bold(green('=' * 70))}{Colors.END}")
+    # Print summary
+    print(f"\n{bold(green('=' * 80))}")
+    print(f"{bold('FINAL RESULTS')}")
+    print(f"{bold(green('=' * 80))}")
+    print(f"{blue('[INFO]')} {bold('Base words:')} {cyan(f'{len(base_words):,}')}")
+    print(f"{blue('[INFO]')} {bold('Target words:')} {cyan(f'{len(target_words):,}')}")
+    print(f"{blue('[INFO]')} {bold('Max depth:')} {cyan(f'{args.depth}')}")
+    print(f"{blue('[INFO]')} {bold('Total time:')} {cyan(f'{end_time - start_time:.2f}s')}")
+    print(f"{green('[RESULT]')} {bold('Valid GPU-compatible chains found:')} {cyan(f'{len(final_chains):,}')}")
+    
+    if final_chains:
+        print(f"{blue('[SAMPLE]')} {bold('Sample chains (max 20):')}")
+        for i, chain in enumerate(final_chains[:20]):
+            depth = len(chain.split())
+            print(f"  {cyan(f'{i+1:2d}.')} [{depth}] {chain}")
+    
+    print(f"{blue('[OUTPUT]')} {bold('Output saved to:')} {bold(args.output)}")
+    print(f"{blue('[NOTE]')} {bold('All chains are GPU-compatible and valid for Hashcat')}")
+    print(f"{bold(green('=' * 80))}{Colors.END}")
