@@ -12,9 +12,8 @@ A high-performance OpenCL-based tool for extracting and testing Hashcat rules us
 🚀 **Features**
 
 - GPU Accelerated: Uses OpenCL for massive parallel rule processing
-- Memory Optimized: Implements memory-mapped I/O for large files (v2.0)
 - Smart Batching: Automatic batch size calculation based on GPU memory
-- Rule Chaining: Supports multi-depth rule chaining (BFS approach)
+- Rule Chaining: Supports multi-depth rule chaining (BFS approach); MITM IN V2.0
 - Flexible Input: Works with internal rules or external rule files
 - Progress Tracking: Real-time progress bars and statistics
 
