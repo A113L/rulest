@@ -28,47 +28,29 @@ A high-performance OpenCL-based tool for extracting and testing Hashcat rules us
 ```pip install numpy pyopencl tqdm```
 
 ```
-python3 rulest.py -h
+ python3 rulest-2.0.py -h
+usage: rulest-2.0.py [-h] [-d {1,2,3}] [-o OUTPUT] [--slow] [--verify] [--max-chains MAX_CHAINS] [--target-hours TARGET_HOURS] base_wordlist target_wordlist
 
-╔══════════════════════════════════════════════════════════════════════╗
-║                GPU-ACCELERATED HASHCAT RULE EXTRACTOR                ║
-╚══════════════════════════════════════════════════════════════════════╝
+GPU-COMPATIBLE Hashcat Rules Engine with Dynamic Workload Processing
 
-DESCRIPTION:
-  Blazing-fast OpenCL GPU rule extraction with BFS chaining.
-  Finds rule sequences that transform base words into target words.
+positional arguments:
+  base_wordlist         Base wordlist path
+  target_wordlist       Target wordlist path
 
-USAGE:
-  rulest.py -w WORDLIST [OPTIONS]
+optional arguments:
+  -h, --help            show this help message and exit
+  -d {1,2,3}, --depth {1,2,3}
+                        Max chain depth (1-3 only for speed, default: 3)
+  -o OUTPUT, --output OUTPUT
+                        Output file (default: found_chains.txt)
+  --slow                Enable more comprehensive search (may take longer)
+  --verify              Verify all chains work before saving
+  --max-chains MAX_CHAINS
+                        Maximum chains to generate (overrides automatic limits)
+  --target-hours TARGET_HOURS
+                        Target completion time in hours (default: 0.5)
 
-REQUIRED ARGUMENTS:
-  -w, --wordlist WORDLIST    Path to target wordlist/dictionary
 
-OPTIONAL ARGUMENTS:
-  -h, --help               Show this help message
-  --list-rules             List all supported rules and exit
-  -c, --comprehensive      Use comprehensive mode (16,000+ rules)
-  -b, --base-wordlist FILE Base wordlist (default: target wordlist)
-  -d, --chain-depth N      Rules to chain together (default: 1)
-  --batch-size N           GPU batch size (default: 5000)
-  -o, --output FILE        Save extracted rules to file
-  -r, --rules_file FILE    Filter external rules file
-
-EXAMPLES:
-  Fast extraction (1,188 rules):
-    rulest.py -w rockyou.txt -o fast_rules.rule
-  Comprehensive extraction (16,000+ rules):
-    rulest.py -w rockyou.txt -c -o comp_rules.rule
-  With chaining depth 4:
-    rulest.py -w rockyou.txt -b base.txt -d 4 --batch-size 500 -o chains.rule
-  Comprehensive with depth 2:
-    rulest.py -w rockyou.txt -c -d 2 --batch-size 200 -o comp_depth2.rule
-
-PERFORMANCE TIPS:
-  • FAST MODE: 1,188 rules - use batch-size 5000-10000
-  • COMPREHENSIVE MODE: 16,000+ rules - use batch-size 200-500
-  • Chain depth 1-2 for comprehensive, 3-4 for fast mode
-  • Use --list-rules to see all implemented rules
 ```
 
 🔧 **Technical Details**
