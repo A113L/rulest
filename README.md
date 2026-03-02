@@ -27,10 +27,10 @@ A high-performance OpenCL-based tool for extracting and testing Hashcat rules us
 ```pip install numpy pyopencl tqdm```
 
 ```
- python3 rulest-2.0.py -h
-usage: rulest-2.0.py [-h] [-d {1,2,3}] [-o OUTPUT] [--slow] [--verify] [--max-chains MAX_CHAINS] [--target-hours TARGET_HOURS] base_wordlist target_wordlist
+python3 rulest-v2.0.py -h
+usage: rulest-v2.0.py [-h] [-d {1,2,3,4,5,6}] [-o OUTPUT] [--slow] [--verify] [--max-chains MAX_CHAINS] [--target-hours TARGET_HOURS] [--mitm] [--mitm-candidates MITM_CANDIDATES] base_wordlist target_wordlist
 
-GPU-COMPATIBLE Hashcat Rules Engine with Dynamic Workload Processing
+GPU-COMPATIBLE Hashcat Rules Engine with OPTIMIZED MITM Support
 
 positional arguments:
   base_wordlist         Base wordlist path
@@ -38,8 +38,8 @@ positional arguments:
 
 optional arguments:
   -h, --help            show this help message and exit
-  -d {1,2,3}, --depth {1,2,3}
-                        Max chain depth (1-3 only for speed, default: 3)
+  -d {1,2,3,4,5,6}, --depth {1,2,3,4,5,6}
+                        Max chain depth (1-6, default: 6)
   -o OUTPUT, --output OUTPUT
                         Output file (default: found_chains.txt)
   --slow                Enable more comprehensive search (may take longer)
@@ -47,9 +47,10 @@ optional arguments:
   --max-chains MAX_CHAINS
                         Maximum chains to generate (overrides automatic limits)
   --target-hours TARGET_HOURS
-                        Target completion time in hours (default: 0.5)
-
-
+                        Target completion time in hours (default: 1.0)
+  --mitm                Enable Meet-in-the-Middle for depths 4-6 (default: True)
+  --mitm-candidates MITM_CANDIDATES
+                        Maximum MITM candidates before GPU testing (default: 200000)
 ```
 
 🔧 **Technical Details**
