@@ -2,20 +2,19 @@
 
 [![rulest.png](https://i.postimg.cc/vDRkTBrs/rulest.png)](https://postimg.cc/1VHJYy7C)
 
-This project implements a highly optimized tool for extracting effective word-transformation rule chains by leveraging PyOpenCL to run the transformation logic on a Graphics Processing Unit (GPU). It uses a Breadth-First Search (BFS) approach to efficiently explore multi-step rule combinations (chains) that convert base dictionary words into target dictionary words.
+This project implements a highly optimized tool for extracting effective word-transformation rule chains by leveraging PyOpenCL to run the transformation logic on a Graphics Processing Unit (GPU).
 
 💡 **Overview**
 Rule-based attacks are highly effective against passwords. This utility automates the process of discovering the most successful rule chains (e.g., l $1 T0 - lowercase, append '1', toggle case at position 0) that have high hit rates against a specific target wordlist, accelerating rule-set generation for tools like Hashcat.
 
 A high-performance OpenCL-based tool for extracting and testing Hashcat rules using GPU acceleration. Perfect for password cracking research and rule optimization.
 
-🚀 **Features**
+**What does the script do?**
 
-- GPU Accelerated: Uses OpenCL for massive parallel rule processing
-- Smart Batching: Automatic batch size calculation based on GPU memory
-- Rule Chaining: Supports multi-depth rule chaining (BFS approach); MITM IN V2.0
-- Flexible Input: Works with internal rules or external rule files
-- Progress Tracking: Real-time progress bars and statistics
+- Generates all possible GPU-compatible rules
+- Creates random rule chains of limited depth
+- Checks them in parallel on the GPU for all base words
+- Filters the results through a bloom filter (checks if the generated word exists in the target wordlist)
 
 
 
