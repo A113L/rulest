@@ -5,13 +5,12 @@
 This project implements a highly optimized tool for extracting effective word-transformation rule chains by leveraging PyOpenCL to run the transformation logic on a Graphics Processing Unit (GPU).
 
 💡 **Overview**
-Rule-based attacks are highly effective against passwords. This utility automates the process of discovering the most successful rule chains (e.g., l $1 T0 - lowercase, append '1', toggle case at position 0) that have high hit rates against a specific target wordlist, accelerating rule-set generation for tools like Hashcat.
 
-A high-performance OpenCL-based tool for extracting and testing Hashcat rules using GPU acceleration. Perfect for password cracking research and rule optimization.
+This Python script leverages the computational power of graphics cards (via OpenCL) to automatically discover Hashcat rules that transform a given base wordlist into target passwords. Its operation is based on a two‑phase process: first, a Bloom filter is generated from all target words; then, in the initial phase, individual rules are tested against every base word. Rules that produce a hit become "hot," and in the second phase they are combined into chains (up to depth three), with 60% of the combinations containing at least one proven rule. The script dynamically adjusts the work‑group size and buffer allocation according to the GPU's capabilities, and it estimates the runtime based on a user‑specified time limit. The final set of rules is filtered to ensure full GPU compatibility (memory‑based and reject rules are removed). The output can be used directly in rule‑based attacks within Hashcat, significantly accelerating password cracking in scenarios where example plaintext‑hash pairs are available.
 
 **What does the script do?**
 
-- Generates all possible GPU-compatible rules
+- Generates possible GPU-compatible rules
 - Creates random rule chains of limited depth
 - Checks them in parallel on the GPU for all base words
 - Filters the results through a bloom filter (checks if the generated word exists in the target wordlist)
@@ -48,25 +47,6 @@ optional arguments:
                         Target completion time in hours (default: 0.5)
 
 ```
-
-🔧 **Technical Details**
-
-*Memory Management*
-
-- Automatic GPU memory detection (v2.0)
-- Smart batch sizing with safety margins
-- Retry logic for memory allocation failures
-
-*GPU Optimization*
-
-- Work group parallelization
-- Bulk processing with aligned memory
-- Optimized kernel with barrier synchronization
-- Efficient data transfer patterns
-
-**Website**
-
-https://hcrt.pages.dev/rulest.static_workflow
 
 **Credits:**
 
