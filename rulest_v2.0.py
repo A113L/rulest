@@ -458,8 +458,7 @@ def bold(text): return f"{Colors.BOLD}{text}{Colors.END}"
 class GPUCompatibleRulesGenerator:
     """Generate ONLY GPU-compatible Hashcat rules"""
     
-    def __init__(self, slow_mode=False):
-        self.slow_mode = slow_mode
+    def __init__(self):
         self.validator = HashcatRuleValidator()
     
     def generate_gpu_compatible_rules(self):
@@ -1267,10 +1266,9 @@ class GPUEngine:
 class GPUExtractor:
     """GPU-optimized extractor with complete processing"""
     
-    def __init__(self, base_count, target_count, device=None, slow_mode=False, target_hours=0.5):
+    def __init__(self, base_count, target_count, device=None, target_hours=0.5):
         self.base_count = base_count
         self.target_count = target_count
-        self.slow_mode = slow_mode
         
         # Calculate dynamic parameters with GPU info and time target
         self.params = calculate_dynamic_parameters(base_count, target_count, device, target_hours)
@@ -1284,7 +1282,7 @@ class GPUExtractor:
         print(f"  {cyan('[*]')} Max safe results/batch: {self.params['MAX_SAFE_RESULTS_PER_BATCH']:,}")
         
         # Initialize components
-        self.rules_generator = GPUCompatibleRulesGenerator(slow_mode)
+        self.rules_generator = GPUCompatibleRulesGenerator()
         self.gpu_engine = GPUEngine(self.params)
         self.validator = HashcatRuleValidator()
     
@@ -2188,10 +2186,6 @@ if __name__ == '__main__':
                        help='Max chain depth (1-3 only for speed, default: 3)')
     parser.add_argument('-o', '--output', type=str, default='found_chains.txt', 
                        help='Output file (default: found_chains.txt)')
-    parser.add_argument('--slow', action='store_true', 
-                       help='Enable more comprehensive search (may take longer)')
-    parser.add_argument('--verify', action='store_true',
-                       help='Verify all chains work before saving')
     parser.add_argument('--max-chains', type=int, default=None,
                        help='Maximum chains to generate (overrides automatic limits)')
     parser.add_argument('--target-hours', type=float, default=0.5,
@@ -2225,7 +2219,7 @@ if __name__ == '__main__':
         device = None
     
     # Initialize GPU extractor with time target
-    extractor = GPUExtractor(len(base_words), len(target_words), device, args.slow, args.target_hours)
+    extractor = GPUExtractor(len(base_words), len(target_words), device, args.target_hours)
     
     # Override max chains if specified
     if args.max_chains:
