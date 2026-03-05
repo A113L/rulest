@@ -16,6 +16,7 @@ import zlib
 import random
 import json
 from typing import List, Dict, Set, Tuple, Optional
+import gc
 
 # Suppress compiler warnings
 os.environ['PYOPENCL_COMPILER_OUTPUT'] = '0'
@@ -306,46 +307,48 @@ class HashcatRuleValidator:
         return valid_rules
 
 # ====================================================================
+# --- FNV-1a HASH FOR BLOOM FILTER (GPU/CPU COMPATIBLE) ---
+# ====================================================================
+
+def fnv1a_32(data, seed=0xDEADBEEF):
+    """FNV-1a 32-bit hash - identical implementation for CPU and GPU"""
+    h = seed ^ 2166136261
+    for b in data:
+        h ^= b
+        h = (h * 16777619) & 0xFFFFFFFF
+    return h
+
+# ====================================================================
 # --- DYNAMIC CONSTANTS CALCULATION ---
 # ====================================================================
 
 def calculate_dynamic_parameters(base_count, target_count, device=None, target_hours=0.5):
     """Calculate dynamic parameters based on input data size and GPU capabilities"""
     
-    # Base multipliers
-    BASE_BLOOM_SIZE = 1024 * 1024 * 8  # 8MB base bloom filter
-    
-    # Dynamic scaling factors
-    bloom_scale = max(1.0, math.log10(base_count + target_count) / 2.0)
-    words_scale = max(1.0, math.log10(base_count) / 2.0)
-    rules_scale = max(1.0, math.log10(target_count) / 2.0)
-    
-    # Calculate dynamic parameters
-    BLOOM_FILTER_SIZE = int(BASE_BLOOM_SIZE * bloom_scale)
-    
-    # Ensure power of 2 for better performance
-    BLOOM_FILTER_SIZE = 1 << (BLOOM_FILTER_SIZE.bit_length() - 1)
-    
     # Get GPU work group info if available
     if device:
         try:
             # Query device limits
             max_work_group_size = device.get_info(cl.device_info.MAX_WORK_GROUP_SIZE)
-            max_work_item_sizes = device.get_info(cl.device_info.MAX_WORK_ITEM_SIZES)
             max_compute_units = device.get_info(cl.device_info.MAX_COMPUTE_UNITS)
             global_mem = device.get_info(cl.device_info.GLOBAL_MEM_SIZE)
             
-            # Dynamic work group size (must be divisor of max)
+            # RTX 3060 Ti specific optimizations
+            is_nvidia = 'NVIDIA' in device.get_info(cl.device_info.NAME)
+            
+            # Dynamic work group size - 512 for Ampere architecture
             possible_sizes = [32, 64, 128, 256, 512, 1024]
             LOCAL_WORK_SIZE = max([s for s in possible_sizes if s <= max_work_group_size])
             
-            # Calculate optimal global size based on compute units
-            # Each compute unit can handle multiple work groups
-            OPTIMAL_GLOBAL_MULTIPLIER = max_compute_units * 8  # Increased for better utilization
+            # For RTX 3060 Ti, 512 is optimal
+            if is_nvidia and max_compute_units >= 38:
+                LOCAL_WORK_SIZE = min(512, LOCAL_WORK_SIZE)
             
-            # Estimate GPU processing speed (combinations per second)
-            # Based on RTX 3060 Ti performance
-            EST_COMBOS_PER_SEC = 50000000  # 50 million combinations per second estimate
+            # Calculate optimal global size - 16 work groups per SM for Ampere
+            OPTIMAL_GLOBAL_MULTIPLIER = max_compute_units * 16
+            
+            # RTX 3060 Ti performance estimate
+            EST_COMBOS_PER_SEC = 120000000  # 120 million combos/sec
             
             print(f"{blue('[GPU]')} {bold('Work Group Limits:')}")
             print(f"  {cyan('[*]')} Max work group size: {max_work_group_size}")
@@ -354,78 +357,78 @@ def calculate_dynamic_parameters(base_count, target_count, device=None, target_h
             print(f"  {cyan('[*]')} Using work group size: {LOCAL_WORK_SIZE}")
             
         except:
-            LOCAL_WORK_SIZE = 256
-            OPTIMAL_GLOBAL_MULTIPLIER = 40
-            EST_COMBOS_PER_SEC = 30000000
-            max_compute_units = 40
+            LOCAL_WORK_SIZE = 512
+            OPTIMAL_GLOBAL_MULTIPLIER = 38 * 16  # 608 for RTX 3060 Ti
+            EST_COMBOS_PER_SEC = 80000000
+            max_compute_units = 38
     else:
-        LOCAL_WORK_SIZE = 256
-        OPTIMAL_GLOBAL_MULTIPLIER = 40
-        EST_COMBOS_PER_SEC = 30000000
-        max_compute_units = 40
+        LOCAL_WORK_SIZE = 512
+        OPTIMAL_GLOBAL_MULTIPLIER = 608
+        EST_COMBOS_PER_SEC = 80000000
+        max_compute_units = 38
     
     # Calculate target combinations based on time limit
     target_seconds = target_hours * 3600
-    max_combinations_time_limit = int(EST_COMBOS_PER_SEC * target_seconds * 0.8)  # 80% efficiency
+    max_combinations_time_limit = int(EST_COMBOS_PER_SEC * target_seconds * 0.8)
     
-    # Calculate batch sizes for 30-minute completion
-    total_combinations = base_count * 100000  # Rough estimate
+    # Bloom filter size - 64MB max for 8GB GPUs
+    BASE_BLOOM_SIZE = 1024 * 1024 * 64  # 64MB base
+    bloom_scale = max(1.0, math.log10(base_count + target_count) / 2.0)
+    BLOOM_FILTER_SIZE_BYTES = int(BASE_BLOOM_SIZE * min(bloom_scale, 2.0))
     
-    # Scale batch sizes aggressively for speed
-    WORDS_PER_BATCH = min(50000, max(10000, base_count // 10))
-    CHAINS_PER_BATCH = min(20000, max(5000, int(OPTIMAL_GLOBAL_MULTIPLIER * LOCAL_WORK_SIZE / 10)))
+    # Hard cap at 64MB for 8GB GPUs
+    MAX_BLOOM_BYTES = 64 * 1024 * 1024  # 64MB
+    BLOOM_FILTER_SIZE_BYTES = min(BLOOM_FILTER_SIZE_BYTES, MAX_BLOOM_BYTES)
     
-    # Max chains based on time limit
-    MAX_CHAINS_TO_FIND = min(1000000, max_combinations_time_limit // 1000)
+    # Convert to bits
+    BLOOM_FILTER_SIZE = BLOOM_FILTER_SIZE_BYTES * 8
     
-    # Chain generation limits for 30-minute completion
-    if base_count > 1000000:
-        CHAIN_GEN_LIMIT_2 = 150000
-        CHAIN_GEN_LIMIT_3 = 75000
-        CHAIN_GEN_LIMIT_4 = 35000
-        CHAIN_GEN_LIMIT_5 = 15000
-    elif base_count > 100000:
-        CHAIN_GEN_LIMIT_2 = 100000
-        CHAIN_GEN_LIMIT_3 = 50000
-        CHAIN_GEN_LIMIT_4 = 25000
-        CHAIN_GEN_LIMIT_5 = 10000
-    else:
-        CHAIN_GEN_LIMIT_2 = 50000
-        CHAIN_GEN_LIMIT_3 = 25000
-        CHAIN_GEN_LIMIT_4 = 10000
-        CHAIN_GEN_LIMIT_5 = 5000
+    # Batch sizes for RTX 3060 Ti - increased for fewer launches
+    WORDS_PER_BATCH = 5000  # Process 5k words at a time
+    CHAINS_PER_BATCH = 2000  # Process 2k chains at a time
+    WORD_SUB_BATCH = 20000   # Increased from 5000 to reduce kernel launches
+    
+    # Safe output per batch (25k * 128 bytes = 3.2MB)
+    MAX_SAFE_RESULTS_PER_BATCH = 25000
+    
+    # Max chains based on time limit (global cap)
+    MAX_CHAINS_TO_FIND = min(1_000_000, max_combinations_time_limit // 1000)
+    
+    # Chain generation limits
+    CHAIN_GEN_LIMIT_2 = 150000
+    CHAIN_GEN_LIMIT_3 = 75000
     
     # Chain depth
-    MAX_CHAIN_DEPTH = 3  # Limit to depth 3 for speed
+    MAX_CHAIN_DEPTH = 3
     
     print(f"\n{blue('[TIME]')} {bold(f'Target completion: {target_hours} hours')}")
     print(f"{blue('[PERF]')} {bold('Estimated processing speed:')} {cyan(f'{EST_COMBOS_PER_SEC:,}')} combos/sec")
     print(f"{blue('[PERF]')} {bold('Max combinations in time:')} {cyan(f'{max_combinations_time_limit:,}')}")
+    print(f"{blue('[VRAM]')} {bold('Bloom filter size:')} {cyan(f'{BLOOM_FILTER_SIZE_BYTES / 1024 / 1024:.1f}MB')}")
+    print(f"{blue('[LIMIT]')} {bold('Global chain limit:')} {cyan(f'{MAX_CHAINS_TO_FIND:,}')}")
     
     return {
         'BLOOM_FILTER_SIZE': BLOOM_FILTER_SIZE,
         'WORDS_PER_BATCH': WORDS_PER_BATCH,
         'CHAINS_PER_BATCH': CHAINS_PER_BATCH,
+        'WORD_SUB_BATCH': WORD_SUB_BATCH,
+        'MAX_SAFE_RESULTS_PER_BATCH': MAX_SAFE_RESULTS_PER_BATCH,
         'MAX_CHAINS_TO_FIND': MAX_CHAINS_TO_FIND,
         'MAX_CHAIN_DEPTH': MAX_CHAIN_DEPTH,
         'LOCAL_WORK_SIZE': LOCAL_WORK_SIZE,
         'OPTIMAL_GLOBAL_MULTIPLIER': OPTIMAL_GLOBAL_MULTIPLIER,
         'CHAIN_GEN_LIMIT_2': CHAIN_GEN_LIMIT_2,
         'CHAIN_GEN_LIMIT_3': CHAIN_GEN_LIMIT_3,
-        'CHAIN_GEN_LIMIT_4': CHAIN_GEN_LIMIT_4,
-        'CHAIN_GEN_LIMIT_5': CHAIN_GEN_LIMIT_5,
         'EST_COMBOS_PER_SEC': EST_COMBOS_PER_SEC,
         'TARGET_SECONDS': target_seconds,
-        'bloom_scale': bloom_scale,
-        'words_scale': words_scale,
-        'rules_scale': rules_scale
+        'bloom_scale': bloom_scale
     }
 
 # Initialize with default values
 MAX_WORD_LEN = 256         
 MAX_RULE_LEN = 16         
 MAX_OUTPUT_LEN = 512      
-MAX_CHAIN_STRING_LEN = 512
+MAX_CHAIN_STRING_LEN = 128  # Reduced from 512 for VRAM efficiency
 
 # --- COLOR CODES ---
 class Colors:
@@ -572,9 +575,37 @@ class GPUEngine:
         self.queue = None
         self.device = None
         self.program = None
-        self.max_work_group_size = 256
-        self.local_work_size = params.get('LOCAL_WORK_SIZE', 256)
+        self.max_work_group_size = 512
+        self.local_work_size = params.get('LOCAL_WORK_SIZE', 512)
         
+        # Persistent buffers
+        self.bloom_buf = None
+        self.rule_index = {}  # Rule name -> index lookup
+        self.gpu_rules = []   # List of rules in order
+        
+    def get_free_vram(self):
+        """Estimate free VRAM using OpenCL"""
+        try:
+            # For NVIDIA via OpenCL, global_mem_size minus estimated used
+            total = self.device.get_info(cl.device_info.GLOBAL_MEM_SIZE)
+            # Conservative: assume 40% is used by driver + bloom + rules
+            return int(total * 0.55)
+        except:
+            return 1 * 1024**3  # assume 1GB free if unknown
+    
+    def safe_output_buffer_size(self, words_count, chains_count):
+        """Calculate safe output buffer within VRAM budget"""
+        free_vram = self.get_free_vram()
+        
+        # Reserve 500MB for inputs + bloom + driver overhead
+        output_budget = max(0, free_vram - 500 * 1024**2)
+        
+        # Each output slot = 128 bytes
+        max_slots = output_budget // 128
+        
+        # Cap at safe maximum
+        return min(max_slots, self.params['MAX_SAFE_RESULTS_PER_BATCH'], words_count * chains_count)
+    
     def initialize_gpu(self):
         """Initialize OpenCL with dynamic parameters"""
         try:
@@ -592,6 +623,7 @@ class GPUEngine:
             print(f"{blue('[INFO]')} {bold('Global Memory:')} {cyan(f'{global_mem // (1024**3)}GB')}")
             print(f"{blue('[INFO]')} {bold('Max Work Group Size:')} {cyan(self.max_work_group_size)}")
             print(f"{blue('[INFO]')} {bold('Compute Units:')} {cyan(max_compute_units)}")
+            print(f"{blue('[INFO]')} {bold('Free VRAM estimate:')} {cyan(f'{self.get_free_vram() / 1024**3:.1f}GB')}")
             
             # Adjust local work size based on device capabilities
             self.local_work_size = min(self.local_work_size, self.max_work_group_size)
@@ -616,16 +648,20 @@ class GPUEngine:
             
             # Replace constants with dynamic values
             kernel_source = kernel_source.replace(
-                "BLOOM_FILTER_SIZE 8388608",
-                f"BLOOM_FILTER_SIZE {self.params['BLOOM_FILTER_SIZE']}"
+                "#define BLOOM_FILTER_SIZE 67108864",
+                f"#define BLOOM_FILTER_SIZE {self.params['BLOOM_FILTER_SIZE']}"
             )
             kernel_source = kernel_source.replace(
-                "MAX_CHAINS_TO_FIND 10000000",
-                f"MAX_CHAINS_TO_FIND {self.params['MAX_CHAINS_TO_FIND']}"
+                "#define MAX_CHAINS_TO_FIND 25000",
+                f"#define MAX_CHAINS_TO_FIND {self.params['MAX_SAFE_RESULTS_PER_BATCH']}"
             )
             kernel_source = kernel_source.replace(
-                "MAX_CHAIN_DEPTH 6",
-                f"MAX_CHAIN_DEPTH {self.params['MAX_CHAIN_DEPTH']}"
+                "#define MAX_CHAIN_DEPTH 3",
+                f"#define MAX_CHAIN_DEPTH {self.params['MAX_CHAIN_DEPTH']}"
+            )
+            kernel_source = kernel_source.replace(
+                "#define MAX_CHAIN_STRING_LEN 128",
+                f"#define MAX_CHAIN_STRING_LEN {MAX_CHAIN_STRING_LEN}"
             )
             
             self.program = cl.Program(self.context, kernel_source).build()
@@ -637,30 +673,24 @@ class GPUEngine:
             return None
     
     def generate_bloom_filter(self, target_words):
-        """Generate Bloom filter with dynamic size - using ALL target words"""
+        """Generate Bloom filter with FNV-1a hashing (CPU/GPU compatible)"""
         print(f"{blue('[SETUP]')} {bold('Generating comprehensive Bloom filter...')}")
         
         bloom_size_bytes = self.params['BLOOM_FILTER_SIZE'] // 8
         bloom_filter = np.zeros(bloom_size_bytes, dtype=np.uint8)
         
-        # Use ALL target words for maximum accuracy
-        print(f"  {cyan('[*]')} Bloom filter size: {bloom_size_bytes / 1024:.1f} KB")
+        print(f"  {cyan('[*]')} Bloom filter size: {bloom_size_bytes / 1024 / 1024:.1f} MB")
         print(f"  {cyan('[*]')} Hashing ALL target words: {len(target_words):,}")
         
         for word in tqdm(target_words, desc="Building bloom filter", leave=False):
             word_bytes = word.encode('latin-1')
             
-            # Use multiple hash functions
-            hash_funcs = [
-                hashlib.md5,
-                hashlib.sha1,
-                hashlib.sha256,
-                hashlib.sha512
-            ]
+            # Use FNV-1a with different seeds (GPU compatible)
+            h1 = fnv1a_32(word_bytes, 0xDEADBEEF)
+            h2 = fnv1a_32(word_bytes, 0xCAFEBABE)
             
-            for i, hash_func in enumerate(hash_funcs):
-                hash_val = int(hash_func(word_bytes).hexdigest()[:8], 16)
-                idx = hash_val % self.params['BLOOM_FILTER_SIZE']
+            for i in range(4):  # 4 hash functions
+                idx = (h1 + i * h2) % self.params['BLOOM_FILTER_SIZE']
                 byte_idx = idx // 8
                 bit_idx = idx % 8
                 bloom_filter[byte_idx] |= (1 << bit_idx)
@@ -673,6 +703,17 @@ class GPUEngine:
         print(f"  {cyan('[*]')} False positive rate: {(fill_ratio**4):.6%}")
         
         return bloom_filter
+    
+    def upload_bloom_filter(self, bloom_filter):
+        """Upload bloom filter ONCE and reuse across all batches"""
+        mf = cl.mem_flags
+        if self.bloom_buf is not None:
+            self.bloom_buf.release()
+        self.bloom_buf = cl.Buffer(
+            self.context, mf.READ_ONLY | mf.COPY_HOST_PTR,
+            hostbuf=bloom_filter
+        )
+        return self.bloom_buf
     
     def prepare_batch_data(self, words, rules):
         """Prepare data for a single batch"""
@@ -713,44 +754,45 @@ class GPUEngine:
             'num_rules': len(rules)
         }
     
-    def process_all_words_single_rule(self, base_words, target_words, rules):
+    def process_all_words_single_rule(self, base_words, rules, bloom_filter):
         """Process ALL base words with single rules"""
         print(f"{blue('[GPU]')} {bold('Processing ALL words with single rules...')}")
         
-        # Generate Bloom filter with ALL target words
-        bloom_filter = self.generate_bloom_filter(target_words)
+        # Upload bloom filter once
+        self.upload_bloom_filter(bloom_filter)
         
         # Compile kernel
         if not self.compile_kernel():
             return []
         
         # Validate rules for GPU compatibility
-        gpu_rules = HashcatRuleValidator.validate_rules_for_gpu(rules)
+        self.gpu_rules = HashcatRuleValidator.validate_rules_for_gpu(rules)
         
-        print(f"{blue('[INFO]')} {bold('GPU-compatible rules:')} {len(gpu_rules):,}")
+        # Build rule index for fast lookup
+        self.rule_index = {r: i for i, r in enumerate(self.gpu_rules)}
         
-        all_found_rules = []
+        print(f"{blue('[INFO]')} {bold('GPU-compatible rules:')} {len(self.gpu_rules):,}")
+        
+        # Use a set for deduplication and to respect global cap
+        found_rules_set = set()
+        max_to_find = self.params['MAX_CHAINS_TO_FIND']
         
         # Calculate optimal batch size
-        optimal_global_size = self.params['OPTIMAL_GLOBAL_MULTIPLIER'] * self.local_work_size
-        items_per_combination = len(gpu_rules)
-        optimal_words_per_batch = max(1000, optimal_global_size // items_per_combination)
-        
-        # Adjust batch size
-        batch_size = min(
-            self.params['WORDS_PER_BATCH'],
-            optimal_words_per_batch,
-            len(base_words)
-        )
-        
+        batch_size = self.params['WORDS_PER_BATCH']
         num_batches = (len(base_words) + batch_size - 1) // batch_size
         
         print(f"{blue('[INFO]')} {bold('Processing ALL')} {len(base_words):,} {bold('words in')} {num_batches} {bold('batches')}")
         print(f"{blue('[INFO]')} {bold('Batch size:')} {batch_size:,} words")
+        print(f"{blue('[INFO]')} {bold('Global cap:')} {max_to_find:,} chains")
         
         # Process batches
         with tqdm(total=num_batches, desc="Processing all words", unit="batch") as pbar:
             for batch_idx in range(num_batches):
+                # Check if we've already reached the cap
+                if len(found_rules_set) >= max_to_find:
+                    print(f"\n{yellow('[STOP]')} Reached global cap of {max_to_find} chains. Stopping early.")
+                    break
+                
                 start_idx = batch_idx * batch_size
                 end_idx = min((batch_idx + 1) * batch_size, len(base_words))
                 batch_words = base_words[start_idx:end_idx]
@@ -760,26 +802,31 @@ class GPUEngine:
                     continue
                 
                 # Process this batch
-                batch_data = self.prepare_batch_data(batch_words, gpu_rules)
-                batch_found = self.process_batch_single(batch_data, bloom_filter, gpu_rules)
+                batch_data = self.prepare_batch_data(batch_words, self.gpu_rules)
+                batch_found = self.process_batch_single(batch_data)
                 
                 if batch_found:
-                    all_found_rules.extend(batch_found)
+                    # Add new found rules to set (automatically deduplicates)
+                    found_rules_set.update(batch_found)
                 
                 # Update progress
                 pbar.set_postfix({
-                    'found': len(all_found_rules),
+                    'found': len(found_rules_set),
                     'progress': f"{end_idx:,}/{len(base_words):,}"
                 })
                 pbar.update(1)
+                
+                # Force cleanup between batches
+                self.queue.finish()
+                gc.collect()
         
-        # Remove duplicates and return
-        all_found_rules = list(set(all_found_rules))
-        print(f"\n{green('[OK]')} {bold('Total unique single rules found:')} {cyan(len(all_found_rules))}")
+        # Convert set to list for return
+        found_rules = list(found_rules_set)
+        print(f"\n{green('[OK]')} {bold('Total unique single rules found:')} {cyan(len(found_rules))}")
         
-        return all_found_rules
+        return found_rules
     
-    def process_batch_single(self, batch_data, bloom_filter, rules):
+    def process_batch_single(self, batch_data):
         """Process a single batch on GPU"""
         mf = cl.mem_flags
         
@@ -799,13 +846,16 @@ class GPUEngine:
             rule_lengths_buf = cl.Buffer(self.context, mf.READ_ONLY | mf.COPY_HOST_PTR,
                                        hostbuf=batch_data['rule_lengths'])
             
-            bloom_buf = cl.Buffer(self.context, mf.READ_ONLY | mf.COPY_HOST_PTR,
-                                hostbuf=bloom_filter)
+            # Use pre-uploaded bloom buffer
+            bloom_buf = self.bloom_buf
             
-            # Output buffers - dynamically sized
-            max_output_size = min(self.params['MAX_CHAINS_TO_FIND'], 
-                                 batch_data['num_words'] * batch_data['num_rules'])
+            # Calculate safe output size
+            max_output_size = self.safe_output_buffer_size(
+                batch_data['num_words'], 
+                batch_data['num_rules']
+            )
             
+            # Output buffers
             found_rules_buf = cl.Buffer(self.context, mf.WRITE_ONLY,
                                       max_output_size * MAX_CHAIN_STRING_LEN)
             found_count_buf = cl.Buffer(self.context, mf.READ_WRITE, 4)
@@ -862,6 +912,8 @@ class GPUEngine:
             return []
             
         finally:
+            # Ensure queue is finished before releasing buffers
+            self.queue.finish()
             # Cleanup all buffers
             try:
                 base_buf.release()
@@ -870,83 +922,14 @@ class GPUEngine:
                 rules_buf.release()
                 rule_offsets_buf.release()
                 rule_lengths_buf.release()
-                bloom_buf.release()
                 found_rules_buf.release()
                 found_count_buf.release()
             except:
                 pass
     
-    def process_all_words_chain_rules(self, base_words, target_words, rules, max_depth):
-        """Process ALL base words with rule chains - optimized for speed"""
-        print(f"{blue('[GPU]')} {bold('Processing ALL words with rule chains...')}")
-        
-        # Generate Bloom filter with ALL target words
-        bloom_filter = self.generate_bloom_filter(target_words)
-        
-        # Compile kernel
-        if not self.compile_kernel():
-            return []
-        
-        # Validate rules for GPU compatibility
-        gpu_rules = HashcatRuleValidator.validate_rules_for_gpu(rules)
-        
-        # Generate chains from valid rules
-        print(f"{blue('[SETUP]')} {bold('Generating rule chains...')}")
-        chains = self.generate_valid_chains(gpu_rules, min(max_depth, 3))  # Limit to depth 3 for speed
-        
-        if not chains:
-            return []
-        
-        print(f"{blue('[INFO]')} {bold('Total chains generated:')} {len(chains):,}")
-        
-        all_chains = []
-        
-        # Calculate optimal batch sizes for 30-minute completion
-        optimal_global_size = self.params['OPTIMAL_GLOBAL_MULTIPLIER'] * self.local_work_size
-        
-        # Calculate words per batch based on target time
-        total_combinations = len(base_words) * len(chains)
-        target_batches = max(10, int(total_combinations / (optimal_global_size * 50)))
-        
-        # Adjust chain batch size for speed
-        chain_batch_size = max(5000, min(20000, len(chains) // target_batches))
-        
-        # Ensure we don't have too many batches
-        num_chain_batches = (len(chains) + chain_batch_size - 1) // chain_batch_size
-        
-        print(f"{blue('[INFO]')} {bold('Processing')} {len(chains):,} {bold('chains in')} {num_chain_batches} {bold('batches')}")
-        print(f"{blue('[INFO]')} {bold('Chain batch size:')} {chain_batch_size:,}")
-        print(f"{blue('[INFO]')} {bold('Total combinations:')} {total_combinations:,}")
-        
-        # Process chain batches
-        with tqdm(total=num_chain_batches, desc="Chain batches", unit="batch") as chain_pbar:
-            for chain_batch_idx in range(0, len(chains), chain_batch_size):
-                chain_end = min(chain_batch_idx + chain_batch_size, len(chains))
-                chain_batch = chains[chain_batch_idx:chain_end]
-                
-                # Process this chain batch with all words
-                batch_chains = self._process_chain_batch(
-                    base_words, gpu_rules, chain_batch, bloom_filter
-                )
-                
-                if batch_chains:
-                    all_chains.extend(batch_chains)
-                
-                chain_pbar.update(1)
-                chain_pbar.set_postfix({
-                    'found': len(all_chains),
-                    'progress': f"{chain_end}/{len(chains)}"
-                })
-        
-        # Remove duplicates and return
-        all_chains = list(set(all_chains))
-        print(f"\n{green('[OK]')} {bold('Total unique chains found:')} {cyan(len(all_chains))}")
-        
-        return all_chains
-    
-    def generate_valid_chains(self, rules, max_depth):
-        """Generate valid rule chains up to max_depth - optimized for speed"""
-        print(f"  {cyan('->')} Generating chains up to depth {max_depth}...")
+    def generate_informed_chains(self, rules, single_rules_found, max_depth):
+        """Generate chains biased toward Phase 1 successes"""
+        print(f"  {cyan('->')} Generating informed chains up to depth {max_depth}...")
         
         # Validate all rules first
         valid_rules = [r for r in rules if HashcatRuleValidator.validate_rule_for_gpu(r)]
@@ -955,61 +938,93 @@ class GPUEngine:
             print(f"  {yellow('[WARN]')} No valid rules found")
             return []
         
-        # Use all valid rules
-        rules_to_use = valid_rules
-        print(f"  {cyan('[*]')} Using all {len(rules_to_use)} rules for chain generation")
+        # Build frequency map from found single rules
+        found_set = set(single_rules_found) if single_rules_found else set()
+        
+        # Partition rules: high-value (matched in phase 1) vs general
+        hot_rules = [r for r in valid_rules if r in found_set]
+        cold_rules = [r for r in valid_rules if r not in found_set]
+        
+        print(f"  {cyan('[*]')} Using all {len(valid_rules)} rules for chain generation")
+        print(f"  {cyan('[*]')} Hot rules (from Phase 1): {len(hot_rules)}")
+        print(f"  {cyan('[*]')} Cold rules: {len(cold_rules)}")
         
         chains = set()
         
         # Depth 1: Single rules
         print(f"  {cyan('->')} Depth 1 chains...")
-        for rule in rules_to_use:
+        for rule in valid_rules:
             chains.add(rule)
         
-        # Generate chains for depth 2 and 3 only (for speed)
+        # Generate chains for depth 2 and 3 only
         for depth in range(2, max_depth + 1):
             print(f"  {cyan('->')} Depth {depth} chains...")
             
             import random
             random.seed(42)
             
-            # Calculate theoretical maximum combinations
-            max_combinations = len(rules_to_use) ** depth
-            
             # Get depth-specific limit
             if depth == 2:
-                target_combinations = self.params.get('CHAIN_GEN_LIMIT_2', 100000)
+                target_combinations = self.params.get('CHAIN_GEN_LIMIT_2', 150000)
             elif depth == 3:
-                target_combinations = self.params.get('CHAIN_GEN_LIMIT_3', 50000)
+                target_combinations = self.params.get('CHAIN_GEN_LIMIT_3', 75000)
             else:
-                target_combinations = self.params.get(f'CHAIN_GEN_LIMIT_{depth}', 25000)
+                target_combinations = 25000
             
-            # Adjust based on total combinations
+            # Calculate theoretical maximum
+            max_combinations = len(valid_rules) ** depth
             target_combinations = min(target_combinations, max_combinations)
             
             print(f"  {cyan('[*]')} Generating up to {target_combinations:,} chains...")
             
             chains_added = 0
             attempts = 0
-            max_attempts = target_combinations * 5  # Reduced attempts for speed
+            max_attempts = target_combinations * 2
             
             # Track generated patterns
             generated_patterns = set()
             
-            while chains_added < target_combinations and attempts < max_attempts:
+            # 60% chains use at least one hot rule from phase 1
+            if hot_rules:
+                hot_budget = int(target_combinations * 0.6)
+                cold_budget = target_combinations - hot_budget
+            else:
+                hot_budget = 0
+                cold_budget = target_combinations
+            
+            # Generate hot chains (with at least one hot rule)
+            if hot_rules and hot_budget > 0:
+                for _ in range(hot_budget):
+                    attempts += 1
+                    if attempts > max_attempts:
+                        break
+                    
+                    # At least one slot is a hot rule
+                    hot_pos = random.randint(0, depth - 1)
+                    parts = []
+                    for i in range(depth):
+                        if i == hot_pos and hot_rules:
+                            parts.append(random.choice(hot_rules))
+                        else:
+                            parts.append(random.choice(valid_rules))
+                    
+                    pattern_key = ' '.join(parts)
+                    
+                    if pattern_key not in generated_patterns:
+                        chains.add(pattern_key)
+                        generated_patterns.add(pattern_key)
+                        chains_added += 1
+            
+            # Generate cold chains (fully random)
+            for _ in range(cold_budget):
                 attempts += 1
+                if attempts > max_attempts:
+                    break
                 
-                # Generate chain parts
-                chain_parts = [random.choice(rules_to_use) for _ in range(depth)]
+                parts = [random.choice(valid_rules) for _ in range(depth)]
+                pattern_key = ' '.join(parts)
                 
-                # Create pattern key
-                pattern_key = ' '.join(chain_parts)
-                
-                # Check if valid
-                valid = all(HashcatRuleValidator.validate_rule_for_gpu(rule) for rule in chain_parts)
-                
-                # Add if valid and not duplicate
-                if valid and pattern_key not in generated_patterns:
+                if pattern_key not in generated_patterns:
                     chains.add(pattern_key)
                     generated_patterns.add(pattern_key)
                     chains_added += 1
@@ -1019,10 +1034,103 @@ class GPUEngine:
         
         return chains_list
     
-    def _process_chain_batch(self, words, rules, chains, bloom_filter):
+    def process_all_words_chain_rules(self, base_words, rules, max_depth, bloom_filter, single_rules_found):
+        """Process ALL base words with rule chains - optimized for speed"""
+        print(f"{blue('[GPU]')} {bold('Processing ALL words with rule chains...')}")
+        
+        # Use existing bloom filter (already uploaded)
+        if self.bloom_buf is None:
+            self.upload_bloom_filter(bloom_filter)
+        
+        # Compile kernel if not already compiled
+        if not self.program:
+            if not self.compile_kernel():
+                return []
+        
+        # Use existing rule index
+        if not self.rule_index:
+            self.rule_index = {r: i for i, r in enumerate(self.gpu_rules)}
+        
+        # Generate informed chains from valid rules
+        print(f"{blue('[SETUP]')} {bold('Generating rule chains...')}")
+        chains = self.generate_informed_chains(rules, single_rules_found, min(max_depth, 3))
+        
+        if not chains:
+            return []
+        
+        print(f"{blue('[INFO]')} {bold('Total chains generated:')} {len(chains):,}")
+        
+        # Use a set for deduplication and to respect global cap
+        found_chains_set = set()
+        max_to_find = self.params['MAX_CHAINS_TO_FIND']
+        
+        # Calculate optimal batch sizes
+        chain_batch_size = self.params['CHAINS_PER_BATCH']
+        word_sub_batch = self.params['WORD_SUB_BATCH']
+        
+        num_chain_batches = (len(chains) + chain_batch_size - 1) // chain_batch_size
+        
+        print(f"{blue('[INFO]')} {bold('Processing')} {len(chains):,} {bold('chains in')} {num_chain_batches} {bold('batches')}")
+        print(f"{blue('[INFO]')} {bold('Chain batch size:')} {chain_batch_size:,}")
+        print(f"{blue('[INFO]')} {bold('Word sub-batch size:')} {word_sub_batch:,}")
+        print(f"{blue('[INFO]')} {bold('Global cap:')} {max_to_find:,} chains")
+        
+        total_combinations = len(base_words) * len(chains)
+        print(f"{blue('[INFO]')} {bold('Total combinations:')} {total_combinations:,}")
+        
+        # Process chain batches
+        with tqdm(total=num_chain_batches, desc="Chain batches", unit="batch") as chain_pbar:
+            for chain_batch_idx in range(0, len(chains), chain_batch_size):
+                # Check global cap
+                if len(found_chains_set) >= max_to_find:
+                    print(f"\n{yellow('[STOP]')} Reached global cap of {max_to_find} chains. Stopping early.")
+                    break
+                
+                chain_end = min(chain_batch_idx + chain_batch_size, len(chains))
+                chain_batch = chains[chain_batch_idx:chain_end]
+                
+                # Process this chain batch with word sub-batches
+                for word_start in range(0, len(base_words), word_sub_batch):
+                    # Check cap again inside word loop
+                    if len(found_chains_set) >= max_to_find:
+                        break
+                    
+                    word_end = min(word_start + word_sub_batch, len(base_words))
+                    word_batch = base_words[word_start:word_end]
+                    
+                    if not word_batch:
+                        continue
+                    
+                    batch_chains = self._process_chain_batch(
+                        word_batch, chain_batch
+                    )
+                    
+                    if batch_chains:
+                        # Add to set (deduplicate on the fly)
+                        found_chains_set.update(batch_chains)
+                    
+                    # Force cleanup between sub-batches
+                    self.queue.finish()
+                
+                chain_pbar.update(1)
+                chain_pbar.set_postfix({
+                    'found': len(found_chains_set),
+                    'progress': f"{chain_end}/{len(chains)}"
+                })
+                
+                # Force cleanup between batches
+                gc.collect()
+        
+        # Convert set to list for return
+        found_chains = list(found_chains_set)
+        print(f"\n{green('[OK]')} {bold('Total unique chains found:')} {cyan(len(found_chains))}")
+        
+        return found_chains
+    
+    def _process_chain_batch(self, words, chains):
         """Process a single chain batch optimized for speed"""
         
-        # Prepare chain sequences
+        # Prepare chain sequences using pre-built rule index
         chain_sequences = []
         chain_depths = []
         
@@ -1033,11 +1141,9 @@ class GPUEngine:
             
             rule_indices = []
             for rule in chain_rules:
-                try:
-                    idx = rules.index(rule)
-                    rule_indices.append(idx)
-                except ValueError:
-                    rule_indices.append(-1)
+                # Fast O(1) lookup instead of O(n) index()
+                idx = self.rule_index.get(rule, -1)
+                rule_indices.append(idx)
             
             # Pad to max depth
             while len(rule_indices) < self.params['MAX_CHAIN_DEPTH']:
@@ -1046,7 +1152,7 @@ class GPUEngine:
             chain_sequences.extend(rule_indices)
         
         # Prepare data
-        batch_data = self.prepare_batch_data(words, rules)
+        batch_data = self.prepare_batch_data(words, self.gpu_rules)
         
         mf = cl.mem_flags
         
@@ -1071,13 +1177,16 @@ class GPUEngine:
             chain_depth_buf = cl.Buffer(self.context, mf.READ_ONLY | mf.COPY_HOST_PTR,
                                       hostbuf=np.array(chain_depths, dtype=np.int32))
             
-            bloom_buf = cl.Buffer(self.context, mf.READ_ONLY | mf.COPY_HOST_PTR,
-                                hostbuf=bloom_filter)
+            # Use pre-uploaded bloom buffer
+            bloom_buf = self.bloom_buf
+            
+            # Calculate safe output size
+            max_output_size = self.safe_output_buffer_size(
+                len(words), 
+                len(chains)
+            )
             
             # Output buffers
-            max_output_size = min(self.params['MAX_CHAINS_TO_FIND'], 
-                                 len(words) * len(chains))
-            
             found_chains_buf = cl.Buffer(self.context, mf.WRITE_ONLY,
                                        max_output_size * MAX_CHAIN_STRING_LEN)
             found_count_buf = cl.Buffer(self.context, mf.READ_WRITE, 4)
@@ -1135,6 +1244,7 @@ class GPUEngine:
             return []
             
         finally:
+            self.queue.finish()
             # Cleanup all buffers
             try:
                 base_buf.release()
@@ -1145,7 +1255,6 @@ class GPUEngine:
                 rule_lengths_buf.release()
                 chain_seq_buf.release()
                 chain_depth_buf.release()
-                bloom_buf.release()
                 found_chains_buf.release()
                 found_count_buf.release()
             except:
@@ -1172,7 +1281,7 @@ class GPUExtractor:
         print(f"  {cyan('[*]')} Chains per batch: {self.params['CHAINS_PER_BATCH']:,}")
         print(f"  {cyan('[*]')} Max chains to find: {self.params['MAX_CHAINS_TO_FIND']:,}")
         print(f"  {cyan('[*]')} Max chain depth: {self.params['MAX_CHAIN_DEPTH']}")
-        print(f"  {cyan('[*]')} Chain gen limits: D2={self.params['CHAIN_GEN_LIMIT_2']:,}, D3={self.params['CHAIN_GEN_LIMIT_3']:,}")
+        print(f"  {cyan('[*]')} Max safe results/batch: {self.params['MAX_SAFE_RESULTS_PER_BATCH']:,}")
         
         # Initialize components
         self.rules_generator = GPUCompatibleRulesGenerator(slow_mode)
@@ -1193,13 +1302,16 @@ class GPUExtractor:
             print(f"{yellow('[WARN]')} {bold('GPU not available')}")
             return []
         
+        # Generate Bloom filter once (with ALL target words)
+        bloom_filter = self.gpu_engine.generate_bloom_filter(target_words)
+        
         # Phase 1: Single rules with ALL words
         print(f"\n{blue('=' * 60)}")
         print(f"{bold('PHASE 1: SINGLE RULE SEARCH (ALL WORDS)')}")
         print(f"{blue('=' * 60)}")
         
         single_chains = self.gpu_engine.process_all_words_single_rule(
-            base_words, target_words, rules
+            base_words, rules, bloom_filter
         )
         all_chains.extend(single_chains)
         
@@ -1212,7 +1324,7 @@ class GPUExtractor:
             print(f"{blue('=' * 60)}")
             
             chain_chains = self.gpu_engine.process_all_words_chain_rules(
-                base_words, target_words, rules, max_depth
+                base_words, rules, max_depth, bloom_filter, single_chains
             )
             all_chains.extend(chain_chains)
             
@@ -1229,18 +1341,42 @@ class GPUExtractor:
         return final_chains
 
 # ====================================================================
-# --- FIXED GPU-COMPATIBLE KERNEL ---
+# --- FIXED GPU-COMPATIBLE KERNEL (WITH ADDRESS SPACE FIXES) ---
 # ====================================================================
 
 GPU_COMPATIBLE_KERNEL = """
 #define MAX_WORD_LEN 256
 #define MAX_RULE_LEN 16
 #define MAX_OUTPUT_LEN 512
-#define MAX_CHAIN_STRING_LEN 512
-#define MAX_CHAINS_TO_FIND 10000000
-#define MAX_CHAIN_DEPTH 6
-#define BLOOM_FILTER_SIZE 8388608
+#define MAX_CHAIN_STRING_LEN 128
+#define MAX_CHAINS_TO_FIND 25000
+#define MAX_CHAIN_DEPTH 3
+#define BLOOM_FILTER_SIZE 67108864
 #define BLOOM_HASH_FUNCTIONS 4
+
+// ============================================================================
+// FNV-1a HASH FUNCTION (GPU VERSION - FIXED FOR LOCAL MEMORY)
+// ============================================================================
+
+// Version for __global memory (used for bloom filter data)
+uint fnv1a_32_global(__global const unsigned char *data, int len, uint seed) {
+    uint hash = seed ^ 2166136261U;
+    for (int i = 0; i < len; i++) {
+        hash ^= data[i];
+        hash *= 16777619U;
+    }
+    return hash;
+}
+
+// Version for local/private memory (used for word buffers on stack)
+uint fnv1a_32_local(const unsigned char *data, int len, uint seed) {
+    uint hash = seed ^ 2166136261U;
+    for (int i = 0; i < len; i++) {
+        hash ^= data[i];
+        hash *= 16777619U;
+    }
+    return hash;
+}
 
 // ============================================================================
 // UTILITY FUNCTIONS
@@ -1286,20 +1422,12 @@ inline unsigned char toggle_case(unsigned char c) {
 }
 
 // ============================================================================
-// BLOOM FILTER FUNCTIONS
+// BLOOM FILTER FUNCTIONS (USING FNV-1a)
 // ============================================================================
 
-uint bloom_hash(const unsigned char *str, int len, uint seed) {
-    uint hash = seed;
-    for (int i = 0; i < len; i++) {
-        hash = (hash * 31) + str[i];
-    }
-    return hash;
-}
-
 int bloom_check(__global const uchar *bloom_filter, const unsigned char *word, int len) {
-    uint h1 = bloom_hash(word, len, 0xDEADBEEF);
-    uint h2 = bloom_hash(word, len, 0xCAFEBABE);
+    uint h1 = fnv1a_32_local(word, len, 0xDEADBEEF);
+    uint h2 = fnv1a_32_local(word, len, 0xCAFEBABE);
     
     for (int i = 0; i < BLOOM_HASH_FUNCTIONS; i++) {
         uint hash_val = (h1 + i * h2) % BLOOM_FILTER_SIZE;
@@ -2144,4 +2272,3 @@ if __name__ == '__main__':
     print(f"{blue('[OUTPUT]')} {bold('Output saved to:')} {bold(args.output)}")
     print(f"{blue('[NOTE]')} {bold('All chains are GPU-compatible and syntactically valid for Hashcat')}")
     print(f"{bold(green('=' * 80))}{Colors.END}")
-
