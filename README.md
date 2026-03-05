@@ -1,7 +1,5 @@
 **GPU-Accelerated Rule Mining for Hash Cracking Wordlists (Full Chain Extraction)**
 
-[![rulest.png](https://i.postimg.cc/vDRkTBrs/rulest.png)](https://postimg.cc/1VHJYy7C)
-
 This project implements a highly optimized tool for extracting effective word-transformation rule chains by leveraging PyOpenCL to run the transformation logic on a Graphics Processing Unit (GPU).
 
 💡 **Overview**
