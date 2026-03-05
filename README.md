@@ -28,7 +28,7 @@ A high-performance OpenCL-based tool for extracting and testing Hashcat rules us
 
 ```
 python3 rulest-v2.0.py -h
-usage: rulest-v2.0.py [-h] [-d {1,2,3}] [-o OUTPUT] [--slow] [--verify] [--max-chains MAX_CHAINS] [--target-hours TARGET_HOURS] base_wordlist target_wordlist
+usage: rulest-v2.0.py [-h] [-d {1,2,3}] [-o OUTPUT] [--max-chains MAX_CHAINS] [--target-hours TARGET_HOURS] base_wordlist target_wordlist
 
 GPU-COMPATIBLE Hashcat Rules Engine with Dynamic Workload Processing
 
@@ -42,8 +42,6 @@ optional arguments:
                         Max chain depth (1-3 only for speed, default: 3)
   -o OUTPUT, --output OUTPUT
                         Output file (default: found_chains.txt)
-  --slow                Enable more comprehensive search (may take longer)
-  --verify              Verify all chains work before saving
   --max-chains MAX_CHAINS
                         Maximum chains to generate (overrides automatic limits)
   --target-hours TARGET_HOURS
