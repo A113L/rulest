@@ -300,8 +300,8 @@ def calculate_dynamic_parameters(base_count, target_count, device=None, target_h
     WORD_SUB_BATCH = 20000
     MAX_SAFE_RESULTS_PER_BATCH = 25000
     MAX_CHAINS_TO_FIND = min(1_000_000, max_combinations_time_limit // 1000)
-    CHAIN_GEN_LIMIT_2 = 150000
-    CHAIN_GEN_LIMIT_3 = 75000
+    CHAIN_GEN_LIMIT_2 = 150000   # will be dynamically adjusted later
+    CHAIN_GEN_LIMIT_3 = 75000    # will be dynamically adjusted later
     MAX_CHAIN_DEPTH = 3
 
     print(f"\n{blue('[TIME]')} {bold(f'Target completion: {target_hours} hours')}")
@@ -345,9 +345,10 @@ class GPUCompatibleRulesGenerator:
 
         # ===== CATEGORY 1: SIMPLE RULES =====
         print(f"  {cyan('[*]')} Simple rules...")
+        # Removed 'a' because it causes errors in Hashcat
         simple_rules = [
             'l', 'u', 'c', 'C', 't', 'r', 'd', 'f', 'p', 'z', 'Z', 'q', 'E',
-            '{', '}', '[', ']', 'k', 'K', ':', 'a'
+            '{', '}', '[', ']', 'k', 'K', ':'
         ]
         rules.update(simple_rules)
 
@@ -1001,7 +1002,8 @@ class GPUExtractor:
         self.gpu_engine = GPUEngine(self.params)
         self.validator = HashcatRuleValidator()
 
-    def extract_rules(self, base_words, target_words, max_depth=3):
+    def extract_rules(self, base_words, target_words, max_depth=3,
+                      depth2_override=None, depth3_override=None):
         """Extract GPU-compatible rules using complete processing"""
         print(f"{blue('[MAIN]')} {bold('Starting GPU-optimized rule extraction...')}")
 
@@ -1019,16 +1021,59 @@ class GPUExtractor:
         print(f"{bold('PHASE 1: SINGLE RULE SEARCH (ALL WORDS)')}")
         print(f"{blue('=' * 60)}")
 
+        phase1_start = time.time()
         single_chains = self.gpu_engine.process_all_words_single_rule(
             base_words, rules, bloom_filter
         )
+        phase1_time = time.time() - phase1_start
         all_chains.extend(single_chains)
         print(f"{green('[OK]')} {bold('Single rules found:')} {cyan(len(single_chains))}")
 
+        # Dynamic chain budget calculation based on actual Phase 1 time
         if max_depth > 1:
             print(f"\n{blue('=' * 60)}")
             print(f"{bold('PHASE 2: RULE CHAIN SEARCH (ALL WORDS)')}")
             print(f"{blue('=' * 60)}")
+
+            remaining_time = max(0, self.params['TARGET_SECONDS'] - phase1_time)
+            total_work_budget = remaining_time * self.params['EST_COMBOS_PER_SEC'] * 0.9  # 90% safety margin
+            base_words_len = len(base_words)
+
+            # Default split: 60% depth2, 40% depth3 (weighted by average rule applications per chain)
+            # Average depth factor = 0.6*2 + 0.4*3 = 2.4
+            if total_work_budget > 0 and base_words_len > 0:
+                max_total_chains = total_work_budget / (base_words_len * 2.4)
+                max_total_chains = min(max_total_chains, self.params['MAX_CHAINS_TO_FIND'])
+                depth2_target = int(max_total_chains * 0.6)
+                depth3_target = int(max_total_chains * 0.4)
+            else:
+                depth2_target = depth3_target = 0
+
+            # Apply overrides if provided
+            if depth2_override is not None:
+                depth2_target = depth2_override
+                print(f"{blue('[OVERRIDE]')} {bold('Depth 2 chains set to:')} {cyan(depth2_override)}")
+            if depth3_override is not None:
+                depth3_target = depth3_override
+                print(f"{blue('[OVERRIDE]')} {bold('Depth 3 chains set to:')} {cyan(depth3_override)}")
+
+            # Ensure at least some minimal generation (1000) if time permits
+            depth2_target = max(depth2_target, 0)
+            depth3_target = max(depth3_target, 0)
+            # Cap by global max
+            total_target = depth2_target + depth3_target
+            if total_target > self.params['MAX_CHAINS_TO_FIND']:
+                scale = self.params['MAX_CHAINS_TO_FIND'] / total_target
+                depth2_target = int(depth2_target * scale)
+                depth3_target = int(depth3_target * scale)
+
+            self.params['CHAIN_GEN_LIMIT_2'] = depth2_target
+            self.params['CHAIN_GEN_LIMIT_3'] = depth3_target
+
+            print(f"{blue('[DYNAMIC]')} {bold('Phase 1 time:')} {phase1_time:.2f}s, {bold('Remaining:')} {remaining_time:.2f}s")
+            # Fixed formatting: apply comma formatting inside cyan()
+            print(f"{blue('[DYNAMIC]')} {bold('Depth 2 chain limit:')} {cyan(f'{depth2_target:,}')}")
+            print(f"{blue('[DYNAMIC]')} {bold('Depth 3 chain limit:')} {cyan(f'{depth3_target:,}')}")
 
             chain_chains = self.gpu_engine.process_all_words_chain_rules(
                 base_words, rules, max_depth, bloom_filter, single_chains
@@ -1264,12 +1309,6 @@ int apply_gpu_rule(
             case ':': // No operation
                 changed = 0;
                 break;
-            case 'a': // Toggle case recursively (same as 't')
-                for (int i = 0; i < *output_len; i++) {{
-                    output_word[i] = toggle_case(output_word[i]);
-                }}
-                changed = 1;
-                break;
             case 'q': // Duplicate all chars
                 if (*output_len * 2 <= MAX_OUTPUT_LEN) {{
                     unsigned char temp[MAX_OUTPUT_LEN];
@@ -1298,6 +1337,7 @@ int apply_gpu_rule(
                 }}
                 changed = 1;
                 break;
+            // 'a' removed because it causes errors in Hashcat
         }}
     }}
     // ------------------------------------------------------------------------
@@ -1757,6 +1797,11 @@ if __name__ == '__main__':
                        help='Maximum chains to generate (overrides automatic limits)')
     parser.add_argument('--target-hours', type=float, default=0.5,
                        help='Target completion time in hours (default: 0.5)')
+    # New flags for depth-specific overrides
+    parser.add_argument('--depth2-chains', type=int, default=None,
+                       help='Override dynamic limit for depth 2 chains')
+    parser.add_argument('--depth3-chains', type=int, default=None,
+                       help='Override dynamic limit for depth 3 chains')
 
     args = parser.parse_args()
 
@@ -1793,7 +1838,9 @@ if __name__ == '__main__':
     print(f"{bold('STARTING GPU-COMPATIBLE RULE EXTRACTION')}")
     print(f"{blue('=' * 60)}")
 
-    chains = extractor.extract_rules(base_words, target_words, args.depth)
+    chains = extractor.extract_rules(base_words, target_words, args.depth,
+                                     depth2_override=args.depth2_chains,
+                                     depth3_override=args.depth3_chains)
 
     end_time = time.time()
     elapsed_hours = (end_time - start_time) / 3600
