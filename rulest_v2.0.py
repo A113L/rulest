@@ -200,6 +200,70 @@ def fnv1a_32(data, seed=0xDEADBEEF):
 # --- GPU DEVICE SELECTION ---
 # ====================================================================
 
+def get_all_devices():
+    """Return list of (platform, device) for all OpenCL devices (GPU and CPU)"""
+    devices = []
+    platforms = cl.get_platforms()
+    for plat in platforms:
+        try:
+            gpu_devices = plat.get_devices(cl.device_type.GPU)
+            for dev in gpu_devices:
+                devices.append((plat, dev))
+        except:
+            pass
+        try:
+            cpu_devices = plat.get_devices(cl.device_type.CPU)
+            for dev in cpu_devices:
+                devices.append((plat, dev))
+        except:
+            pass
+    return devices
+
+def list_devices():
+    """Print all available OpenCL devices with indices"""
+    devices = get_all_devices()
+    if not devices:
+        print(f"{red('[ERROR]')} No OpenCL devices found.")
+        sys.exit(1)
+    print(f"\n{blue('[DEVICES]')} Available OpenCL devices:")
+    for idx, (plat, dev) in enumerate(devices):
+        name = dev.get_info(cl.device_info.NAME)
+        typ = cl.device_type.to_string(dev.get_info(cl.device_info.TYPE))
+        print(f"  {cyan(f'{idx}:')} {name} ({typ}) – Platform: {plat.name}")
+    print()
+
+def get_device_by_spec(spec: Optional[str]):
+    """Return device matching spec (index or substring), or best GPU if spec is None"""
+    if spec is None:
+        return get_best_gpu_device()
+
+    devices = get_all_devices()
+    if not devices:
+        raise RuntimeError("No OpenCL devices found")
+
+    # Try as index
+    if spec.isdigit():
+        idx = int(spec)
+        if 0 <= idx < len(devices):
+            return devices[idx][1]
+        else:
+            raise RuntimeError(f"Device index {idx} out of range (0-{len(devices)-1})")
+
+    # Try as substring (case-insensitive)
+    spec_lower = spec.lower()
+    matches = []
+    for plat, dev in devices:
+        name = dev.get_info(cl.device_info.NAME).lower()
+        if spec_lower in name:
+            matches.append(dev)
+    if len(matches) == 1:
+        return matches[0]
+    elif len(matches) > 1:
+        print(f"{yellow('[WARN]')} Multiple devices match '{spec}'; using the first one.")
+        return matches[0]
+    else:
+        raise RuntimeError(f"No device found matching '{spec}'")
+
 def get_best_gpu_device():
     """Return the most suitable GPU device (discrete NVIDIA/AMD preferred)"""
     platforms = cl.get_platforms()
@@ -510,10 +574,10 @@ class GPUEngine:
             max_slots = 1
         return min(max_slots, self.params['MAX_SAFE_RESULTS_PER_BATCH'], words_count * chains_count)
 
-    def initialize_gpu(self):
-        """Initialize OpenCL with dynamic parameters"""
+    def initialize_gpu(self, device_spec):
+        """Initialize OpenCL with dynamic parameters, using specified device if given"""
         try:
-            self.device = get_best_gpu_device()
+            self.device = get_device_by_spec(device_spec)
             self.context = cl.Context([self.device])
             self.queue = cl.CommandQueue(self.context)
 
@@ -1073,11 +1137,12 @@ class GPUEngine:
 class GPUExtractor:
     """GPU-optimized extractor with complete processing"""
 
-    def __init__(self, base_count, target_count, max_depth, device=None, target_hours=0.5):
+    def __init__(self, base_count, target_count, max_depth, device_spec=None, target_hours=0.5):
         self.base_count = base_count
         self.target_count = target_count
         self.max_depth = max_depth
-        self.params = calculate_dynamic_parameters(base_count, target_count, device, target_hours)
+        self.device_spec = device_spec
+        self.params = calculate_dynamic_parameters(base_count, target_count, None, target_hours)  # device passed later
         self.params['MAX_CHAIN_DEPTH'] = max_depth  # Add user-specified max depth
 
         print(f"{blue('[CONFIG]')} {bold('GPU-Optimized Configuration:')}")
@@ -1099,9 +1164,14 @@ class GPUExtractor:
 
         rules = self.rules_generator.generate_gpu_compatible_rules()
 
-        if not self.gpu_engine.initialize_gpu():
+        if not self.gpu_engine.initialize_gpu(self.device_spec):
             print(f"{yellow('[WARN]')} {bold('GPU not available')}")
             return []
+
+        # Recalculate params with actual device (now that we have device)
+        self.params = calculate_dynamic_parameters(self.base_count, self.target_count, self.gpu_engine.device, self.params['TARGET_SECONDS']/3600)
+        self.params['MAX_CHAIN_DEPTH'] = self.max_depth
+        self.gpu_engine.params = self.params
 
         bloom_filter = self.gpu_engine.generate_bloom_filter(target_words)
 
@@ -1884,8 +1954,8 @@ if __name__ == '__main__':
         formatter_class=argparse.RawTextHelpFormatter
     )
 
-    parser.add_argument('base_wordlist', help='Base wordlist path')
-    parser.add_argument('target_wordlist', help='Target wordlist path')
+    parser.add_argument('base_wordlist', nargs='?', help='Base wordlist path')
+    parser.add_argument('target_wordlist', nargs='?', help='Target wordlist path')
     parser.add_argument('-d', '--max-depth', type=int, default=3,
                        choices=[1,2,3,4,5,6],
                        help='Max chain depth (1-6, default: 3)')
@@ -1895,6 +1965,11 @@ if __name__ == '__main__':
                        help='Maximum chains to generate (overrides automatic limits)')
     parser.add_argument('--target-hours', type=float, default=0.5,
                        help='Target completion time in hours (default: 0.5)')
+    # Device selection
+    parser.add_argument('--list-devices', action='store_true',
+                       help='List available OpenCL devices and exit')
+    parser.add_argument('--device', type=str, default=None,
+                       help='Device index or substring (e.g., "0" or "NVIDIA")')
     # Depth-specific overrides (up to depth 6)
     parser.add_argument('--depth2-chains', type=int, default=None,
                        help='Override dynamic limit for depth 2 chains')
@@ -1908,6 +1983,16 @@ if __name__ == '__main__':
                        help='Override dynamic limit for depth 6 chains')
 
     args = parser.parse_args()
+
+    if args.list_devices:
+        list_devices()
+        sys.exit(0)
+
+    # If not listing devices, we need both wordlists
+    if args.base_wordlist is None or args.target_wordlist is None:
+        parser.print_help()
+        print(f"\n{red('[ERROR]')} Both base_wordlist and target_wordlist are required when not using --list-devices.")
+        sys.exit(1)
 
     print(f"\n{bold(green('=' * 80))}")
     print(f"{bold('GPU-COMPATIBLE HASHCAT RULES ENGINE (DYNAMIC WORKLOAD)')}")
@@ -1926,13 +2011,8 @@ if __name__ == '__main__':
 
     start_time = time.time()
 
-    try:
-        device = get_best_gpu_device()
-    except Exception as e:
-        print(f"{yellow('[WARN]')} Could not detect GPU: {e}")
-        device = None
-
-    extractor = GPUExtractor(len(base_words), len(target_words), args.max_depth, device, args.target_hours)
+    # Device is handled inside GPUExtractor and GPUEngine
+    extractor = GPUExtractor(len(base_words), len(target_words), args.max_depth, args.device, args.target_hours)
 
     if args.max_chains:
         extractor.params['MAX_CHAINS_TO_FIND'] = args.max_chains
