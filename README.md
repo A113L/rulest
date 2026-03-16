@@ -23,9 +23,9 @@ This Python script leverages the computational power of graphics cards (via Open
 
 ```
 python3 rulest-v2.0.py -h
-usage: rulest-v2.0.py [-h] [-d {1,2,3}] [-o OUTPUT] [--max-chains MAX_CHAINS] [--target-hours TARGET_HOURS] [--depth2-chains DEPTH2_CHAINS]
-                      [--depth3-chains DEPTH3_CHAINS]
-                      base_wordlist target_wordlist
+usage: rulest-v2.0.py [-h] [-d {1,2,3,4,5,6}] [-o OUTPUT] [--max-chains MAX_CHAINS] [--target-hours TARGET_HOURS] [--depth2-chains DEPTH2_CHAINS]
+                     [--depth3-chains DEPTH3_CHAINS] [--depth4-chains DEPTH4_CHAINS] [--depth5-chains DEPTH5_CHAINS] [--depth6-chains DEPTH6_CHAINS]
+                     base_wordlist target_wordlist
 
 GPU-COMPATIBLE Hashcat Rules Engine with Dynamic Workload Processing
 
@@ -35,8 +35,8 @@ positional arguments:
 
 optional arguments:
   -h, --help            show this help message and exit
-  -d {1,2,3}, --depth {1,2,3}
-                        Max chain depth (1-3 only for speed, default: 3)
+  -d {1,2,3,4,5,6}, --max-depth {1,2,3,4,5,6}
+                        Max chain depth (1-6, default: 3)
   -o OUTPUT, --output OUTPUT
                         Output file (default: found_chains.txt)
   --max-chains MAX_CHAINS
@@ -47,7 +47,12 @@ optional arguments:
                         Override dynamic limit for depth 2 chains
   --depth3-chains DEPTH3_CHAINS
                         Override dynamic limit for depth 3 chains
-
+  --depth4-chains DEPTH4_CHAINS
+                        Override dynamic limit for depth 4 chains
+  --depth5-chains DEPTH5_CHAINS
+                        Override dynamic limit for depth 5 chains
+  --depth6-chains DEPTH6_CHAINS
+                        Override dynamic limit for depth 6 chains
 ```
 
 **Credits:**
