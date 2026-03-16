@@ -23,9 +23,10 @@ This Python script leverages the computational power of graphics cards (via Open
 
 ```
 python3 rulest-v2.0.py -h
-usage: rulest-v2.0.py [-h] [-d {1,2,3,4,5,6}] [-o OUTPUT] [--max-chains MAX_CHAINS] [--target-hours TARGET_HOURS] [--depth2-chains DEPTH2_CHAINS]
-                     [--depth3-chains DEPTH3_CHAINS] [--depth4-chains DEPTH4_CHAINS] [--depth5-chains DEPTH5_CHAINS] [--depth6-chains DEPTH6_CHAINS]
-                     base_wordlist target_wordlist
+usage: rulest-v2.0.py [-h] [-d {1,2,3,4,5,6}] [-o OUTPUT] [--max-chains MAX_CHAINS] [--target-hours TARGET_HOURS] [--list-devices] [--device DEVICE]
+                      [--depth2-chains DEPTH2_CHAINS] [--depth3-chains DEPTH3_CHAINS] [--depth4-chains DEPTH4_CHAINS] [--depth5-chains DEPTH5_CHAINS]
+                      [--depth6-chains DEPTH6_CHAINS]
+                      [base_wordlist] [target_wordlist]
 
 GPU-COMPATIBLE Hashcat Rules Engine with Dynamic Workload Processing
 
@@ -43,6 +44,8 @@ optional arguments:
                         Maximum chains to generate (overrides automatic limits)
   --target-hours TARGET_HOURS
                         Target completion time in hours (default: 0.5)
+  --list-devices        List available OpenCL devices and exit
+  --device DEVICE       Device index or substring (e.g., "0" or "NVIDIA")
   --depth2-chains DEPTH2_CHAINS
                         Override dynamic limit for depth 2 chains
   --depth3-chains DEPTH3_CHAINS
