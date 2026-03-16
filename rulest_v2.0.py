@@ -241,22 +241,33 @@ def get_best_gpu_device():
         raise RuntimeError("No GPU device found")
     return best_device
 
+def estimate_free_vram(device):
+    """Conservative estimate of free VRAM in bytes"""
+    try:
+        total = device.get_info(cl.device_info.GLOBAL_MEM_SIZE)
+        # Assume driver and overhead use about 45% on average
+        return int(total * 0.55)
+    except:
+        return 1 * 1024**3  # fallback to 1GB
+
 # ====================================================================
 # --- DYNAMIC CONSTANTS CALCULATION ---
 # ====================================================================
 
 def calculate_dynamic_parameters(base_count, target_count, device=None, target_hours=0.5):
-    """Calculate dynamic parameters based on input data size and GPU capabilities"""
+    """Calculate dynamic parameters based on input data size, GPU capabilities and available VRAM"""
 
-    # Get GPU work group info if available
+    # Get GPU work group info and VRAM if available
     if device:
         try:
             max_work_group_size = device.get_info(cl.device_info.MAX_WORK_GROUP_SIZE)
             max_compute_units = device.get_info(cl.device_info.MAX_COMPUTE_UNITS)
             global_mem = device.get_info(cl.device_info.GLOBAL_MEM_SIZE)
-            is_nvidia = 'NVIDIA' in device.get_info(cl.device_info.NAME)
+            free_vram = estimate_free_vram(device)
+            vram_gb = free_vram / (1024**3)
+            is_nvidia = 'NVIDIA' in device.get_info(cl.device_info.NAME).upper()
 
-            # Dynamic work group size - 512 for Ampere architecture
+            # Dynamic work group size
             possible_sizes = [32, 64, 128, 256, 512, 1024]
             LOCAL_WORK_SIZE = max([s for s in possible_sizes if s <= max_work_group_size])
 
@@ -264,50 +275,75 @@ def calculate_dynamic_parameters(base_count, target_count, device=None, target_h
                 LOCAL_WORK_SIZE = min(512, LOCAL_WORK_SIZE)
 
             OPTIMAL_GLOBAL_MULTIPLIER = max_compute_units * 16
-            EST_COMBOS_PER_SEC = 120000000  # 120 million combos/sec (RTX 3060 Ti estimate)
+            EST_COMBOS_PER_SEC = 120000000  # baseline (RTX 3060 Ti)
+            # Scale speed estimate based on compute units (rough)
+            if max_compute_units < 20:  # low-end GPU
+                EST_COMBOS_PER_SEC = 40000000
 
             print(f"{blue('[GPU]')} {bold('Work Group Limits:')}")
             print(f"  {cyan('[*]')} Max work group size: {max_work_group_size}")
             print(f"  {cyan('[*]')} Compute units: {max_compute_units}")
             print(f"  {cyan('[*]')} Global memory: {global_mem // (1024**3)}GB")
+            print(f"  {cyan('[*]')} Estimated free VRAM: {vram_gb:.1f}GB")
             print(f"  {cyan('[*]')} Using work group size: {LOCAL_WORK_SIZE}")
 
         except:
-            LOCAL_WORK_SIZE = 512
+            # fallback if device info fails
+            LOCAL_WORK_SIZE = 256
             OPTIMAL_GLOBAL_MULTIPLIER = 38 * 16
             EST_COMBOS_PER_SEC = 80000000
             max_compute_units = 38
+            free_vram = 2 * 1024**3  # assume 2GB
+            vram_gb = 2.0
     else:
-        LOCAL_WORK_SIZE = 512
+        LOCAL_WORK_SIZE = 256
         OPTIMAL_GLOBAL_MULTIPLIER = 608
         EST_COMBOS_PER_SEC = 80000000
         max_compute_units = 38
+        free_vram = 2 * 1024**3
+        vram_gb = 2.0
+
+    # VRAM scaling factor (baseline 8GB)
+    vram_scale = min(1.0, vram_gb / 8.0)
+    # Ensure minimum scale for very low VRAM
+    vram_scale = max(0.25, vram_scale)
 
     target_seconds = target_hours * 3600
     max_combinations_time_limit = int(EST_COMBOS_PER_SEC * target_seconds * 0.8)
 
-    # Bloom filter size - 64MB max for 8GB GPUs
+    # Bloom filter size - 64MB max, scale down slightly for low VRAM but keep at least 16MB
     BASE_BLOOM_SIZE = 1024 * 1024 * 64
     bloom_scale = max(1.0, math.log10(base_count + target_count) / 2.0)
     BLOOM_FILTER_SIZE_BYTES = int(BASE_BLOOM_SIZE * min(bloom_scale, 2.0))
     MAX_BLOOM_BYTES = 64 * 1024 * 1024
+    # For low VRAM, cap bloom filter to 32MB if needed
+    if vram_gb < 4:
+        MAX_BLOOM_BYTES = 32 * 1024 * 1024
     BLOOM_FILTER_SIZE_BYTES = min(BLOOM_FILTER_SIZE_BYTES, MAX_BLOOM_BYTES)
     BLOOM_FILTER_SIZE = BLOOM_FILTER_SIZE_BYTES * 8
 
-    # Batch sizes
-    WORDS_PER_BATCH = 5000
-    CHAINS_PER_BATCH = 2000
-    WORD_SUB_BATCH = 20000
-    MAX_SAFE_RESULTS_PER_BATCH = 25000
+    # Batch sizes scaled by VRAM
+    BASE_WORDS_PER_BATCH = 5000
+    BASE_CHAINS_PER_BATCH = 2000
+    BASE_WORD_SUB_BATCH = 20000
+    BASE_MAX_SAFE_RESULTS = 25000
+
+    WORDS_PER_BATCH = max(1000, int(BASE_WORDS_PER_BATCH * vram_scale))
+    CHAINS_PER_BATCH = max(500, int(BASE_CHAINS_PER_BATCH * vram_scale))
+    WORD_SUB_BATCH = max(5000, int(BASE_WORD_SUB_BATCH * vram_scale))
+    MAX_SAFE_RESULTS_PER_BATCH = max(5000, int(BASE_MAX_SAFE_RESULTS * vram_scale))
+
     MAX_CHAINS_TO_FIND = min(1_000_000, max_combinations_time_limit // 1000)
-    CHAIN_GEN_LIMIT_2 = 150000   # will be dynamically adjusted later
-    CHAIN_GEN_LIMIT_3 = 75000    # will be dynamically adjusted later
-    MAX_CHAIN_DEPTH = 3
+    # Optionally reduce global cap for low VRAM
+    if vram_gb < 4:
+        MAX_CHAINS_TO_FIND = min(MAX_CHAINS_TO_FIND, 500000)
 
     print(f"\n{blue('[TIME]')} {bold(f'Target completion: {target_hours} hours')}")
     print(f"{blue('[PERF]')} {bold('Estimated processing speed:')} {cyan(f'{EST_COMBOS_PER_SEC:,}')} combos/sec")
     print(f"{blue('[PERF]')} {bold('Max combinations in time:')} {cyan(f'{max_combinations_time_limit:,}')}")
     print(f"{blue('[VRAM]')} {bold('Bloom filter size:')} {cyan(f'{BLOOM_FILTER_SIZE_BYTES / 1024 / 1024:.1f}MB')}")
+    print(f"{blue('[VRAM]')} {bold('Batch sizes (words/chain/word_sub):')} {cyan(f'{WORDS_PER_BATCH}/{CHAINS_PER_BATCH}/{WORD_SUB_BATCH}')}")
+    print(f"{blue('[VRAM]')} {bold('Max output per batch:')} {cyan(f'{MAX_SAFE_RESULTS_PER_BATCH:,}')}")
     print(f"{blue('[LIMIT]')} {bold('Global chain limit:')} {cyan(f'{MAX_CHAINS_TO_FIND:,}')}")
 
     return {
@@ -317,14 +353,13 @@ def calculate_dynamic_parameters(base_count, target_count, device=None, target_h
         'WORD_SUB_BATCH': WORD_SUB_BATCH,
         'MAX_SAFE_RESULTS_PER_BATCH': MAX_SAFE_RESULTS_PER_BATCH,
         'MAX_CHAINS_TO_FIND': MAX_CHAINS_TO_FIND,
-        'MAX_CHAIN_DEPTH': MAX_CHAIN_DEPTH,
         'LOCAL_WORK_SIZE': LOCAL_WORK_SIZE,
         'OPTIMAL_GLOBAL_MULTIPLIER': OPTIMAL_GLOBAL_MULTIPLIER,
-        'CHAIN_GEN_LIMIT_2': CHAIN_GEN_LIMIT_2,
-        'CHAIN_GEN_LIMIT_3': CHAIN_GEN_LIMIT_3,
         'EST_COMBOS_PER_SEC': EST_COMBOS_PER_SEC,
         'TARGET_SECONDS': target_seconds,
-        'bloom_scale': bloom_scale
+        'bloom_scale': bloom_scale,
+        'vram_scale': vram_scale,
+        'free_vram': free_vram
     }
 
 # ====================================================================
@@ -453,6 +488,10 @@ class GPUEngine:
         self.rule_index = {}  # Rule name -> index lookup
         self.gpu_rules = []   # List of rules in order
 
+        # Kernel objects (to avoid repeated retrieval)
+        self.kernel_single = None
+        self.kernel_chain = None
+
     def get_free_vram(self):
         """Estimate free VRAM using OpenCL"""
         try:
@@ -481,12 +520,13 @@ class GPUEngine:
             global_mem = self.device.global_mem_size
             self.max_work_group_size = self.device.get_info(cl.device_info.MAX_WORK_GROUP_SIZE)
             max_compute_units = self.device.get_info(cl.device_info.MAX_COMPUTE_UNITS)
+            free_vram = self.get_free_vram()
 
             print(f"{green('[GPU]')} {bold('GPU:')} {cyan(self.device.name.strip())}")
             print(f"{blue('[INFO]')} {bold('Global Memory:')} {cyan(f'{global_mem // (1024**3)}GB')}")
             print(f"{blue('[INFO]')} {bold('Max Work Group Size:')} {cyan(self.max_work_group_size)}")
             print(f"{blue('[INFO]')} {bold('Compute Units:')} {cyan(max_compute_units)}")
-            print(f"{blue('[INFO]')} {bold('Free VRAM estimate:')} {cyan(f'{self.get_free_vram() / 1024**3:.1f}GB')}")
+            print(f"{blue('[INFO]')} {bold('Free VRAM estimate:')} {cyan(f'{free_vram / 1024**3:.1f}GB')}")
 
             self.local_work_size = min(self.local_work_size, self.max_work_group_size)
             while self.max_work_group_size % self.local_work_size != 0 and self.local_work_size > 32:
@@ -517,6 +557,9 @@ class GPUEngine:
             )
 
             self.program = cl.Program(self.context, kernel_source).build()
+            # Retrieve kernel objects once and store them
+            self.kernel_single = self.program.find_single_rules_gpu
+            self.kernel_chain = self.program.find_rule_chains_gpu
             print(f"{green('[OK]')} {bold('Kernel compiled successfully')}")
             return self.program
         except Exception as e:
@@ -685,7 +728,7 @@ class GPUEngine:
             zero_count = np.array([0], dtype=np.int32)
             cl.enqueue_copy(self.queue, found_count_buf, zero_count)
 
-            kernel = self.program.find_single_rules_gpu
+            kernel = self.kernel_single  # Use stored kernel
             total_combinations = batch_data['num_words'] * batch_data['num_rules']
             global_size = ((total_combinations + self.local_work_size - 1) //
                           self.local_work_size) * self.local_work_size
@@ -735,7 +778,13 @@ class GPUEngine:
                     pass
 
     def generate_informed_chains(self, rules, single_rules_found, max_depth):
-        """Generate chains biased toward Phase 1 successes"""
+        """
+        Generate chains biased toward Phase 1 successes.
+        For depths 2 and 3, first generate a seed set of common patterns
+        (e.g., all combinations of prepend/append with digits) to ensure
+        that simple chains like '$1 $2' are covered.
+        Then fill remaining budget with random chains.
+        """
         print(f"  {cyan('->')} Generating informed chains up to depth {max_depth}...")
 
         valid_rules = [r for r in rules if HashcatRuleValidator.validate_rule_for_gpu(r)]
@@ -752,18 +801,29 @@ class GPUEngine:
         print(f"  {cyan('[*]')} Cold rules: {len(cold_rules)}")
 
         chains = set()
+        # Include single rules as chains of depth 1
         for rule in valid_rules:
             chains.add(rule)
+
+        # Define common rule patterns for seeding (prepend/append with digits)
+        common_ops = []
+        for d in '0123456789':
+            common_ops.append(f'^{d}')
+            common_ops.append(f'${d}')
+        # Also add a few other frequent rules like 'l', 'u', etc. if desired
+        # But to keep seed manageable, we'll focus on ^ and $ with digits.
+        # For depth 2, seed all combos of common_ops with common_ops
+        # For depth 3, seed all combos of common_ops repeated 3 times.
 
         for depth in range(2, max_depth + 1):
             print(f"  {cyan('->')} Depth {depth} chains...")
 
-            if depth == 2:
-                target_combinations = self.params.get('CHAIN_GEN_LIMIT_2', 150000)
-            elif depth == 3:
-                target_combinations = self.params.get('CHAIN_GEN_LIMIT_3', 75000)
-            else:
-                target_combinations = 25000
+            # Retrieve budget for this depth from params
+            budget_key = f'CHAIN_GEN_LIMIT_{depth}'
+            target_combinations = self.params.get(budget_key, 0)
+            if target_combinations <= 0:
+                print(f"  {yellow('[*]')} Budget for depth {depth} is 0, skipping.")
+                continue
 
             max_combinations = len(valid_rules) ** depth
             target_combinations = min(target_combinations, max_combinations)
@@ -772,45 +832,70 @@ class GPUEngine:
 
             chains_added = 0
             attempts = 0
-            max_attempts = target_combinations * 2
+            max_attempts = target_combinations * 3  # increased for seeding overhead
             generated_patterns = set()
 
-            hot_budget = int(target_combinations * 0.6) if hot_rules else 0
-            cold_budget = target_combinations - hot_budget
+            # --- Seed generation for depth 2 and 3 (common patterns) ---
+            seed_chains = []
+            if depth == 2:
+                # All combinations of two common operations (^d and $d)
+                seed_chains = [f"{a} {b}" for a in common_ops for b in common_ops]
+            elif depth == 3:
+                # All combinations of three common operations
+                seed_chains = [f"{a} {b} {c}" for a in common_ops for b in common_ops for c in common_ops]
+            # For higher depths, we could also generate seeds but it might be too many; we'll rely on random.
 
-            # Hot chains (at least one hot rule)
-            if hot_rules and hot_budget > 0:
-                for _ in range(hot_budget):
+            # Add seeds to chains (up to a limit to avoid blowing budget)
+            max_seeds = min(len(seed_chains), target_combinations // 2)  # use at most half the budget for seeds
+            if max_seeds > 0:
+                random.shuffle(seed_chains)
+                for sc in seed_chains[:max_seeds]:
+                    if sc not in generated_patterns:
+                        chains.add(sc)
+                        generated_patterns.add(sc)
+                        chains_added += 1
+                print(f"  {cyan('[*]')} Added {max_seeds} seed chains for depth {depth}")
+
+            # --- Random generation for remaining budget ---
+            remaining = target_combinations - chains_added
+            if remaining > 0:
+                # Decide split between hot-biased and fully random
+                hot_budget = int(remaining * 0.6) if hot_rules else 0
+                cold_budget = remaining - hot_budget
+
+                # Hot chains (at least one hot rule)
+                if hot_rules and hot_budget > 0:
+                    for _ in range(hot_budget):
+                        attempts += 1
+                        if attempts > max_attempts:
+                            break
+                        hot_pos = random.randint(0, depth - 1)
+                        parts = []
+                        for i in range(depth):
+                            if i == hot_pos and hot_rules:
+                                parts.append(random.choice(hot_rules))
+                            else:
+                                parts.append(random.choice(valid_rules))
+                        pattern_key = ' '.join(parts)
+                        if pattern_key not in generated_patterns:
+                            chains.add(pattern_key)
+                            generated_patterns.add(pattern_key)
+                            chains_added += 1
+
+                # Cold chains (fully random)
+                for _ in range(cold_budget):
                     attempts += 1
                     if attempts > max_attempts:
                         break
-                    hot_pos = random.randint(0, depth - 1)
-                    parts = []
-                    for i in range(depth):
-                        if i == hot_pos and hot_rules:
-                            parts.append(random.choice(hot_rules))
-                        else:
-                            parts.append(random.choice(valid_rules))
+                    parts = [random.choice(valid_rules) for _ in range(depth)]
                     pattern_key = ' '.join(parts)
                     if pattern_key not in generated_patterns:
                         chains.add(pattern_key)
                         generated_patterns.add(pattern_key)
                         chains_added += 1
 
-            # Cold chains (fully random)
-            for _ in range(cold_budget):
-                attempts += 1
-                if attempts > max_attempts:
-                    break
-                parts = [random.choice(valid_rules) for _ in range(depth)]
-                pattern_key = ' '.join(parts)
-                if pattern_key not in generated_patterns:
-                    chains.add(pattern_key)
-                    generated_patterns.add(pattern_key)
-                    chains_added += 1
-
         chains_list = list(chains)
-        print(f"  {cyan('[*]')} Generated {len(chains_list):,} chains")
+        print(f"  {cyan('[*]')} Generated {len(chains_list):,} chains total")
         return chains_list
 
     def process_all_words_chain_rules(self, base_words, rules, max_depth, bloom_filter, single_rules_found):
@@ -826,7 +911,7 @@ class GPUEngine:
             self.rule_index = {r: i for i, r in enumerate(self.gpu_rules)}
 
         print(f"{blue('[SETUP]')} {bold('Generating rule chains...')}")
-        chains = self.generate_informed_chains(rules, single_rules_found, min(max_depth, 3))
+        chains = self.generate_informed_chains(rules, single_rules_found, max_depth)
 
         if not chains:
             return []
@@ -930,7 +1015,7 @@ class GPUEngine:
             zero_count = np.array([0], dtype=np.int32)
             cl.enqueue_copy(self.queue, found_count_buf, zero_count)
 
-            kernel = self.program.find_rule_chains_gpu
+            kernel = self.kernel_chain  # Use stored kernel
             total_items = len(words) * len(chains)
             global_size = ((total_items + self.local_work_size - 1) //
                           self.local_work_size) * self.local_work_size
@@ -988,22 +1073,25 @@ class GPUEngine:
 class GPUExtractor:
     """GPU-optimized extractor with complete processing"""
 
-    def __init__(self, base_count, target_count, device=None, target_hours=0.5):
+    def __init__(self, base_count, target_count, max_depth, device=None, target_hours=0.5):
         self.base_count = base_count
         self.target_count = target_count
+        self.max_depth = max_depth
         self.params = calculate_dynamic_parameters(base_count, target_count, device, target_hours)
+        self.params['MAX_CHAIN_DEPTH'] = max_depth  # Add user-specified max depth
 
         print(f"{blue('[CONFIG]')} {bold('GPU-Optimized Configuration:')}")
         for k, v in self.params.items():
-            if isinstance(v, (int, float)) and k not in ('bloom_scale'):
+            if isinstance(v, (int, float)) and k not in ('bloom_scale', 'vram_scale', 'free_vram'):
                 print(f"  {cyan('[*]')} {k}: {v:,}" if isinstance(v, int) else f"  {cyan('[*]')} {k}: {v}")
 
         self.rules_generator = GPUCompatibleRulesGenerator()
         self.gpu_engine = GPUEngine(self.params)
         self.validator = HashcatRuleValidator()
 
-    def extract_rules(self, base_words, target_words, max_depth=3,
-                      depth2_override=None, depth3_override=None):
+    def extract_rules(self, base_words, target_words,
+                      depth2_override=None, depth3_override=None,
+                      depth4_override=None, depth5_override=None, depth6_override=None):
         """Extract GPU-compatible rules using complete processing"""
         print(f"{blue('[MAIN]')} {bold('Starting GPU-optimized rule extraction...')}")
 
@@ -1030,7 +1118,7 @@ class GPUExtractor:
         print(f"{green('[OK]')} {bold('Single rules found:')} {cyan(len(single_chains))}")
 
         # Dynamic chain budget calculation based on actual Phase 1 time
-        if max_depth > 1:
+        if self.max_depth > 1:
             print(f"\n{blue('=' * 60)}")
             print(f"{bold('PHASE 2: RULE CHAIN SEARCH (ALL WORDS)')}")
             print(f"{blue('=' * 60)}")
@@ -1039,44 +1127,54 @@ class GPUExtractor:
             total_work_budget = remaining_time * self.params['EST_COMBOS_PER_SEC'] * 0.9  # 90% safety margin
             base_words_len = len(base_words)
 
-            # Default split: 60% depth2, 40% depth3 (weighted by average rule applications per chain)
-            # Average depth factor = 0.6*2 + 0.4*3 = 2.4
-            if total_work_budget > 0 and base_words_len > 0:
-                max_total_chains = total_work_budget / (base_words_len * 2.4)
-                max_total_chains = min(max_total_chains, self.params['MAX_CHAINS_TO_FIND'])
-                depth2_target = int(max_total_chains * 0.6)
-                depth3_target = int(max_total_chains * 0.4)
+            # Distribute work across depths 2..max_depth
+            # Each depth d chain consumes d times the work of a depth-1 chain (approx)
+            # We'll allocate work proportionally so that each depth gets equal total work.
+            depths = list(range(2, self.max_depth + 1))
+            if total_work_budget > 0 and base_words_len > 0 and depths:
+                # Total work = sum_{d in depths} (num_words * budget_d * d)
+                # We want equal work per depth: for each d, num_words * budget_d * d = W (constant)
+                # Then sum over d of W = total_work  =>  W = total_work / len(depths)
+                # So budget_d = W / (num_words * d)
+                W = total_work_budget / len(depths)
+                depth_budgets = {}
+                for d in depths:
+                    raw_budget = int(W / (base_words_len * d))
+                    # Apply global cap and ensure at least 0
+                    depth_budgets[d] = min(raw_budget, self.params['MAX_CHAINS_TO_FIND'])
             else:
-                depth2_target = depth3_target = 0
+                depth_budgets = {d: 0 for d in depths}
 
-            # Apply overrides if provided
-            if depth2_override is not None:
-                depth2_target = depth2_override
-                print(f"{blue('[OVERRIDE]')} {bold('Depth 2 chains set to:')} {cyan(depth2_override)}")
-            if depth3_override is not None:
-                depth3_target = depth3_override
-                print(f"{blue('[OVERRIDE]')} {bold('Depth 3 chains set to:')} {cyan(depth3_override)}")
+            # Apply overrides if provided (overrides dictionary)
+            overrides = {
+                2: depth2_override,
+                3: depth3_override,
+                4: depth4_override,
+                5: depth5_override,
+                6: depth6_override
+            }
+            for d, val in overrides.items():
+                if val is not None and d in depth_budgets:
+                    depth_budgets[d] = val
+                    print(f"{blue('[OVERRIDE]')} {bold(f'Depth {d} chains set to:')} {cyan(val)}")
 
-            # Ensure at least some minimal generation (1000) if time permits
-            depth2_target = max(depth2_target, 0)
-            depth3_target = max(depth3_target, 0)
-            # Cap by global max
-            total_target = depth2_target + depth3_target
-            if total_target > self.params['MAX_CHAINS_TO_FIND']:
-                scale = self.params['MAX_CHAINS_TO_FIND'] / total_target
-                depth2_target = int(depth2_target * scale)
-                depth3_target = int(depth3_target * scale)
+            # Ensure budgets are within global max and at least 0
+            total_budget = sum(depth_budgets.values())
+            if total_budget > self.params['MAX_CHAINS_TO_FIND']:
+                scale = self.params['MAX_CHAINS_TO_FIND'] / total_budget
+                for d in depth_budgets:
+                    depth_budgets[d] = int(depth_budgets[d] * scale)
 
-            self.params['CHAIN_GEN_LIMIT_2'] = depth2_target
-            self.params['CHAIN_GEN_LIMIT_3'] = depth3_target
+            # Store budgets in params for chain generation
+            for d, budget in depth_budgets.items():
+                self.params[f'CHAIN_GEN_LIMIT_{d}'] = budget
 
             print(f"{blue('[DYNAMIC]')} {bold('Phase 1 time:')} {phase1_time:.2f}s, {bold('Remaining:')} {remaining_time:.2f}s")
-            # Fixed formatting: apply comma formatting inside cyan()
-            print(f"{blue('[DYNAMIC]')} {bold('Depth 2 chain limit:')} {cyan(f'{depth2_target:,}')}")
-            print(f"{blue('[DYNAMIC]')} {bold('Depth 3 chain limit:')} {cyan(f'{depth3_target:,}')}")
+            for d in depths:
+                print(f"{blue('[DYNAMIC]')} {bold(f'Depth {d} chain limit:')} {cyan(f'{depth_budgets[d]:,}')}")
 
             chain_chains = self.gpu_engine.process_all_words_chain_rules(
-                base_words, rules, max_depth, bloom_filter, single_chains
+                base_words, rules, self.max_depth, bloom_filter, single_chains
             )
             all_chains.extend(chain_chains)
             print(f"{green('[OK]')} {bold('Rule chains found:')} {cyan(len(chain_chains))}")
@@ -1788,20 +1886,26 @@ if __name__ == '__main__':
 
     parser.add_argument('base_wordlist', help='Base wordlist path')
     parser.add_argument('target_wordlist', help='Target wordlist path')
-    parser.add_argument('-d', '--depth', type=int, default=3,
-                       choices=[1, 2, 3],
-                       help='Max chain depth (1-3 only for speed, default: 3)')
+    parser.add_argument('-d', '--max-depth', type=int, default=3,
+                       choices=[1,2,3,4,5,6],
+                       help='Max chain depth (1-6, default: 3)')
     parser.add_argument('-o', '--output', type=str, default='found_chains.txt',
                        help='Output file (default: found_chains.txt)')
     parser.add_argument('--max-chains', type=int, default=None,
                        help='Maximum chains to generate (overrides automatic limits)')
     parser.add_argument('--target-hours', type=float, default=0.5,
                        help='Target completion time in hours (default: 0.5)')
-    # New flags for depth-specific overrides
+    # Depth-specific overrides (up to depth 6)
     parser.add_argument('--depth2-chains', type=int, default=None,
                        help='Override dynamic limit for depth 2 chains')
     parser.add_argument('--depth3-chains', type=int, default=None,
                        help='Override dynamic limit for depth 3 chains')
+    parser.add_argument('--depth4-chains', type=int, default=None,
+                       help='Override dynamic limit for depth 4 chains')
+    parser.add_argument('--depth5-chains', type=int, default=None,
+                       help='Override dynamic limit for depth 5 chains')
+    parser.add_argument('--depth6-chains', type=int, default=None,
+                       help='Override dynamic limit for depth 6 chains')
 
     args = parser.parse_args()
 
@@ -1828,7 +1932,7 @@ if __name__ == '__main__':
         print(f"{yellow('[WARN]')} Could not detect GPU: {e}")
         device = None
 
-    extractor = GPUExtractor(len(base_words), len(target_words), device, args.target_hours)
+    extractor = GPUExtractor(len(base_words), len(target_words), args.max_depth, device, args.target_hours)
 
     if args.max_chains:
         extractor.params['MAX_CHAINS_TO_FIND'] = args.max_chains
@@ -1838,9 +1942,12 @@ if __name__ == '__main__':
     print(f"{bold('STARTING GPU-COMPATIBLE RULE EXTRACTION')}")
     print(f"{blue('=' * 60)}")
 
-    chains = extractor.extract_rules(base_words, target_words, args.depth,
+    chains = extractor.extract_rules(base_words, target_words,
                                      depth2_override=args.depth2_chains,
-                                     depth3_override=args.depth3_chains)
+                                     depth3_override=args.depth3_chains,
+                                     depth4_override=args.depth4_chains,
+                                     depth5_override=args.depth5_chains,
+                                     depth6_override=args.depth6_chains)
 
     end_time = time.time()
     elapsed_hours = (end_time - start_time) / 3600
@@ -1858,7 +1965,7 @@ if __name__ == '__main__':
     print(f"{bold(green('=' * 80))}")
     print(f"{blue('[INFO]')} {bold('Base words:')} {cyan(f'{len(base_words):,}')}")
     print(f"{blue('[INFO]')} {bold('Target words:')} {cyan(f'{len(target_words):,}')}")
-    print(f"{blue('[INFO]')} {bold('Max depth:')} {cyan(f'{args.depth}')}")
+    print(f"{blue('[INFO]')} {bold('Max depth:')} {cyan(f'{args.max_depth}')}")
     print(f"{blue('[INFO]')} {bold('Total time:')} {cyan(f'{elapsed_hours:.2f} hours ({end_time - start_time:.2f}s)')}")
     print(f"{blue('[INFO]')} {bold('Target time:')} {cyan(f'{args.target_hours} hours')}")
     print(f"{green('[RESULT]')} {bold('GPU-compatible chains found:')} {cyan(f'{len(final_chains):,}')}")
