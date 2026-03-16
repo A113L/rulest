@@ -397,10 +397,8 @@ def calculate_dynamic_parameters(base_count, target_count, device=None, target_h
     WORD_SUB_BATCH = max(5000, int(BASE_WORD_SUB_BATCH * vram_scale))
     MAX_SAFE_RESULTS_PER_BATCH = max(5000, int(BASE_MAX_SAFE_RESULTS * vram_scale))
 
-    MAX_CHAINS_TO_FIND = min(1_000_000, max_combinations_time_limit // 1000)
-    # Optionally reduce global cap for low VRAM
-    if vram_gb < 4:
-        MAX_CHAINS_TO_FIND = min(MAX_CHAINS_TO_FIND, 500000)
+    # Global cap removed - effectively unlimited
+    MAX_CHAINS_TO_FIND = 2**31 - 1  # huge number, essentially no limit
 
     print(f"\n{blue('[TIME]')} {bold(f'Target completion: {target_hours} hours')}")
     print(f"{blue('[PERF]')} {bold('Estimated processing speed:')} {cyan(f'{EST_COMBOS_PER_SEC:,}')} combos/sec")
@@ -408,7 +406,7 @@ def calculate_dynamic_parameters(base_count, target_count, device=None, target_h
     print(f"{blue('[VRAM]')} {bold('Bloom filter size:')} {cyan(f'{BLOOM_FILTER_SIZE_BYTES / 1024 / 1024:.1f}MB')}")
     print(f"{blue('[VRAM]')} {bold('Batch sizes (words/chain/word_sub):')} {cyan(f'{WORDS_PER_BATCH}/{CHAINS_PER_BATCH}/{WORD_SUB_BATCH}')}")
     print(f"{blue('[VRAM]')} {bold('Max output per batch:')} {cyan(f'{MAX_SAFE_RESULTS_PER_BATCH:,}')}")
-    print(f"{blue('[LIMIT]')} {bold('Global chain limit:')} {cyan(f'{MAX_CHAINS_TO_FIND:,}')}")
+    print(f"{blue('[LIMIT]')} {bold('Global cap:')} {cyan('unlimited')}")
 
     return {
         'BLOOM_FILTER_SIZE': BLOOM_FILTER_SIZE,
@@ -721,21 +719,17 @@ class GPUEngine:
         print(f"{blue('[INFO]')} {bold('GPU-compatible rules:')} {len(self.gpu_rules):,}")
 
         found_rules_set = set()
-        max_to_find = self.params['MAX_CHAINS_TO_FIND']
+        # Global cap removed – no early stop
 
         batch_size = self.params['WORDS_PER_BATCH']
         num_batches = (len(base_words) + batch_size - 1) // batch_size
 
         print(f"{blue('[INFO]')} {bold('Processing ALL')} {len(base_words):,} {bold('words in')} {num_batches} {bold('batches')}")
         print(f"{blue('[INFO]')} {bold('Batch size:')} {batch_size:,} words")
-        print(f"{blue('[INFO]')} {bold('Global cap:')} {max_to_find:,} chains")
+        print(f"{blue('[INFO]')} {bold('Global cap:')} {cyan('unlimited')}")
 
         with tqdm(total=num_batches, desc="Processing all words", unit="batch") as pbar:
             for batch_idx in range(num_batches):
-                if len(found_rules_set) >= max_to_find:
-                    print(f"\n{yellow('[STOP]')} Reached global cap of {max_to_find} chains. Stopping early.")
-                    break
-
                 start_idx = batch_idx * batch_size
                 end_idx = min((batch_idx + 1) * batch_size, len(base_words))
                 batch_words = base_words[start_idx:end_idx]
@@ -983,7 +977,7 @@ class GPUEngine:
         print(f"{blue('[INFO]')} {bold('Total chains generated:')} {len(chains):,}")
 
         found_chains_set = set()
-        max_to_find = self.params['MAX_CHAINS_TO_FIND']
+        # Global cap removed – no early stop
 
         chain_batch_size = self.params['CHAINS_PER_BATCH']
         word_sub_batch = self.params['WORD_SUB_BATCH']
@@ -993,21 +987,14 @@ class GPUEngine:
         print(f"{blue('[INFO]')} {bold('Processing')} {len(chains):,} {bold('chains in')} {num_chain_batches} {bold('batches')}")
         print(f"{blue('[INFO]')} {bold('Chain batch size:')} {chain_batch_size:,}")
         print(f"{blue('[INFO]')} {bold('Word sub-batch size:')} {word_sub_batch:,}")
-        print(f"{blue('[INFO]')} {bold('Global cap:')} {max_to_find:,} chains")
+        print(f"{blue('[INFO]')} {bold('Global cap:')} {cyan('unlimited')}")
 
         with tqdm(total=num_chain_batches, desc="Chain batches", unit="batch") as chain_pbar:
             for chain_batch_idx in range(0, len(chains), chain_batch_size):
-                if len(found_chains_set) >= max_to_find:
-                    print(f"\n{yellow('[STOP]')} Reached global cap. Stopping early.")
-                    break
-
                 chain_end = min(chain_batch_idx + chain_batch_size, len(chains))
                 chain_batch = chains[chain_batch_idx:chain_end]
 
                 for word_start in range(0, len(base_words), word_sub_batch):
-                    if len(found_chains_set) >= max_to_find:
-                        break
-
                     word_end = min(word_start + word_sub_batch, len(base_words))
                     word_batch = base_words[word_start:word_end]
 
@@ -1210,8 +1197,8 @@ class GPUExtractor:
                 depth_budgets = {}
                 for d in depths:
                     raw_budget = int(W / (base_words_len * d))
-                    # Apply global cap and ensure at least 0
-                    depth_budgets[d] = min(raw_budget, self.params['MAX_CHAINS_TO_FIND'])
+                    # Global cap removed – no upper limit
+                    depth_budgets[d] = raw_budget
             else:
                 depth_budgets = {d: 0 for d in depths}
 
@@ -1228,12 +1215,9 @@ class GPUExtractor:
                     depth_budgets[d] = val
                     print(f"{blue('[OVERRIDE]')} {bold(f'Depth {d} chains set to:')} {cyan(val)}")
 
-            # Ensure budgets are within global max and at least 0
-            total_budget = sum(depth_budgets.values())
-            if total_budget > self.params['MAX_CHAINS_TO_FIND']:
-                scale = self.params['MAX_CHAINS_TO_FIND'] / total_budget
-                for d in depth_budgets:
-                    depth_budgets[d] = int(depth_budgets[d] * scale)
+            # Ensure budgets are non-negative
+            for d in depth_budgets:
+                depth_budgets[d] = max(0, depth_budgets[d])
 
             # Store budgets in params for chain generation
             for d, budget in depth_budgets.items():
@@ -1950,7 +1934,7 @@ def load_wordlist_fast(filename):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
-        description=f"{bold('GPU-COMPATIBLE Hashcat Rules Engine with Dynamic Workload Processing')}",
+        description=f"{bold('GPU-COMPATIBLE Hashcat Rules Engine with Dynamic Workload Processing (no global cap)')}",
         formatter_class=argparse.RawTextHelpFormatter
     )
 
@@ -1962,7 +1946,7 @@ if __name__ == '__main__':
     parser.add_argument('-o', '--output', type=str, default='found_chains.txt',
                        help='Output file (default: found_chains.txt)')
     parser.add_argument('--max-chains', type=int, default=None,
-                       help='Maximum chains to generate (overrides automatic limits)')
+                       help='Maximum chains to generate (default: unlimited)')
     parser.add_argument('--target-hours', type=float, default=0.5,
                        help='Target completion time in hours (default: 0.5)')
     # Device selection
@@ -1995,7 +1979,7 @@ if __name__ == '__main__':
         sys.exit(1)
 
     print(f"\n{bold(green('=' * 80))}")
-    print(f"{bold('GPU-COMPATIBLE HASHCAT RULES ENGINE (DYNAMIC WORKLOAD)')}")
+    print(f"{bold('GPU-COMPATIBLE HASHCAT RULES ENGINE (DYNAMIC WORKLOAD, UNLIMITED GLOBAL CAP)')}")
     print(f"{bold(green('=' * 80))}{Colors.END}\n")
 
     print(f"{blue('[INIT]')} {bold('Loading data...')}")
@@ -2017,6 +2001,8 @@ if __name__ == '__main__':
     if args.max_chains:
         extractor.params['MAX_CHAINS_TO_FIND'] = args.max_chains
         print(f"{blue('[OVERRIDE]')} {bold('Max chains set to:')} {cyan(args.max_chains)}")
+    else:
+        print(f"{blue('[OVERRIDE]')} {bold('Max chains:')} {cyan('unlimited')}")
 
     print(f"\n{blue('=' * 60)}")
     print(f"{bold('STARTING GPU-COMPATIBLE RULE EXTRACTION')}")
