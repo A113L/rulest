@@ -835,13 +835,50 @@ class GPUEngine:
                 except:
                     pass
 
-    def generate_informed_chains(self, rules, single_rules_found, max_depth):
+    def _generate_random_chains(self, depth, count, valid_rules, hot_rules, cold_rules, existing_chains, new_chains_set):
+        """Generate random chains of given depth, up to count, avoiding duplicates."""
+        generated = set()
+        attempts = 0
+        max_attempts = count * 5
+
+        # Decide split between hot-biased and fully random
+        hot_budget = int(count * 0.6) if hot_rules else 0
+        cold_budget = count - hot_budget
+
+        # Hot chains (at least one hot rule)
+        if hot_rules and hot_budget > 0:
+            for _ in range(hot_budget):
+                attempts += 1
+                if attempts > max_attempts:
+                    break
+                hot_pos = random.randint(0, depth - 1)
+                parts = []
+                for i in range(depth):
+                    if i == hot_pos and hot_rules:
+                        parts.append(random.choice(hot_rules))
+                    else:
+                        parts.append(random.choice(valid_rules))
+                pattern_key = ' '.join(parts)
+                if pattern_key not in existing_chains and pattern_key not in generated and pattern_key not in new_chains_set:
+                    generated.add(pattern_key)
+
+        # Cold chains (fully random)
+        for _ in range(cold_budget):
+            attempts += 1
+            if attempts > max_attempts:
+                break
+            parts = [random.choice(valid_rules) for _ in range(depth)]
+            pattern_key = ' '.join(parts)
+            if pattern_key not in existing_chains and pattern_key not in generated and pattern_key not in new_chains_set:
+                generated.add(pattern_key)
+
+        return generated
+
+    def generate_informed_chains(self, rules, single_rules_found, max_depth, seed_chains=None):
         """
-        Generate chains biased toward Phase 1 successes.
-        For depths 2 and 3, first generate a seed set of common patterns
-        (e.g., all combinations of prepend/append with digits) to ensure
-        that simple chains like '$1 $2' are covered.
-        Then fill remaining budget with random chains.
+        Generate chains biased toward Phase 1 successes and optionally using user-supplied seed chains.
+        For depths 2 and 3, built-in seeds (all combinations of prepend/append with digits) are always added.
+        User seeds (if provided) are added and used to extend to deeper depths.
         """
         print(f"  {cyan('->')} Generating informed chains up to depth {max_depth}...")
 
@@ -859,25 +896,50 @@ class GPUEngine:
         print(f"  {cyan('[*]')} Hot rules (from Phase 1): {len(hot_rules)}")
         print(f"  {cyan('[*]')} Cold rules: {len(cold_rules)}")
 
-        chains = set()
-        # Include single rules as chains of depth 1
-        for rule in valid_rules:
-            chains.add(rule)
-
-        # Define common rule patterns for seeding (prepend/append with digits)
+        # --- Prepare seeds ---
+        # Built-in common operations (^d and $d) for seeding
         common_ops = []
         for d in '0123456789':
             common_ops.append(f'^{d}')
             common_ops.append(f'${d}')
-        # Also add a few other frequent rules like 'l', 'u', etc. if desired
-        # But to keep seed manageable, we'll focus on ^ and $ with digits.
-        # For depth 2, seed all combos of common_ops with common_ops
-        # For depth 3, seed all combos of common_ops repeated 3 times.
 
+        # Depth 1: all valid rules are already in the set
+        chains = set(valid_rules)  # depth 1
+
+        # Seed chains by depth
+        seed_by_depth = defaultdict(set)
+
+        # Built-in seeds for depth 2 and 3 (all combos of common_ops)
+        if max_depth >= 2:
+            for a in common_ops:
+                for b in common_ops:
+                    seed_by_depth[2].add(f"{a} {b}")
+        if max_depth >= 3:
+            for a in common_ops:
+                for b in common_ops:
+                    for c in common_ops:
+                        seed_by_depth[3].add(f"{a} {b} {c}")
+
+        # User seeds (if provided)
+        if seed_chains:
+            for sc in seed_chains:
+                # compute depth by counting spaces
+                d = sc.count(' ') + 1
+                if d <= max_depth:
+                    seed_by_depth[d].add(sc)
+                else:
+                    # still add it as a chain even if deeper than max_depth (it will be included)
+                    seed_by_depth[d].add(sc)
+            print(f"  {cyan('[*]')} Loaded {len(seed_chains)} user seed chains")
+
+        # Add all seeds to chains set
+        for dset in seed_by_depth.values():
+            chains.update(dset)
+
+        # --- Generate chains for each depth ---
         for depth in range(2, max_depth + 1):
             print(f"  {cyan('->')} Depth {depth} chains...")
 
-            # Retrieve budget for this depth from params
             budget_key = f'CHAIN_GEN_LIMIT_{depth}'
             target_combinations = self.params.get(budget_key, 0)
             if target_combinations <= 0:
@@ -889,75 +951,47 @@ class GPUEngine:
 
             print(f"  {cyan('[*]')} Generating up to {target_combinations:,} chains...")
 
-            chains_added = 0
-            attempts = 0
-            max_attempts = target_combinations * 3  # increased for seeding overhead
-            generated_patterns = set()
+            new_chains = set()
+            # Add existing seeds of this depth
+            if depth in seed_by_depth:
+                for sc in seed_by_depth[depth]:
+                    if sc not in chains:
+                        new_chains.add(sc)
 
-            # --- Seed generation for depth 2 and 3 (common patterns) ---
-            seed_chains = []
-            if depth == 2:
-                # All combinations of two common operations (^d and $d)
-                seed_chains = [f"{a} {b}" for a in common_ops for b in common_ops]
-            elif depth == 3:
-                # All combinations of three common operations
-                seed_chains = [f"{a} {b} {c}" for a in common_ops for b in common_ops for c in common_ops]
-            # For higher depths, we could also generate seeds but it might be too many; we'll rely on random.
-
-            # Add seeds to chains (up to a limit to avoid blowing budget)
-            max_seeds = min(len(seed_chains), target_combinations // 2)  # use at most half the budget for seeds
-            if max_seeds > 0:
-                random.shuffle(seed_chains)
-                for sc in seed_chains[:max_seeds]:
-                    if sc not in generated_patterns:
-                        chains.add(sc)
-                        generated_patterns.add(sc)
-                        chains_added += 1
-                print(f"  {cyan('[*]')} Added {max_seeds} seed chains for depth {depth}")
-
-            # --- Random generation for remaining budget ---
-            remaining = target_combinations - chains_added
-            if remaining > 0:
-                # Decide split between hot-biased and fully random
-                hot_budget = int(remaining * 0.6) if hot_rules else 0
-                cold_budget = remaining - hot_budget
-
-                # Hot chains (at least one hot rule)
-                if hot_rules and hot_budget > 0:
-                    for _ in range(hot_budget):
-                        attempts += 1
-                        if attempts > max_attempts:
-                            break
-                        hot_pos = random.randint(0, depth - 1)
-                        parts = []
-                        for i in range(depth):
-                            if i == hot_pos and hot_rules:
-                                parts.append(random.choice(hot_rules))
-                            else:
-                                parts.append(random.choice(valid_rules))
-                        pattern_key = ' '.join(parts)
-                        if pattern_key not in generated_patterns:
-                            chains.add(pattern_key)
-                            generated_patterns.add(pattern_key)
-                            chains_added += 1
-
-                # Cold chains (fully random)
-                for _ in range(cold_budget):
+            # Extend seeds of depth depth-1 by appending a rule
+            if depth-1 in seed_by_depth and len(seed_by_depth[depth-1]) > 0:
+                seed_list = list(seed_by_depth[depth-1])
+                # Allocate up to 30% of budget for extensions
+                extension_target = int(target_combinations * 0.3)
+                attempts = 0
+                max_attempts = extension_target * 5
+                while len(new_chains) < extension_target and attempts < max_attempts:
+                    seed = random.choice(seed_list)
+                    rule = random.choice(valid_rules)
+                    new_chain = seed + ' ' + rule
+                    if new_chain not in chains and new_chain not in new_chains:
+                        new_chains.add(new_chain)
                     attempts += 1
-                    if attempts > max_attempts:
-                        break
-                    parts = [random.choice(valid_rules) for _ in range(depth)]
-                    pattern_key = ' '.join(parts)
-                    if pattern_key not in generated_patterns:
-                        chains.add(pattern_key)
-                        generated_patterns.add(pattern_key)
-                        chains_added += 1
+
+            # Fill remaining budget with random chains
+            remaining = target_combinations - len(new_chains)
+            if remaining > 0:
+                random_chains = self._generate_random_chains(
+                    depth, remaining, valid_rules, hot_rules, cold_rules,
+                    chains, new_chains
+                )
+                new_chains.update(random_chains)
+
+            # Add to main set
+            chains.update(new_chains)
+            # Also update seed_by_depth for this depth so that deeper depths can extend from these new chains
+            seed_by_depth[depth].update(new_chains)
 
         chains_list = list(chains)
         print(f"  {cyan('[*]')} Generated {len(chains_list):,} chains total")
         return chains_list
 
-    def process_all_words_chain_rules(self, base_words, rules, max_depth, bloom_filter, single_rules_counter):
+    def process_all_words_chain_rules(self, base_words, rules, max_depth, bloom_filter, single_rules_counter, seed_chains=None):
         """Process ALL base words with rule chains and return a counter {chain: hits}"""
         print(f"{blue('[GPU]')} {bold('Processing ALL words with rule chains...')}")
 
@@ -970,7 +1004,7 @@ class GPUEngine:
             self.rule_index = {r: i for i, r in enumerate(self.gpu_rules)}
 
         print(f"{blue('[SETUP]')} {bold('Generating rule chains...')}")
-        chains = self.generate_informed_chains(rules, single_rules_counter, max_depth)
+        chains = self.generate_informed_chains(rules, single_rules_counter, max_depth, seed_chains)
 
         if not chains:
             return Counter()
@@ -1124,12 +1158,13 @@ class GPUEngine:
 class GPUExtractor:
     """GPU-optimized extractor with complete processing and hit counting"""
 
-    def __init__(self, base_count, target_count, max_depth, device_spec=None, target_hours=0.5, max_chains=None):
+    def __init__(self, base_count, target_count, max_depth, device_spec=None, target_hours=0.5, max_chains=None, seed_rules_file=None):
         self.base_count = base_count
         self.target_count = target_count
         self.max_depth = max_depth
         self.device_spec = device_spec
-        self.max_chains = max_chains  # New: total chain generation limit
+        self.max_chains = max_chains
+        self.seed_rules_file = seed_rules_file
         self.params = calculate_dynamic_parameters(base_count, target_count, None, target_hours)  # device passed later
         self.params['MAX_CHAIN_DEPTH'] = max_depth  # Add user-specified max depth
 
@@ -1142,9 +1177,30 @@ class GPUExtractor:
         self.gpu_engine = GPUEngine(self.params)
         self.validator = HashcatRuleValidator()
 
+    def load_seed_rules(self):
+        """Load seed rules from file, validate GPU compatibility"""
+        if not self.seed_rules_file:
+            return []
+        print(f"{blue('[SEED]')} {bold('Loading seed rules from:')} {self.seed_rules_file}")
+        seeds = []
+        try:
+            with open(self.seed_rules_file, 'r', encoding='latin-1') as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith('#'):
+                        if self.validator.validate_rule_for_gpu(line):
+                            seeds.append(line)
+        except Exception as e:
+            print(f"{yellow('[WARN]')} Could not load seed rules: {e}")
+            return []
+        print(f"{green('[OK]')} {bold('Loaded')} {len(seeds)} {bold('GPU-compatible seed rules')}")
+        return seeds
+
     def extract_rules(self, base_words, target_words,
                       depth2_override=None, depth3_override=None,
-                      depth4_override=None, depth5_override=None, depth6_override=None):
+                      depth4_override=None, depth5_override=None, depth6_override=None,
+                      depth7_override=None, depth8_override=None, depth9_override=None,
+                      depth10_override=None):
         """Extract GPU-compatible rules using complete processing; returns Counter {rule: hits}"""
         print(f"{blue('[MAIN]')} {bold('Starting GPU-optimized rule extraction...')}")
 
@@ -1160,6 +1216,9 @@ class GPUExtractor:
         self.params = calculate_dynamic_parameters(self.base_count, self.target_count, self.gpu_engine.device, self.params['TARGET_SECONDS']/3600)
         self.params['MAX_CHAIN_DEPTH'] = self.max_depth
         self.gpu_engine.params = self.params
+
+        # Load seed rules if provided
+        seed_chains = self.load_seed_rules()
 
         bloom_filter = self.gpu_engine.generate_bloom_filter(target_words)
 
@@ -1186,8 +1245,6 @@ class GPUExtractor:
             base_words_len = len(base_words)
 
             # Distribute work across depths 2..max_depth
-            # Each depth d chain consumes d times the work of a depth-1 chain (approx)
-            # We'll allocate work proportionally so that each depth gets equal total work.
             depths = list(range(2, self.max_depth + 1))
             if total_work_budget > 0 and base_words_len > 0 and depths:
                 # Total work = sum_{d in depths} (num_words * budget_d * d)
@@ -1198,7 +1255,6 @@ class GPUExtractor:
                 depth_budgets = {}
                 for d in depths:
                     raw_budget = int(W / (base_words_len * d))
-                    # Global cap removed – no upper limit
                     depth_budgets[d] = raw_budget
             else:
                 depth_budgets = {d: 0 for d in depths}
@@ -1209,7 +1265,11 @@ class GPUExtractor:
                 3: depth3_override,
                 4: depth4_override,
                 5: depth5_override,
-                6: depth6_override
+                6: depth6_override,
+                7: depth7_override,
+                8: depth8_override,
+                9: depth9_override,
+                10: depth10_override
             }
             for d, val in overrides.items():
                 if val is not None and d in depth_budgets:
@@ -1220,7 +1280,7 @@ class GPUExtractor:
             for d in depth_budgets:
                 depth_budgets[d] = max(0, depth_budgets[d])
 
-            # ----- NEW: Apply --max-chains limit to total generated chains -----
+            # Apply --max-chains limit to total generated chains
             if self.max_chains is not None:
                 total_budget = sum(depth_budgets.values())
                 if total_budget > self.max_chains:
@@ -1228,7 +1288,6 @@ class GPUExtractor:
                     for d in depth_budgets:
                         depth_budgets[d] = int(depth_budgets[d] * scale)
                     print(f"{blue('[OVERRIDE]')} {bold('Scaled chain budgets to fit --max-chains:')} {cyan(self.max_chains)}")
-            # --------------------------------------------------------------------
 
             # Store budgets in params for chain generation
             for d, budget in depth_budgets.items():
@@ -1239,7 +1298,7 @@ class GPUExtractor:
                 print(f"{blue('[DYNAMIC]')} {bold(f'Depth {d} chain limit:')} {cyan(f'{depth_budgets[d]:,}')}")
 
             chain_counts = self.gpu_engine.process_all_words_chain_rules(
-                base_words, rules, self.max_depth, bloom_filter, single_counts
+                base_words, rules, self.max_depth, bloom_filter, single_counts, seed_chains
             )
             all_counts.update(chain_counts)
             print(f"{green('[OK]')} {bold('Rule chains found:')} {cyan(len(chain_counts))}")
@@ -1950,27 +2009,28 @@ def load_wordlist_fast(filename):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
-        description=f"{bold('GPU-COMPATIBLE Hashcat Rules Engine with Hit Counting and Frequency Sorting')}",
+        description=f"{bold('GPU-COMPATIBLE Hashcat Rules Engine with Hit Counting and Seed Support')}",
         formatter_class=argparse.RawTextHelpFormatter
     )
 
     parser.add_argument('base_wordlist', nargs='?', help='Base wordlist path')
     parser.add_argument('target_wordlist', nargs='?', help='Target wordlist path')
     parser.add_argument('-d', '--max-depth', type=int, default=3,
-                       choices=[1,2,3,4,5,6],
-                       help='Max chain depth (1-6, default: 3)')
+                       help='Max chain depth (>=1, default: 3). Now supports any depth.')
     parser.add_argument('-o', '--output', type=str, default='found_chains.txt',
                        help='Output file (default: found_chains.txt)')
     parser.add_argument('--max-chains', type=int, default=None,
                        help='Maximum TOTAL number of chains to generate (default: unlimited)')
     parser.add_argument('--target-hours', type=float, default=0.5,
                        help='Target completion time in hours (default: 0.5)')
+    parser.add_argument('--seed-rules', type=str, default=None,
+                       help='File containing proven rules/chains to use as seeds for deeper generation')
     # Device selection
     parser.add_argument('--list-devices', action='store_true',
                        help='List available OpenCL devices and exit')
     parser.add_argument('--device', type=str, default=None,
                        help='Device index or substring (e.g., "0" or "NVIDIA")')
-    # Depth-specific overrides (up to depth 6)
+    # Depth-specific overrides (up to depth 10, can be extended if needed)
     parser.add_argument('--depth2-chains', type=int, default=None,
                        help='Override dynamic limit for depth 2 chains')
     parser.add_argument('--depth3-chains', type=int, default=None,
@@ -1981,6 +2041,14 @@ if __name__ == '__main__':
                        help='Override dynamic limit for depth 5 chains')
     parser.add_argument('--depth6-chains', type=int, default=None,
                        help='Override dynamic limit for depth 6 chains')
+    parser.add_argument('--depth7-chains', type=int, default=None,
+                       help='Override dynamic limit for depth 7 chains')
+    parser.add_argument('--depth8-chains', type=int, default=None,
+                       help='Override dynamic limit for depth 8 chains')
+    parser.add_argument('--depth9-chains', type=int, default=None,
+                       help='Override dynamic limit for depth 9 chains')
+    parser.add_argument('--depth10-chains', type=int, default=None,
+                       help='Override dynamic limit for depth 10 chains')
 
     args = parser.parse_args()
 
@@ -1994,8 +2062,15 @@ if __name__ == '__main__':
         print(f"\n{red('[ERROR]')} Both base_wordlist and target_wordlist are required when not using --list-devices.")
         sys.exit(1)
 
+    # Sanity check max depth
+    if args.max_depth < 1:
+        print(f"{red('[ERROR]')} max-depth must be at least 1.")
+        sys.exit(1)
+    if args.max_depth > 12:
+        print(f"{yellow('[WARN]')} Very high depth may exhaust memory/time. Proceed with caution.")
+
     print(f"\n{bold(green('=' * 80))}")
-    print(f"{bold('GPU-COMPATIBLE HASHCAT RULES ENGINE WITH HIT COUNTING')}")
+    print(f"{bold('GPU-COMPATIBLE HASHCAT RULES ENGINE WITH HIT COUNTING & SEEDING')}")
     print(f"{bold(green('=' * 80))}{Colors.END}\n")
 
     print(f"{blue('[INIT]')} {bold('Loading data...')}")
@@ -2011,8 +2086,12 @@ if __name__ == '__main__':
 
     start_time = time.time()
 
-    # Pass max_chains to the extractor
-    extractor = GPUExtractor(len(base_words), len(target_words), args.max_depth, args.device, args.target_hours, args.max_chains)
+    extractor = GPUExtractor(
+        len(base_words), len(target_words),
+        args.max_depth, args.device,
+        args.target_hours, args.max_chains,
+        args.seed_rules
+    )
 
     if args.max_chains:
         print(f"{blue('[OVERRIDE]')} {bold('Max chains set to:')} {cyan(args.max_chains)}")
@@ -2023,12 +2102,18 @@ if __name__ == '__main__':
     print(f"{bold('STARTING GPU-COMPATIBLE RULE EXTRACTION')}")
     print(f"{blue('=' * 60)}")
 
-    rule_counts = extractor.extract_rules(base_words, target_words,
-                                          depth2_override=args.depth2_chains,
-                                          depth3_override=args.depth3_chains,
-                                          depth4_override=args.depth4_chains,
-                                          depth5_override=args.depth5_chains,
-                                          depth6_override=args.depth6_chains)
+    rule_counts = extractor.extract_rules(
+        base_words, target_words,
+        depth2_override=args.depth2_chains,
+        depth3_override=args.depth3_chains,
+        depth4_override=args.depth4_chains,
+        depth5_override=args.depth5_chains,
+        depth6_override=args.depth6_chains,
+        depth7_override=args.depth7_chains,
+        depth8_override=args.depth8_chains,
+        depth9_override=args.depth9_chains,
+        depth10_override=args.depth10_chains
+    )
 
     end_time = time.time()
     elapsed_hours = (end_time - start_time) / 3600
@@ -2043,7 +2128,7 @@ if __name__ == '__main__':
     sorted_items = sorted(rule_counts.items(), key=lambda x: (-x[1], x[0]))
 
     with open(args.output, 'w', encoding='latin-1') as f:
-        f.write(f"# Generated by rulest_v2.0.py\n")
+        f.write(f"# Generated by rulest_v2.0.py (seeded)\n")
         f.write(f"# Total unique rules: {len(rule_counts)}\n")
         f.write(f"# Total hits (sum of frequencies): {sum(rule_counts.values())}\n")
         f.write(":\n")  # explicitly write ":" first
