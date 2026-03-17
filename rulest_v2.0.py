@@ -22,7 +22,7 @@ import gc
 os.environ['PYOPENCL_COMPILER_OUTPUT'] = '0'
 
 # -------------------------------------------------------------------
-# Color codes (moved to top)
+# Color codes
 # -------------------------------------------------------------------
 class Colors:
     RED = '\033[91m'
@@ -706,19 +706,19 @@ class GPUEngine:
         }
 
     def process_all_words_single_rule(self, base_words, rules, bloom_filter):
-        """Process ALL base words with single rules"""
+        """Process ALL base words with single rules and return a counter {rule: hits}"""
         print(f"{blue('[GPU]')} {bold('Processing ALL words with single rules...')}")
 
         self.upload_bloom_filter(bloom_filter)
         if not self.compile_kernel():
-            return []
+            return Counter()
 
         self.gpu_rules = HashcatRuleValidator.validate_rules_for_gpu(rules)
         self.rule_index = {r: i for i, r in enumerate(self.gpu_rules)}
 
         print(f"{blue('[INFO]')} {bold('GPU-compatible rules:')} {len(self.gpu_rules):,}")
 
-        found_rules_set = set()
+        rule_counter = Counter()
         # Global cap removed – no early stop
 
         batch_size = self.params['WORDS_PER_BATCH']
@@ -739,23 +739,23 @@ class GPUEngine:
                     continue
 
                 batch_data = self.prepare_batch_data(batch_words, self.gpu_rules)
-                batch_found = self.process_batch_single(batch_data)
+                batch_found = self.process_batch_single(batch_data)  # returns list (may have duplicates)
 
                 if batch_found:
-                    found_rules_set.update(batch_found)
+                    # Update counter with all occurrences (including duplicates)
+                    rule_counter.update(batch_found)
 
-                pbar.set_postfix({'found': len(found_rules_set), 'progress': f"{end_idx:,}/{len(base_words):,}"})
+                pbar.set_postfix({'found': len(rule_counter), 'progress': f"{end_idx:,}/{len(base_words):,}"})
                 pbar.update(1)
 
                 self.queue.finish()
                 gc.collect()
 
-        found_rules = list(found_rules_set)
-        print(f"\n{green('[OK]')} {bold('Total unique single rules found:')} {cyan(len(found_rules))}")
-        return found_rules
+        print(f"\n{green('[OK]')} {bold('Total unique single rules found:')} {cyan(len(rule_counter))}")
+        return rule_counter
 
     def process_batch_single(self, batch_data):
-        """Process a single batch on GPU"""
+        """Process a single batch on GPU; returns list of rules (may contain duplicates)"""
         mf = cl.mem_flags
         try:
             base_buf = cl.Buffer(self.context, mf.READ_ONLY | mf.COPY_HOST_PTR,
@@ -850,7 +850,8 @@ class GPUEngine:
             print(f"  {yellow('[WARN]')} No valid rules found")
             return []
 
-        found_set = set(single_rules_found) if single_rules_found else set()
+        # single_rules_found is a Counter, but we need just the set for hot rules
+        found_set = set(single_rules_found.keys()) if single_rules_found else set()
         hot_rules = [r for r in valid_rules if r in found_set]
         cold_rules = [r for r in valid_rules if r not in found_set]
 
@@ -956,27 +957,27 @@ class GPUEngine:
         print(f"  {cyan('[*]')} Generated {len(chains_list):,} chains total")
         return chains_list
 
-    def process_all_words_chain_rules(self, base_words, rules, max_depth, bloom_filter, single_rules_found):
-        """Process ALL base words with rule chains"""
+    def process_all_words_chain_rules(self, base_words, rules, max_depth, bloom_filter, single_rules_counter):
+        """Process ALL base words with rule chains and return a counter {chain: hits}"""
         print(f"{blue('[GPU]')} {bold('Processing ALL words with rule chains...')}")
 
         if self.bloom_buf is None:
             self.upload_bloom_filter(bloom_filter)
         if not self.program:
             if not self.compile_kernel():
-                return []
+                return Counter()
         if not self.rule_index:
             self.rule_index = {r: i for i, r in enumerate(self.gpu_rules)}
 
         print(f"{blue('[SETUP]')} {bold('Generating rule chains...')}")
-        chains = self.generate_informed_chains(rules, single_rules_found, max_depth)
+        chains = self.generate_informed_chains(rules, single_rules_counter, max_depth)
 
         if not chains:
-            return []
+            return Counter()
 
         print(f"{blue('[INFO]')} {bold('Total chains generated:')} {len(chains):,}")
 
-        found_chains_set = set()
+        chain_counter = Counter()
         # Global cap removed – no early stop
 
         chain_batch_size = self.params['CHAINS_PER_BATCH']
@@ -1001,22 +1002,21 @@ class GPUEngine:
                     if not word_batch:
                         continue
 
-                    batch_chains = self._process_chain_batch(word_batch, chain_batch)
+                    batch_chains = self._process_chain_batch(word_batch, chain_batch)  # returns list (may have duplicates)
                     if batch_chains:
-                        found_chains_set.update(batch_chains)
+                        chain_counter.update(batch_chains)
 
                     self.queue.finish()
 
                 chain_pbar.update(1)
-                chain_pbar.set_postfix({'found': len(found_chains_set), 'progress': f"{chain_end}/{len(chains)}"})
+                chain_pbar.set_postfix({'found': len(chain_counter), 'progress': f"{chain_end}/{len(chains)}"})
                 gc.collect()
 
-        found_chains = list(found_chains_set)
-        print(f"\n{green('[OK]')} {bold('Total unique chains found:')} {cyan(len(found_chains))}")
-        return found_chains
+        print(f"\n{green('[OK]')} {bold('Total unique chains found:')} {cyan(len(chain_counter))}")
+        return chain_counter
 
     def _process_chain_batch(self, words, chains):
-        """Process a single chain batch"""
+        """Process a single chain batch; returns list of chains (may contain duplicates)"""
         chain_sequences = []
         chain_depths = []
 
@@ -1122,7 +1122,7 @@ class GPUEngine:
 # ====================================================================
 
 class GPUExtractor:
-    """GPU-optimized extractor with complete processing"""
+    """GPU-optimized extractor with complete processing and hit counting"""
 
     def __init__(self, base_count, target_count, max_depth, device_spec=None, target_hours=0.5):
         self.base_count = base_count
@@ -1144,16 +1144,16 @@ class GPUExtractor:
     def extract_rules(self, base_words, target_words,
                       depth2_override=None, depth3_override=None,
                       depth4_override=None, depth5_override=None, depth6_override=None):
-        """Extract GPU-compatible rules using complete processing"""
+        """Extract GPU-compatible rules using complete processing; returns Counter {rule: hits}"""
         print(f"{blue('[MAIN]')} {bold('Starting GPU-optimized rule extraction...')}")
 
-        all_chains = []
+        all_counts = Counter()
 
         rules = self.rules_generator.generate_gpu_compatible_rules()
 
         if not self.gpu_engine.initialize_gpu(self.device_spec):
             print(f"{yellow('[WARN]')} {bold('GPU not available')}")
-            return []
+            return all_counts
 
         # Recalculate params with actual device (now that we have device)
         self.params = calculate_dynamic_parameters(self.base_count, self.target_count, self.gpu_engine.device, self.params['TARGET_SECONDS']/3600)
@@ -1167,12 +1167,12 @@ class GPUExtractor:
         print(f"{blue('=' * 60)}")
 
         phase1_start = time.time()
-        single_chains = self.gpu_engine.process_all_words_single_rule(
+        single_counts = self.gpu_engine.process_all_words_single_rule(
             base_words, rules, bloom_filter
         )
         phase1_time = time.time() - phase1_start
-        all_chains.extend(single_chains)
-        print(f"{green('[OK]')} {bold('Single rules found:')} {cyan(len(single_chains))}")
+        all_counts.update(single_counts)
+        print(f"{green('[OK]')} {bold('Single rules found:')} {cyan(len(single_counts))}")
 
         # Dynamic chain budget calculation based on actual Phase 1 time
         if self.max_depth > 1:
@@ -1227,18 +1227,23 @@ class GPUExtractor:
             for d in depths:
                 print(f"{blue('[DYNAMIC]')} {bold(f'Depth {d} chain limit:')} {cyan(f'{depth_budgets[d]:,}')}")
 
-            chain_chains = self.gpu_engine.process_all_words_chain_rules(
-                base_words, rules, self.max_depth, bloom_filter, single_chains
+            chain_counts = self.gpu_engine.process_all_words_chain_rules(
+                base_words, rules, self.max_depth, bloom_filter, single_counts
             )
-            all_chains.extend(chain_chains)
-            print(f"{green('[OK]')} {bold('Rule chains found:')} {cyan(len(chain_chains))}")
+            all_counts.update(chain_counts)
+            print(f"{green('[OK]')} {bold('Rule chains found:')} {cyan(len(chain_counts))}")
 
         print(f"\n{blue('=' * 60)}")
         print(f"{bold('FINAL CLEANUP')}")
         print(f"{blue('=' * 60)}")
 
-        final_chains = self.validator.validate_rules_for_gpu(all_chains)
-        return final_chains
+        # Validate all rules (filter out invalid ones)
+        validated_counts = Counter()
+        for rule, cnt in all_counts.items():
+            if HashcatRuleValidator.validate_rule_for_gpu(rule):
+                validated_counts[rule] = cnt
+
+        return validated_counts
 
 # ====================================================================
 # --- GPU KERNEL TEMPLATE (with placeholders) ---
@@ -1934,7 +1939,7 @@ def load_wordlist_fast(filename):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
-        description=f"{bold('GPU-COMPATIBLE Hashcat Rules Engine with Dynamic Workload Processing (no global cap)')}",
+        description=f"{bold('GPU-COMPATIBLE Hashcat Rules Engine with Hit Counting and Frequency Sorting')}",
         formatter_class=argparse.RawTextHelpFormatter
     )
 
@@ -1979,7 +1984,7 @@ if __name__ == '__main__':
         sys.exit(1)
 
     print(f"\n{bold(green('=' * 80))}")
-    print(f"{bold('GPU-COMPATIBLE HASHCAT RULES ENGINE (DYNAMIC WORKLOAD, UNLIMITED GLOBAL CAP)')}")
+    print(f"{bold('GPU-COMPATIBLE HASHCAT RULES ENGINE WITH HIT COUNTING')}")
     print(f"{bold(green('=' * 80))}{Colors.END}\n")
 
     print(f"{blue('[INIT]')} {bold('Loading data...')}")
@@ -2008,23 +2013,33 @@ if __name__ == '__main__':
     print(f"{bold('STARTING GPU-COMPATIBLE RULE EXTRACTION')}")
     print(f"{blue('=' * 60)}")
 
-    chains = extractor.extract_rules(base_words, target_words,
-                                     depth2_override=args.depth2_chains,
-                                     depth3_override=args.depth3_chains,
-                                     depth4_override=args.depth4_chains,
-                                     depth5_override=args.depth5_chains,
-                                     depth6_override=args.depth6_chains)
+    rule_counts = extractor.extract_rules(base_words, target_words,
+                                          depth2_override=args.depth2_chains,
+                                          depth3_override=args.depth3_chains,
+                                          depth4_override=args.depth4_chains,
+                                          depth5_override=args.depth5_chains,
+                                          depth6_override=args.depth6_chains)
 
     end_time = time.time()
     elapsed_hours = (end_time - start_time) / 3600
 
     print(f"\n{blue('[SAVE]')} {bold('Saving results...')}")
 
-    final_chains = HashcatRuleValidator.validate_rules_for_gpu(chains)
+    # Add the ":" rule if not present (with count 0)
+    if ":" not in rule_counts:
+        rule_counts[":"] = 0
+
+    # Sort rules: first by hit count descending, then alphabetically
+    sorted_items = sorted(rule_counts.items(), key=lambda x: (-x[1], x[0]))
 
     with open(args.output, 'w', encoding='latin-1') as f:
-        for chain in final_chains:
-            f.write(f"{chain}\n")
+        f.write(f"# Generated by rulest_v2.0.py\n")
+        f.write(f"# Total unique rules: {len(rule_counts)}\n")
+        f.write(f"# Total hits (sum of frequencies): {sum(rule_counts.values())}\n")
+        f.write(":\n")  # explicitly write ":" first
+        for rule, count in sorted_items:
+            if rule != ":":
+                f.write(f"{rule}\n")
 
     print(f"\n{bold(green('=' * 80))}")
     print(f"{bold('FINAL RESULTS')}")
@@ -2034,14 +2049,17 @@ if __name__ == '__main__':
     print(f"{blue('[INFO]')} {bold('Max depth:')} {cyan(f'{args.max_depth}')}")
     print(f"{blue('[INFO]')} {bold('Total time:')} {cyan(f'{elapsed_hours:.2f} hours ({end_time - start_time:.2f}s)')}")
     print(f"{blue('[INFO]')} {bold('Target time:')} {cyan(f'{args.target_hours} hours')}")
-    print(f"{green('[RESULT]')} {bold('GPU-compatible chains found:')} {cyan(f'{len(final_chains):,}')}")
+    print(f"{green('[RESULT]')} {bold('GPU-compatible rules found:')} {cyan(f'{len(rule_counts)}')}")
+    print(f"{green('[RESULT]')} {bold('Total hits (all rules combined):')} {cyan(f'{sum(rule_counts.values()):,}')}")
 
-    if final_chains:
-        print(f"{blue('[SAMPLE]')} {bold('Sample chains (max 20):')}")
-        for i, chain in enumerate(final_chains[:20]):
-            depth = len(chain.split())
-            print(f"  {cyan(f'{i+1:2d}.')} [{depth}] {chain}")
+    # Show top 20 most frequent rules
+    if sorted_items:
+        print(f"{blue('[SAMPLE]')} {bold('Top 20 most frequent rules:')}")
+        for i, (rule, count) in enumerate(sorted_items[:20]):
+            depth = len(rule.split())
+            print(f"  {cyan(f'{i+1:2d}.')} [{depth}] {rule} (hits: {count})")
 
     print(f"{blue('[OUTPUT]')} {bold('Output saved to:')} {bold(args.output)}")
-    print(f"{blue('[NOTE]')} {bold('All chains are GPU-compatible and syntactically valid for Hashcat')}")
+    print(f"{blue('[NOTE]')} {bold('All rules are GPU-compatible and syntactically valid for Hashcat')}")
+    print(f"{blue('[NOTE]')} {bold('Rules are sorted by frequency (most hits first)')}")
     print(f"{bold(green('=' * 80))}{Colors.END}")
