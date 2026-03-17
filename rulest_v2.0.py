@@ -1124,11 +1124,12 @@ class GPUEngine:
 class GPUExtractor:
     """GPU-optimized extractor with complete processing and hit counting"""
 
-    def __init__(self, base_count, target_count, max_depth, device_spec=None, target_hours=0.5):
+    def __init__(self, base_count, target_count, max_depth, device_spec=None, target_hours=0.5, max_chains=None):
         self.base_count = base_count
         self.target_count = target_count
         self.max_depth = max_depth
         self.device_spec = device_spec
+        self.max_chains = max_chains  # New: total chain generation limit
         self.params = calculate_dynamic_parameters(base_count, target_count, None, target_hours)  # device passed later
         self.params['MAX_CHAIN_DEPTH'] = max_depth  # Add user-specified max depth
 
@@ -1218,6 +1219,16 @@ class GPUExtractor:
             # Ensure budgets are non-negative
             for d in depth_budgets:
                 depth_budgets[d] = max(0, depth_budgets[d])
+
+            # ----- NEW: Apply --max-chains limit to total generated chains -----
+            if self.max_chains is not None:
+                total_budget = sum(depth_budgets.values())
+                if total_budget > self.max_chains:
+                    scale = self.max_chains / total_budget
+                    for d in depth_budgets:
+                        depth_budgets[d] = int(depth_budgets[d] * scale)
+                    print(f"{blue('[OVERRIDE]')} {bold('Scaled chain budgets to fit --max-chains:')} {cyan(self.max_chains)}")
+            # --------------------------------------------------------------------
 
             # Store budgets in params for chain generation
             for d, budget in depth_budgets.items():
@@ -1951,7 +1962,7 @@ if __name__ == '__main__':
     parser.add_argument('-o', '--output', type=str, default='found_chains.txt',
                        help='Output file (default: found_chains.txt)')
     parser.add_argument('--max-chains', type=int, default=None,
-                       help='Maximum chains to generate (default: unlimited)')
+                       help='Maximum TOTAL number of chains to generate (default: unlimited)')
     parser.add_argument('--target-hours', type=float, default=0.5,
                        help='Target completion time in hours (default: 0.5)')
     # Device selection
@@ -2000,11 +2011,10 @@ if __name__ == '__main__':
 
     start_time = time.time()
 
-    # Device is handled inside GPUExtractor and GPUEngine
-    extractor = GPUExtractor(len(base_words), len(target_words), args.max_depth, args.device, args.target_hours)
+    # Pass max_chains to the extractor
+    extractor = GPUExtractor(len(base_words), len(target_words), args.max_depth, args.device, args.target_hours, args.max_chains)
 
     if args.max_chains:
-        extractor.params['MAX_CHAINS_TO_FIND'] = args.max_chains
         print(f"{blue('[OVERRIDE]')} {bold('Max chains set to:')} {cyan(args.max_chains)}")
     else:
         print(f"{blue('[OVERRIDE]')} {bold('Max chains:')} {cyan('unlimited')}")
@@ -2063,3 +2073,4 @@ if __name__ == '__main__':
     print(f"{blue('[NOTE]')} {bold('All rules are GPU-compatible and syntactically valid for Hashcat')}")
     print(f"{blue('[NOTE]')} {bold('Rules are sorted by frequency (most hits first)')}")
     print(f"{bold(green('=' * 80))}{Colors.END}")
+
