@@ -22,13 +22,13 @@ This Python script leverages the computational power of graphics cards (via Open
 ```pip install numpy pyopencl tqdm```
 
 ```
-python3 rulest-v2.0.py -h
-usage: rulest-v2.0.py [-h] [-d {1,2,3,4,5,6}] [-o OUTPUT] [--max-chains MAX_CHAINS] [--target-hours TARGET_HOURS] [--list-devices] [--device DEVICE]
+python3 rulest_v2.0.py -h
+usage: rulest_v2.0.py [-h] [-d {1,2,3,4,5,6}] [-o OUTPUT] [--max-chains MAX_CHAINS] [--target-hours TARGET_HOURS] [--list-devices] [--device DEVICE]
                       [--depth2-chains DEPTH2_CHAINS] [--depth3-chains DEPTH3_CHAINS] [--depth4-chains DEPTH4_CHAINS] [--depth5-chains DEPTH5_CHAINS]
                       [--depth6-chains DEPTH6_CHAINS]
                       [base_wordlist] [target_wordlist]
 
-GPU-COMPATIBLE Hashcat Rules Engine with Dynamic Workload Processing
+GPU-COMPATIBLE Hashcat Rules Engine with Hit Counting and Frequency Sorting
 
 positional arguments:
   base_wordlist         Base wordlist path
@@ -41,7 +41,7 @@ optional arguments:
   -o OUTPUT, --output OUTPUT
                         Output file (default: found_chains.txt)
   --max-chains MAX_CHAINS
-                        Maximum chains to generate (overrides automatic limits)
+                        Maximum TOTAL number of chains to generate (default: unlimited)
   --target-hours TARGET_HOURS
                         Target completion time in hours (default: 0.5)
   --list-devices        List available OpenCL devices and exit
