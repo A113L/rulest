@@ -132,7 +132,8 @@ class HashcatRuleValidator:
                 continue
 
             # --- Commands with no arguments ---
-            if c in (':', 'l', 'u', 'c', 'C', 't', 'r', 'd', 'f', 'a', 'q', 'k', 'K', 'E'):
+            if c in (':', 'l', 'u', 'c', 'C', 't', 'r', 'd', 'f', 'a', 'q', 'k', 'K', 'E',
+                     '{', '}', '[', ']'):
                 pos += 1
 
             # --- Commands with one decimal digit ---
@@ -177,26 +178,15 @@ class HashcatRuleValidator:
                 if pos >= line_len: return False
                 pos += 1
 
-            # --- @ : purge character (one char) ---
-            elif c == '@':
+            # --- Commands with one character (no digit) ---
+            elif c in ('@', 'e', '$', '^'):
                 pos += 1
                 if pos >= line_len: return False
                 pos += 1
-
-            # --- e : title case with separator (one char) ---
-            elif c == 'e':
-                pos += 1
-                if pos >= line_len: return False
-                pos += 1
-
-            # --- {, }, [, ] : single character only, no arguments ---
-            elif c in ('{', '}', '[', ']'):
-                pos += 1
-                # In Hashcat these never take a digit; do not consume next char
 
             # --- Memory / reject rules (not supported on GPU) ---
             elif c in ('X', '4', '6', 'M', 'v', '3',           # memory rules
-                       '<', '>', '!', '/', '(', ')', '=', '%', 'Q', '?'):  # reject rules
+                       '<', '>', '!', '/', '(', ')', '=', '%', 'Q', '?'):
                 return False
 
             else:
@@ -473,7 +463,6 @@ class GPUCompatibleRulesGenerator:
 
         # ===== CATEGORY 1: SIMPLE RULES =====
         print(f"  {cyan('[*]')} Simple rules...")
-        # Removed 'a' because it causes errors in Hashcat
         simple_rules = [
             'l', 'u', 'c', 'C', 't', 'r', 'd', 'f', 'p', 'z', 'Z', 'q', 'E',
             '{', '}', '[', ']', 'k', 'K', ':'
