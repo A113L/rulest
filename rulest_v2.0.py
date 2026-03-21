@@ -45,12 +45,50 @@ def cyan(text): return f"{Colors.CYAN}{text}{Colors.END}"
 def bold(text): return f"{Colors.BOLD}{text}{Colors.END}"
 
 # -------------------------------------------------------------------
-# Constants (will be overridden by dynamic params)
+# Constants (centralised for easy tuning)
 # -------------------------------------------------------------------
 MAX_WORD_LEN = 256
 MAX_RULE_LEN = 16
 MAX_OUTPUT_LEN = 512
 MAX_CHAIN_STRING_LEN = 128
+
+# VRAM & memory
+VRAM_USAGE_FACTOR = 0.55               # Conservative free memory estimate
+BLOOM_HASH_FUNCTIONS = 4               # Number of hash functions for Bloom filter
+BLOOM_FILTER_MAX_MB = 64               # Max bloom filter size in MB
+BLOOM_FILTER_MIN_MB = 16               # Min bloom filter size for low VRAM
+
+# Performance estimates (baseline: RTX 3060 Ti)
+BASELINE_COMBOS_PER_SEC = 120_000_000
+LOW_END_COMPUTE_UNITS_THRESHOLD = 20
+LOW_END_COMBOS_PER_SEC = 40_000_000
+
+# Work group sizes
+POSSIBLE_WORK_GROUP_SIZES = [32, 64, 128, 256, 512, 1024]
+
+# Batch scaling factors (base values for 8GB VRAM)
+BASE_WORDS_PER_BATCH = 5000
+BASE_CHAINS_PER_BATCH = 2000
+BASE_WORD_SUB_BATCH = 20000
+BASE_MAX_SAFE_RESULTS = 25000
+
+# Chain generation
+HOT_RULE_RATIO = 0.6                   # Fraction of chains that contain a hot rule
+EXTENSION_RATIO = 0.3                  # Fraction of budget used for extending existing seeds
+MAX_ATTEMPTS_MULTIPLIER = 5            # Attempts limit for random generation
+
+# Time & budget
+TIME_SAFETY_FACTOR = 0.9               # Safety margin for work budget
+OPTIMAL_GLOBAL_MULTIPLIER_BASE = 16    # Multiplier for compute units to determine global size
+
+# FNV-1a constants
+FNV1A_PRIME = 16777619
+FNV1A_OFFSET_BASIS = 2166136261
+FNV1A_SEED1 = 0xDEADBEEF
+FNV1A_SEED2 = 0xCAFEBABE
+
+# Hashcat rule limits
+MAX_GPU_RULES = 255                    # Hard limit from Hashcat's GPU implementation
 
 # ====================================================================
 # --- HASHCAT RULE VALIDATION (GPU COMPATIBILITY) ---
@@ -58,6 +96,8 @@ MAX_CHAIN_STRING_LEN = 128
 
 class HashcatRuleValidator:
     """Validates rules according to Hashcat's official GPU compatibility"""
+
+    MAX_GPU_RULES = MAX_GPU_RULES
 
     @staticmethod
     def is_digit(c):
@@ -83,9 +123,6 @@ class HashcatRuleValidator:
         line_len = len(rule_str)
         pos = 0
         cnt = 0
-
-        # Hard limit from Hashcat's GPU implementation
-        MAX_GPU_RULES = 255
 
         while pos < line_len:
             c = rule_str[pos]
@@ -167,7 +204,7 @@ class HashcatRuleValidator:
                 return False
 
             cnt += 1
-            if cnt > MAX_GPU_RULES:
+            if cnt > HashcatRuleValidator.MAX_GPU_RULES:
                 return False
 
         return True
@@ -188,12 +225,12 @@ class HashcatRuleValidator:
 # --- FNV-1a HASH FOR BLOOM FILTER (GPU/CPU COMPATIBLE) ---
 # ====================================================================
 
-def fnv1a_32(data, seed=0xDEADBEEF):
+def fnv1a_32(data, seed=FNV1A_SEED1):
     """FNV-1a 32-bit hash – identical to GPU version"""
-    h = seed ^ 2166136261
+    h = seed ^ FNV1A_OFFSET_BASIS
     for b in data:
         h ^= b
-        h = (h * 16777619) & 0xFFFFFFFF
+        h = (h * FNV1A_PRIME) & 0xFFFFFFFF
     return h
 
 # ====================================================================
@@ -209,13 +246,13 @@ def get_all_devices():
             gpu_devices = plat.get_devices(cl.device_type.GPU)
             for dev in gpu_devices:
                 devices.append((plat, dev))
-        except:
+        except Exception:
             pass
         try:
             cpu_devices = plat.get_devices(cl.device_type.CPU)
             for dev in cpu_devices:
                 devices.append((plat, dev))
-        except:
+        except Exception:
             pass
     return devices
 
@@ -276,7 +313,7 @@ def get_best_gpu_device():
     for plat in platforms:
         try:
             devices = plat.get_devices(cl.device_type.GPU)
-        except:
+        except Exception:
             continue
         for dev in devices:
             name = dev.get_info(cl.device_info.NAME).upper()
@@ -298,7 +335,7 @@ def get_best_gpu_device():
             try:
                 best_device = plat.get_devices(cl.device_type.GPU)[0]
                 break
-            except:
+            except Exception:
                 continue
 
     if best_device is None:
@@ -306,13 +343,13 @@ def get_best_gpu_device():
     return best_device
 
 def estimate_free_vram(device):
-    """Conservative estimate of free VRAM in bytes"""
+    """Conservative estimate of free VRAM in bytes using global constant factor"""
     try:
         total = device.get_info(cl.device_info.GLOBAL_MEM_SIZE)
-        # Assume driver and overhead use about 45% on average
-        return int(total * 0.55)
-    except:
-        return 1 * 1024**3  # fallback to 1GB
+        return int(total * VRAM_USAGE_FACTOR)
+    except Exception as e:
+        # Fallback to 1GB
+        return 1 * 1024**3
 
 # ====================================================================
 # --- DYNAMIC CONSTANTS CALCULATION ---
@@ -332,17 +369,16 @@ def calculate_dynamic_parameters(base_count, target_count, device=None, target_h
             is_nvidia = 'NVIDIA' in device.get_info(cl.device_info.NAME).upper()
 
             # Dynamic work group size
-            possible_sizes = [32, 64, 128, 256, 512, 1024]
-            LOCAL_WORK_SIZE = max([s for s in possible_sizes if s <= max_work_group_size])
+            LOCAL_WORK_SIZE = max([s for s in POSSIBLE_WORK_GROUP_SIZES if s <= max_work_group_size])
 
             if is_nvidia and max_compute_units >= 38:
                 LOCAL_WORK_SIZE = min(512, LOCAL_WORK_SIZE)
 
-            OPTIMAL_GLOBAL_MULTIPLIER = max_compute_units * 16
-            EST_COMBOS_PER_SEC = 120000000  # baseline (RTX 3060 Ti)
+            OPTIMAL_GLOBAL_MULTIPLIER = max_compute_units * OPTIMAL_GLOBAL_MULTIPLIER_BASE
+            EST_COMBOS_PER_SEC = BASELINE_COMBOS_PER_SEC
             # Scale speed estimate based on compute units (rough)
-            if max_compute_units < 20:  # low-end GPU
-                EST_COMBOS_PER_SEC = 40000000
+            if max_compute_units < LOW_END_COMPUTE_UNITS_THRESHOLD:
+                EST_COMBOS_PER_SEC = LOW_END_COMBOS_PER_SEC
 
             print(f"{blue('[GPU]')} {bold('Work Group Limits:')}")
             print(f"  {cyan('[*]')} Max work group size: {max_work_group_size}")
@@ -351,18 +387,18 @@ def calculate_dynamic_parameters(base_count, target_count, device=None, target_h
             print(f"  {cyan('[*]')} Estimated free VRAM: {vram_gb:.1f}GB")
             print(f"  {cyan('[*]')} Using work group size: {LOCAL_WORK_SIZE}")
 
-        except:
+        except Exception as e:
             # fallback if device info fails
             LOCAL_WORK_SIZE = 256
-            OPTIMAL_GLOBAL_MULTIPLIER = 38 * 16
-            EST_COMBOS_PER_SEC = 80000000
+            OPTIMAL_GLOBAL_MULTIPLIER = 38 * OPTIMAL_GLOBAL_MULTIPLIER_BASE
+            EST_COMBOS_PER_SEC = BASELINE_COMBOS_PER_SEC
             max_compute_units = 38
             free_vram = 2 * 1024**3  # assume 2GB
             vram_gb = 2.0
     else:
         LOCAL_WORK_SIZE = 256
         OPTIMAL_GLOBAL_MULTIPLIER = 608
-        EST_COMBOS_PER_SEC = 80000000
+        EST_COMBOS_PER_SEC = BASELINE_COMBOS_PER_SEC
         max_compute_units = 38
         free_vram = 2 * 1024**3
         vram_gb = 2.0
@@ -373,13 +409,13 @@ def calculate_dynamic_parameters(base_count, target_count, device=None, target_h
     vram_scale = max(0.25, vram_scale)
 
     target_seconds = target_hours * 3600
-    max_combinations_time_limit = int(EST_COMBOS_PER_SEC * target_seconds * 0.8)
+    max_combinations_time_limit = int(EST_COMBOS_PER_SEC * target_seconds * TIME_SAFETY_FACTOR)
 
     # Bloom filter size - 64MB max, scale down slightly for low VRAM but keep at least 16MB
-    BASE_BLOOM_SIZE = 1024 * 1024 * 64
+    BASE_BLOOM_SIZE = 1024 * 1024 * BLOOM_FILTER_MAX_MB
     bloom_scale = max(1.0, math.log10(base_count + target_count) / 2.0)
     BLOOM_FILTER_SIZE_BYTES = int(BASE_BLOOM_SIZE * min(bloom_scale, 2.0))
-    MAX_BLOOM_BYTES = 64 * 1024 * 1024
+    MAX_BLOOM_BYTES = BLOOM_FILTER_MAX_MB * 1024 * 1024
     # For low VRAM, cap bloom filter to 32MB if needed
     if vram_gb < 4:
         MAX_BLOOM_BYTES = 32 * 1024 * 1024
@@ -387,11 +423,6 @@ def calculate_dynamic_parameters(base_count, target_count, device=None, target_h
     BLOOM_FILTER_SIZE = BLOOM_FILTER_SIZE_BYTES * 8
 
     # Batch sizes scaled by VRAM
-    BASE_WORDS_PER_BATCH = 5000
-    BASE_CHAINS_PER_BATCH = 2000
-    BASE_WORD_SUB_BATCH = 20000
-    BASE_MAX_SAFE_RESULTS = 25000
-
     WORDS_PER_BATCH = max(1000, int(BASE_WORDS_PER_BATCH * vram_scale))
     CHAINS_PER_BATCH = max(500, int(BASE_CHAINS_PER_BATCH * vram_scale))
     WORD_SUB_BATCH = max(5000, int(BASE_WORD_SUB_BATCH * vram_scale))
@@ -555,13 +586,8 @@ class GPUEngine:
         self.kernel_chain = None
 
     def get_free_vram(self):
-        """Estimate free VRAM using OpenCL"""
-        try:
-            total = self.device.get_info(cl.device_info.GLOBAL_MEM_SIZE)
-            # Conservative: assume 40% is used by driver + bloom + rules
-            return int(total * 0.55)
-        except Exception:
-            return 1 * 1024**3
+        """Estimate free VRAM using OpenCL (uses the same factor as calculate_dynamic_parameters)"""
+        return estimate_free_vram(self.device)
 
     def safe_output_buffer_size(self, words_count, chains_count):
         """Calculate safe output buffer within VRAM budget (minimum 1)"""
@@ -615,7 +641,7 @@ class GPUEngine:
                 MAX_WORD_LEN=MAX_WORD_LEN,
                 MAX_RULE_LEN=MAX_RULE_LEN,
                 MAX_OUTPUT_LEN=MAX_OUTPUT_LEN,
-                BLOOM_HASH_FUNCTIONS=4
+                BLOOM_HASH_FUNCTIONS=BLOOM_HASH_FUNCTIONS
             )
 
             self.program = cl.Program(self.context, kernel_source).build()
@@ -641,10 +667,10 @@ class GPUEngine:
 
         for word in tqdm(target_words, desc="Building bloom filter", leave=False):
             word_bytes = word.encode('latin-1')
-            h1 = fnv1a_32(word_bytes, 0xDEADBEEF)
-            h2 = fnv1a_32(word_bytes, 0xCAFEBABE)
+            h1 = fnv1a_32(word_bytes, FNV1A_SEED1)
+            h2 = fnv1a_32(word_bytes, FNV1A_SEED2)
 
-            for i in range(4):
+            for i in range(BLOOM_HASH_FUNCTIONS):
                 idx = (h1 + i * h2) % self.params['BLOOM_FILTER_SIZE']
                 byte_idx = idx // 8
                 bit_idx = idx % 8
@@ -654,7 +680,7 @@ class GPUEngine:
         fill_ratio = bits_set / self.params['BLOOM_FILTER_SIZE']
         print(f"  {cyan('[*]')} Bloom filter fill ratio: {fill_ratio:.3%}")
         # approximate false positive rate (4 independent hashes)
-        fpr = (fill_ratio ** 4) if fill_ratio < 0.5 else 1.0
+        fpr = (fill_ratio ** BLOOM_HASH_FUNCTIONS) if fill_ratio < 0.5 else 1.0
         print(f"  {cyan('[*]')} Approx false positive rate: {fpr:.6%}")
 
         return bloom_filter
@@ -832,24 +858,26 @@ class GPUEngine:
                         found_rules_buf, found_count_buf):
                 try:
                     buf.release()
-                except:
+                except Exception:
                     pass
 
     def _generate_random_chains(self, depth, count, valid_rules, hot_rules, cold_rules, existing_chains, new_chains_set):
         """Generate random chains of given depth, up to count, avoiding duplicates."""
         generated = set()
-        attempts = 0
-        max_attempts = count * 5
+        # Separate attempts counters for hot and cold to avoid premature termination
+        hot_attempts = 0
+        cold_attempts = 0
+        max_attempts = count * MAX_ATTEMPTS_MULTIPLIER
 
         # Decide split between hot-biased and fully random
-        hot_budget = int(count * 0.6) if hot_rules else 0
+        hot_budget = int(count * HOT_RULE_RATIO) if hot_rules else 0
         cold_budget = count - hot_budget
 
         # Hot chains (at least one hot rule)
         if hot_rules and hot_budget > 0:
             for _ in range(hot_budget):
-                attempts += 1
-                if attempts > max_attempts:
+                hot_attempts += 1
+                if hot_attempts > max_attempts:
                     break
                 hot_pos = random.randint(0, depth - 1)
                 parts = []
@@ -864,8 +892,8 @@ class GPUEngine:
 
         # Cold chains (fully random)
         for _ in range(cold_budget):
-            attempts += 1
-            if attempts > max_attempts:
+            cold_attempts += 1
+            if cold_attempts > max_attempts:
                 break
             parts = [random.choice(valid_rules) for _ in range(depth)]
             pattern_key = ' '.join(parts)
@@ -961,10 +989,10 @@ class GPUEngine:
             # Extend seeds of depth depth-1 by appending a rule
             if depth-1 in seed_by_depth and len(seed_by_depth[depth-1]) > 0:
                 seed_list = list(seed_by_depth[depth-1])
-                # Allocate up to 30% of budget for extensions
-                extension_target = int(target_combinations * 0.3)
+                # Allocate up to EXTENSION_RATIO of budget for extensions
+                extension_target = int(target_combinations * EXTENSION_RATIO)
                 attempts = 0
-                max_attempts = extension_target * 5
+                max_attempts = extension_target * MAX_ATTEMPTS_MULTIPLIER
                 while len(new_chains) < extension_target and attempts < max_attempts:
                     seed = random.choice(seed_list)
                     rule = random.choice(valid_rules)
@@ -1148,7 +1176,7 @@ class GPUEngine:
                         found_chains_buf, found_count_buf):
                 try:
                     buf.release()
-                except:
+                except Exception:
                     pass
 
 # ====================================================================
@@ -1198,8 +1226,9 @@ class GPUExtractor:
 
     def extract_rules(self, base_words, target_words,
                       depth2_override=None, depth3_override=None,
-                      depth4_override=None, depth5_override=None, depth6_override=None,
-                      depth7_override=None, depth8_override=None, depth9_override=None,
+                      depth4_override=None, depth5_override=None,
+                      depth6_override=None, depth7_override=None,
+                      depth8_override=None, depth9_override=None,
                       depth10_override=None):
         """Extract GPU-compatible rules using complete processing; returns Counter {rule: hits}"""
         print(f"{blue('[MAIN]')} {bold('Starting GPU-optimized rule extraction...')}")
@@ -1241,7 +1270,7 @@ class GPUExtractor:
             print(f"{blue('=' * 60)}")
 
             remaining_time = max(0, self.params['TARGET_SECONDS'] - phase1_time)
-            total_work_budget = remaining_time * self.params['EST_COMBOS_PER_SEC'] * 0.9  # 90% safety margin
+            total_work_budget = remaining_time * self.params['EST_COMBOS_PER_SEC'] * TIME_SAFETY_FACTOR  # 90% safety margin
             base_words_len = len(base_words)
 
             # Distribute work across depths 2..max_depth
@@ -2158,4 +2187,3 @@ if __name__ == '__main__':
     print(f"{blue('[NOTE]')} {bold('All rules are GPU-compatible and syntactically valid for Hashcat')}")
     print(f"{blue('[NOTE]')} {bold('Rules are sorted by frequency (most hits first)')}")
     print(f"{bold(green('=' * 80))}{Colors.END}")
-
