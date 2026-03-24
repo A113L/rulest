@@ -112,7 +112,7 @@ An OpenCL-capable GPU (NVIDIA, AMD, or Intel) is required. CPU fallback via Open
 
 ```bash
 # Clone the repository
-git clone https://github.com/your-username/gpu-rule-extractor.git](https://github.com/A113L/rulest.git
+git clone https://github.com/A113L/rulest.git
 cd rulest
 
 # Install dependencies
