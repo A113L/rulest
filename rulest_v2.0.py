@@ -8,6 +8,16 @@ import itertools
 from collections import defaultdict, deque, Counter
 from tqdm import tqdm
 import mmap
+import timeimport os
+import sys
+import numpy as np
+import pyopencl as cl
+import argparse
+import string
+import itertools
+from collections import defaultdict, deque, Counter
+from tqdm import tqdm
+import mmap
 import time
 import hashlib
 import signal
@@ -144,7 +154,7 @@ class HashcatRuleValidator:
                 pos += 1
 
             # --- Commands with one digit and then a character (any) ---
-            elif c in ('i', 'o'):
+            elif c in ('i', 'o', '3'):                         # Added '3' for toggle after Nth separator
                 pos += 1
                 if pos >= line_len or not HashcatRuleValidator.is_digit(rule_str[pos]):
                     return False
@@ -154,7 +164,7 @@ class HashcatRuleValidator:
                 pos += 1
 
             # --- Commands with two decimal digits ---
-            elif c in ('x', '*'):
+            elif c in ('x', '*', 'O'):                         # Added 'O' for omit range
                 pos += 1
                 if pos >= line_len or not HashcatRuleValidator.is_digit(rule_str[pos]):
                     return False
@@ -383,7 +393,7 @@ def calculate_dynamic_parameters(base_count, target_count, device=None, target_h
             OPTIMAL_GLOBAL_MULTIPLIER = 38 * OPTIMAL_GLOBAL_MULTIPLIER_BASE
             EST_COMBOS_PER_SEC = BASELINE_COMBOS_PER_SEC
             max_compute_units = 38
-            free_vram = 2 * 1024**3  # assume 2GB
+            free_vram = 2 * 1024**3
             vram_gb = 2.0
     else:
         LOCAL_WORK_SIZE = 256
@@ -479,7 +489,7 @@ class GPUCompatibleRulesGenerator:
                 rules.add(f'{cmd}{pos}')
 
         # Two position rules (both digits)
-        for cmd in ['x', '*']:
+        for cmd in ['x', '*', 'O']:               # Added 'O' for omit range
             for pos1 in digits:
                 for pos2 in digits:
                     rules.add(f'{cmd}{pos1}{pos2}')
@@ -521,6 +531,8 @@ class GPUCompatibleRulesGenerator:
                 if n != m:
                     rules.add(f'x{n}{m}')
                     rules.add(f'*{n}{m}')
+                # Also add O (omit) for all combos (including n==m?) O works with any n,m
+                rules.add(f'O{n}{m}')           # Add O rules for all digit pairs
 
         # ===== CATEGORY 7: DUPLICATION =====
         print(f"  {cyan('[*]')} Duplication rules...")
@@ -535,6 +547,12 @@ class GPUCompatibleRulesGenerator:
         print(f"  {cyan('[*]')} Title case rules...")
         for separator in [' ', '-', '_', '.', ',', ';', ':', '|', '/', '\\', '+', '*', '&', '^', '%', '$', '#', '@', '!', '~', '`']:
             rules.add(f'e{separator}')
+
+        # ===== CATEGORY 9: TOGGLE AFTER NTH SEPARATOR (3NX) =====
+        print(f"  {cyan('[*]')} Toggle after Nth separator rules...")
+        for n in digits:
+            for separator in string.ascii_letters + string.digits + '!@#$%^&*()_+-=[]{}|;:,.<>?/~':
+                rules.add(f'3{n}{separator}')
 
         # Convert to list and validate
         rules_list = list(rules)
@@ -1651,21 +1669,17 @@ int apply_gpu_rule(
                 changed = 1;
             }}
         }}
-        else if (cmd == 'L' && is_digit(param)) {{ // Delete left (keep from pos to end)
+        else if (cmd == 'L' && is_digit(param)) {{ // Bitwise shift left (new)
             int pos = param - '0';
             if (pos < *output_len) {{
-                int new_len = 0;
-                for (int i = pos; i < *output_len; i++) {{
-                    output_word[new_len++] = output_word[i];
-                }}
-                *output_len = new_len;
+                output_word[pos] = output_word[pos] << 1;
                 changed = 1;
             }}
         }}
-        else if (cmd == 'R' && is_digit(param)) {{ // Delete right (keep up to pos)
+        else if (cmd == 'R' && is_digit(param)) {{ // Bitwise shift right (new)
             int pos = param - '0';
             if (pos < *output_len) {{
-                *output_len = pos + 1;
+                output_word[pos] = output_word[pos] >> 1;
                 changed = 1;
             }}
         }}
@@ -1683,17 +1697,17 @@ int apply_gpu_rule(
                 changed = 1;
             }}
         }}
-        else if (cmd == '.' && is_digit(param)) {{ // Replace with '.' at position
+        else if (cmd == '.' && is_digit(param)) {{ // Replace with char+1 (new)
             int pos = param - '0';
             if (pos < *output_len) {{
-                output_word[pos] = '.';
+                output_word[pos] = output_word[pos] + 1;
                 changed = 1;
             }}
         }}
-        else if (cmd == ',' && is_digit(param)) {{ // Replace with ',' at position
+        else if (cmd == ',' && is_digit(param)) {{ // Replace with char-1 (new)
             int pos = param - '0';
             if (pos < *output_len) {{
-                output_word[pos] = ',';
+                output_word[pos] = output_word[pos] - 1;
                 changed = 1;
             }}
         }}
@@ -1812,6 +1826,20 @@ int apply_gpu_rule(
                 changed = 1;
             }}
         }}
+        else if (cmd == 'O' && is_digit(param1) && is_digit(param2)) {{ // Omit range (delete M chars from N)
+            int n = param1 - '0';
+            int m = param2 - '0';
+            if (n < *output_len && m > 0) {{
+                int end = n + m;
+                if (end > *output_len) end = *output_len;
+                int shift = end - n;
+                for (int i = end; i < *output_len; i++) {{
+                    output_word[i - shift] = output_word[i];
+                }}
+                *output_len -= shift;
+                changed = 1;
+            }}
+        }}
         else if (cmd == '*' && is_digit(param1) && is_digit(param2)) {{ // Swap positions
             int n = param1 - '0';
             int m = param2 - '0';
@@ -1822,7 +1850,25 @@ int apply_gpu_rule(
                 changed = 1;
             }}
         }}
-        // K with two digits is NOT a valid Hashcat rule; we omit it.
+        else if (cmd == '3' && is_digit(param1)) {{ // Toggle after Nth separator (new)
+            int n = param1 - '0';
+            unsigned char separator = param2;
+            int count = 0;
+            int found = -1;
+            for (int i = 0; i < *output_len; i++) {{
+                if (output_word[i] == separator) {{
+                    count++;
+                    if (count == n) {{
+                        found = i;
+                        break;
+                    }}
+                }}
+            }}
+            if (found != -1 && found + 1 < *output_len) {{
+                output_word[found + 1] = toggle_case(output_word[found + 1]);
+                changed = 1;
+            }}
+        }}
     }}
 
     output_word[*output_len] = '\\0';
