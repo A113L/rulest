@@ -538,9 +538,9 @@ class GPUCompatibleRulesGenerator:
                 rules.add(f'3{n}{ch}')
 
         # Insert every N characters vNX
-        for n in digits:
-            for ch in ascii_printable:
-                rules.add(f'v{n}{ch}')
+        #for n in digits:
+        #    for ch in ascii_printable:
+        #        rules.add(f'v{n}{ch}')
 
         # Convert to list and validate
         rules_list = list(rules)
