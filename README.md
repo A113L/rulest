@@ -149,7 +149,9 @@ usage: rulest_v2.py [options] base_wordlist target_wordlist
 | `-o`, `--output` | `found_chains.txt` | Output file path |
 | `--max-chains` | unlimited | Hard cap on total chains generated |
 | `--target-hours` | `0.5` | Time budget in hours; controls chain generation budget |
-| `--seed-rules` | None | File with known-good rules/chains to use as generation seeds |
+| `--seed-rules` | None | File with known-good rules/chains to use as generation seeds
+| `--allow-reject-rules` | False |  Include reject rules (e.g. !X, ?NX) in generation (GPU will ignore them, provide in `--seed-rules` if desired in output) |
+| `--debug` | False | Enable verbose output (detailed generation info, validation messages) |
 | `--list-devices` | — | Print all available OpenCL devices and exit |
 | `--device` | best GPU | Device index (e.g. `0`) or name substring (e.g. `NVIDIA`) |
 | `--depth2-chains` | dynamic | Override chain generation limit for depth 2 |
