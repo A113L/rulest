@@ -19,7 +19,8 @@ from typing import List, Dict, Set, Tuple, Optional
 import gc
 
 # ================== CONFIGURATION ==================
-VERBOSE = False              # Set to False to reduce output
+VERBOSE = False              # Set to True to see detailed output (use --debug)
+ALLOW_REJECT_RULES = False   # If True, allow reject rules in validation (GPU will ignore them)
 # ==================================================
 
 # Suppress compiler warnings
@@ -92,6 +93,8 @@ MAX_GPU_RULES = 255
 # ====================================================================
 def should_exclude_rule(rule: str) -> bool:
     """Return True if rule is unwanted (rejection, memory, vNX, etc.)"""
+    if ALLOW_REJECT_RULES:
+        return False
     if not rule:
         return False
     # Single‑character problematic rules (z and Z are valid, so keep them)
@@ -237,6 +240,34 @@ class HashcatRuleValidator:
                 if pos >= line_len:
                     if VERBOSE:
                         print(f"  Invalid (missing argument after {c}): {rule_str}")
+                    return False
+                pos += 1
+                cnt += 1
+                continue
+
+            # --- Two‑character reject rules (if allowed) ---
+            if ALLOW_REJECT_RULES and c in ('!', '/', '(', ')', '<', '>', '_'):
+                pos += 1
+                if pos >= line_len:
+                    if VERBOSE:
+                        print(f"  Invalid (missing argument after {c}): {rule_str}")
+                    return False
+                # any character is accepted
+                pos += 1
+                cnt += 1
+                continue
+
+            # --- Three‑character reject rules (if allowed) ---
+            if ALLOW_REJECT_RULES and c in ('?', '=', 'v'):
+                pos += 1
+                if pos >= line_len or not HashcatRuleValidator.is_digit(rule_str[pos]):
+                    if VERBOSE:
+                        print(f"  Invalid (missing digit after {c}): {rule_str}")
+                    return False
+                pos += 1
+                if pos >= line_len:
+                    if VERBOSE:
+                        print(f"  Invalid (missing character after {c}N): {rule_str}")
                     return False
                 pos += 1
                 cnt += 1
@@ -412,12 +443,13 @@ def calculate_dynamic_parameters(base_count, target_count, device=None, target_h
             EST_COMBOS_PER_SEC = BASELINE_COMBOS_PER_SEC
             if max_compute_units < LOW_END_COMPUTE_UNITS_THRESHOLD:
                 EST_COMBOS_PER_SEC = LOW_END_COMBOS_PER_SEC
-            print(f"{blue('[GPU]')} {bold('Work Group Limits:')}")
-            print(f"  {cyan('[*]')} Max work group size: {max_work_group_size}")
-            print(f"  {cyan('[*]')} Compute units: {max_compute_units}")
-            print(f"  {cyan('[*]')} Global memory: {global_mem // (1024**3)}GB")
-            print(f"  {cyan('[*]')} Estimated free VRAM: {vram_gb:.1f}GB")
-            print(f"  {cyan('[*]')} Using work group size: {LOCAL_WORK_SIZE}")
+            if VERBOSE:
+                print(f"{blue('[GPU]')} {bold('Work Group Limits:')}")
+                print(f"  {cyan('[*]')} Max work group size: {max_work_group_size}")
+                print(f"  {cyan('[*]')} Compute units: {max_compute_units}")
+                print(f"  {cyan('[*]')} Global memory: {global_mem // (1024**3)}GB")
+                print(f"  {cyan('[*]')} Estimated free VRAM: {vram_gb:.1f}GB")
+                print(f"  {cyan('[*]')} Using work group size: {LOCAL_WORK_SIZE}")
         except Exception:
             LOCAL_WORK_SIZE = 256
             OPTIMAL_GLOBAL_MULTIPLIER = 38 * OPTIMAL_GLOBAL_MULTIPLIER_BASE
@@ -455,13 +487,14 @@ def calculate_dynamic_parameters(base_count, target_count, device=None, target_h
 
     MAX_CHAINS_TO_FIND = 2**31 - 1
 
-    print(f"\n{blue('[TIME]')} {bold(f'Target completion: {target_hours} hours')}")
-    print(f"{blue('[PERF]')} {bold('Estimated processing speed:')} {cyan(f'{EST_COMBOS_PER_SEC:,}')} combos/sec")
-    print(f"{blue('[PERF]')} {bold('Max combinations in time:')} {cyan(f'{max_combinations_time_limit:,}')}")
-    print(f"{blue('[VRAM]')} {bold('Bloom filter size:')} {cyan(f'{BLOOM_FILTER_SIZE_BYTES / 1024 / 1024:.1f}MB')}")
-    print(f"{blue('[VRAM]')} {bold('Batch sizes:')} {cyan(f'{WORDS_PER_BATCH}/{CHAINS_PER_BATCH}/{WORD_SUB_BATCH}')}")
-    print(f"{blue('[VRAM]')} {bold('Max output per batch:')} {cyan(f'{MAX_SAFE_RESULTS_PER_BATCH:,}')}")
-    print(f"{blue('[LIMIT]')} {bold('Global cap:')} {cyan('unlimited')}")
+    if VERBOSE:
+        print(f"\n{blue('[TIME]')} {bold(f'Target completion: {target_hours} hours')}")
+        print(f"{blue('[PERF]')} {bold('Estimated processing speed:')} {cyan(f'{EST_COMBOS_PER_SEC:,}')} combos/sec")
+        print(f"{blue('[PERF]')} {bold('Max combinations in time:')} {cyan(f'{max_combinations_time_limit:,}')}")
+        print(f"{blue('[VRAM]')} {bold('Bloom filter size:')} {cyan(f'{BLOOM_FILTER_SIZE_BYTES / 1024 / 1024:.1f}MB')}")
+        print(f"{blue('[VRAM]')} {bold('Batch sizes:')} {cyan(f'{WORDS_PER_BATCH}/{CHAINS_PER_BATCH}/{WORD_SUB_BATCH}')}")
+        print(f"{blue('[VRAM]')} {bold('Max output per batch:')} {cyan(f'{MAX_SAFE_RESULTS_PER_BATCH:,}')}")
+        print(f"{blue('[LIMIT]')} {bold('Global cap:')} {cyan('unlimited')}")
 
     return {
         'BLOOM_FILTER_SIZE': BLOOM_FILTER_SIZE,
@@ -488,10 +521,12 @@ class GPUCompatibleRulesGenerator:
 
     def generate_gpu_compatible_rules(self):
         rules = set()
-        print(f"{blue('[SETUP]')} {bold('Generating GPU-compatible Hashcat rules...')}")
+        if VERBOSE:
+            print(f"{blue('[SETUP]')} {bold('Generating GPU-compatible Hashcat rules...')}")
 
         # ===== CATEGORY 1: SIMPLE RULES =====
-        print(f"  {cyan('[*]')} Simple rules...")
+        if VERBOSE:
+            print(f"  {cyan('[*]')} Simple rules...")
         simple_rules = [
             'l', 'u', 'c', 'C', 't', 'r', 'd', 'f', 'p', 'z', 'Z', 'q', 'E',
             '{', '}', '[', ']', 'k', 'K', ':'
@@ -501,7 +536,8 @@ class GPUCompatibleRulesGenerator:
             print(f"    Generated {len(simple_rules)} simple rules (first 10: {', '.join(simple_rules[:10])})")
 
         # ===== CATEGORY 2: POSITION-BASED RULES =====
-        print(f"  {cyan('[*]')} Position-based rules (0-9 only)...")
+        if VERBOSE:
+            print(f"  {cyan('[*]')} Position-based rules (0-9 only)...")
         digits = '0123456789'
         pos_cmds = ['T', 'D', 'L', 'R', '+', '-', '.', ',', "'", 'z', 'Z', 'y', 'Y']
         pos_rules = []
@@ -526,14 +562,8 @@ class GPUCompatibleRulesGenerator:
             print(f"    Generated {len(two_pos_rules)} two-position rules (first 10: {', '.join(two_pos_rules[:10])})")
 
         # ===== CATEGORY 3: PREFIX/SUFFIX (PRINTABLE ASCII, EXCLUDING SPACE) =====
-        # FIX: Start from chr(33) instead of chr(32) to exclude the space character.
-        # Space (0x20) is Hashcat's chain-rule delimiter; a rule whose argument IS a
-        # space (e.g. "^ " = prepend space) would be silently broken by the .strip()
-        # call that was previously in validate_rules_for_gpu, turning "^ " into bare
-        # "^" which then fails validation. Excluding space here is the safer choice
-        # because space-argument rules would also cause ambiguity inside chained
-        # rule strings where space is the separator token.
-        print(f"  {cyan('[*]')} Prefix/suffix rules (printable ASCII, excluding space)...")
+        if VERBOSE:
+            print(f"  {cyan('[*]')} Prefix/suffix rules (printable ASCII, excluding space)...")
         prefix_suffix = set()
         for i in range(33, 127):  # chr(33)='!' through chr(126)='~'; chr(32)=' ' excluded
             char = chr(i)
@@ -546,7 +576,8 @@ class GPUCompatibleRulesGenerator:
             print(f"    Generated {len(prefix_suffix)} prefix/suffix rules (first 10: {', '.join(examples[:10])})")
 
         # ===== CATEGORY 4: SUBSTITUTIONS =====
-        print(f"  {cyan('[*]')} Substitution rules...")
+        if VERBOSE:
+            print(f"  {cyan('[*]')} Substitution rules...")
         leet_subs = [
             ('a', '@'), ('a', '4'), ('e', '3'), ('i', '1'), ('o', '0'),
             ('s', '$'), ('s', '5'), ('t', '7'), ('l', '1'), ('g', '9'),
@@ -567,7 +598,8 @@ class GPUCompatibleRulesGenerator:
             print(f"    Generated {len(sub_rules)} substitution rules (first 10: {', '.join(sub_rules[:10])})")
 
         # ===== CATEGORY 5: INSERTION/OVERWRITE =====
-        print(f"  {cyan('[*]')} Insertion/overwrite rules...")
+        if VERBOSE:
+            print(f"  {cyan('[*]')} Insertion/overwrite rules...")
         io_rules = []
         for pos in digits:
             for char in string.ascii_letters + string.digits + '!@#$%^&*()_+-=[]{}|;:,.<>?/~':
@@ -581,7 +613,8 @@ class GPUCompatibleRulesGenerator:
             print(f"    Generated {len(io_rules)} insertion/overwrite rules (first 10: {', '.join(io_rules[:10])})")
 
         # ===== CATEGORY 6: EXTRACTION/SWAP =====
-        print(f"  {cyan('[*]')} Extraction/swap rules...")
+        if VERBOSE:
+            print(f"  {cyan('[*]')} Extraction/swap rules...")
         extract_swap = set()
         for n in digits:
             for m in digits:
@@ -594,7 +627,8 @@ class GPUCompatibleRulesGenerator:
             print(f"    Generated {len(extract_swap)} extraction/swap rules (first 10: {', '.join(list(extract_swap)[:10])})")
 
         # ===== CATEGORY 7: DUPLICATION =====
-        print(f"  {cyan('[*]')} Duplication rules...")
+        if VERBOSE:
+            print(f"  {cyan('[*]')} Duplication rules...")
         dup_rules = set()
         for n in range(1, 10):
             dup_rules.add(f'p{n}')
@@ -607,12 +641,8 @@ class GPUCompatibleRulesGenerator:
             print(f"    Generated {len(dup_rules)} duplication rules (first 10: {', '.join(list(dup_rules)[:10])})")
 
         # ===== CATEGORY 8: TITLE CASE WITH SEPARATOR =====
-        # FIX: Space (' ') removed from the separator list.
-        # "e " (e + space) would be stripped to bare "e" by the old .strip() call,
-        # causing a validation failure. Even with the strip fix, space as a separator
-        # arg creates ambiguity in chained-rule strings. The remaining separators
-        # cover every common real-world delimiter Hashcat users encounter.
-        print(f"  {cyan('[*]')} Title case rules...")
+        if VERBOSE:
+            print(f"  {cyan('[*]')} Title case rules...")
         title_rules = set()
         for sep in ['-', '_', '.', ',', ';', ':', '|', '/', '\\', '+', '*', '&', '^', '%', '$', '#', '@', '!', '~', '`']:
             title_rules.add(f'e{sep}')
@@ -621,7 +651,8 @@ class GPUCompatibleRulesGenerator:
             print(f"    Generated {len(title_rules)} title case rules (first 10: {', '.join(list(title_rules)[:10])})")
 
         # ===== CATEGORY 9: TOGGLE AFTER NTH SEPARATOR =====
-        print(f"  {cyan('[*]')} Toggle after Nth separator rules...")
+        if VERBOSE:
+            print(f"  {cyan('[*]')} Toggle after Nth separator rules...")
         toggle_rules = set()
         for n in digits:
             for sep in string.ascii_letters + string.digits + '!@#$%^&*()_+-=[]{}|;:,.<>?/~':
@@ -635,16 +666,18 @@ class GPUCompatibleRulesGenerator:
         valid_rules = []
         excluded_count = 0
 
-        print(f"  {cyan('[*]')} Validating rules for GPU compatibility...")
-        for rule in tqdm(rules_list, desc="Validating", leave=False):
+        if VERBOSE:
+            print(f"  {cyan('[*]')} Validating rules for GPU compatibility...")
+        for rule in tqdm(rules_list, desc="Validating", leave=False, disable=False):
             if self.validator.validate_rule_for_gpu(rule):
                 if 1 <= len(rule) <= MAX_RULE_LEN:
                     valid_rules.append(rule)
             else:
                 excluded_count += 1
 
-        print(f"{green('[OK]')} {bold('Generated:')} {cyan(f'{len(valid_rules):,}')} {bold('GPU-compatible Hashcat rules')} "
-              f"(excluded {excluded_count} invalid/unwanted)")
+        if VERBOSE:
+            print(f"{green('[OK]')} {bold('Generated:')} {cyan(f'{len(valid_rules):,}')} {bold('GPU-compatible Hashcat rules')} "
+                  f"(excluded {excluded_count} invalid/unwanted)")
         return valid_rules
 
 # ====================================================================
@@ -706,17 +739,19 @@ class GPUEngine:
             max_compute_units = self.device.get_info(cl.device_info.MAX_COMPUTE_UNITS)
             free_vram = self.get_free_vram()
 
-            print(f"{green('[GPU]')} {bold('GPU:')} {cyan(self.device.name.strip())}")
-            print(f"{blue('[INFO]')} {bold('Global Memory:')} {cyan(f'{global_mem // (1024**3)}GB')}")
-            print(f"{blue('[INFO]')} {bold('Max Work Group Size:')} {cyan(self.max_work_group_size)}")
-            print(f"{blue('[INFO]')} {bold('Compute Units:')} {cyan(max_compute_units)}")
-            print(f"{blue('[INFO]')} {bold('Free VRAM estimate:')} {cyan(f'{free_vram / 1024**3:.1f}GB')}")
+            if VERBOSE:
+                print(f"{green('[GPU]')} {bold('GPU:')} {cyan(self.device.name.strip())}")
+                print(f"{blue('[INFO]')} {bold('Global Memory:')} {cyan(f'{global_mem // (1024**3)}GB')}")
+                print(f"{blue('[INFO]')} {bold('Max Work Group Size:')} {cyan(self.max_work_group_size)}")
+                print(f"{blue('[INFO]')} {bold('Compute Units:')} {cyan(max_compute_units)}")
+                print(f"{blue('[INFO]')} {bold('Free VRAM estimate:')} {cyan(f'{free_vram / 1024**3:.1f}GB')}")
 
             self.local_work_size = min(self.local_work_size, self.max_work_group_size)
             while self.max_work_group_size % self.local_work_size != 0 and self.local_work_size > 32:
                 self.local_work_size //= 2
 
-            print(f"{blue('[INFO]')} {bold('Using Work Group Size:')} {cyan(self.local_work_size)}")
+            if VERBOSE:
+                print(f"{blue('[INFO]')} {bold('Using Work Group Size:')} {cyan(self.local_work_size)}")
             return True
         except Exception as e:
             print(f"{red('[ERROR]')} {bold('GPU initialization failed:')} {e}")
@@ -724,7 +759,8 @@ class GPUEngine:
 
     def compile_kernel(self):
         try:
-            print(f"{blue('[SETUP]')} {bold('Compiling GPU-compatible kernel...')}")
+            if VERBOSE:
+                print(f"{blue('[SETUP]')} {bold('Compiling GPU-compatible kernel...')}")
             kernel_source = GPU_COMPATIBLE_KERNEL_TEMPLATE.format(
                 BLOOM_FILTER_SIZE=self.params['BLOOM_FILTER_SIZE'],
                 MAX_SAFE_RESULTS_PER_BATCH=self.params['MAX_SAFE_RESULTS_PER_BATCH'],
@@ -738,7 +774,8 @@ class GPUEngine:
             self.program = cl.Program(self.context, kernel_source).build()
             self.kernel_single = self.program.find_single_rules_gpu
             self.kernel_chain = self.program.find_rule_chains_gpu
-            print(f"{green('[OK]')} {bold('Kernel compiled successfully')}")
+            if VERBOSE:
+                print(f"{green('[OK]')} {bold('Kernel compiled successfully')}")
             return self.program
         except Exception as e:
             print(f"{red('[ERROR]')} {bold('Kernel compilation failed:')}")
@@ -746,12 +783,14 @@ class GPUEngine:
             return None
 
     def generate_bloom_filter(self, target_words):
-        print(f"{blue('[SETUP]')} {bold('Generating comprehensive Bloom filter...')}")
+        if VERBOSE:
+            print(f"{blue('[SETUP]')} {bold('Generating comprehensive Bloom filter...')}")
         bloom_size_bytes = self.params['BLOOM_FILTER_SIZE'] // 8
         bloom_filter = np.zeros(bloom_size_bytes, dtype=np.uint8)
-        print(f"  {cyan('[*]')} Bloom filter size: {bloom_size_bytes / 1024 / 1024:.1f} MB")
-        print(f"  {cyan('[*]')} Hashing ALL target words: {len(target_words):,}")
-        for word in tqdm(target_words, desc="Building bloom filter", leave=False):
+        if VERBOSE:
+            print(f"  {cyan('[*]')} Bloom filter size: {bloom_size_bytes / 1024 / 1024:.1f} MB")
+            print(f"  {cyan('[*]')} Hashing ALL target words: {len(target_words):,}")
+        for word in tqdm(target_words, desc="Building bloom filter", leave=False, disable=False):
             word_bytes = word.encode('latin-1')
             h1 = fnv1a_32(word_bytes, FNV1A_SEED1)
             h2 = fnv1a_32(word_bytes, FNV1A_SEED2)
@@ -762,9 +801,10 @@ class GPUEngine:
                 bloom_filter[byte_idx] |= (1 << bit_idx)
         bits_set = np.sum(np.unpackbits(bloom_filter))
         fill_ratio = bits_set / self.params['BLOOM_FILTER_SIZE']
-        print(f"  {cyan('[*]')} Bloom filter fill ratio: {fill_ratio:.3%}")
-        fpr = (fill_ratio ** BLOOM_HASH_FUNCTIONS) if fill_ratio < 0.5 else 1.0
-        print(f"  {cyan('[*]')} Approx false positive rate: {fpr:.6%}")
+        if VERBOSE:
+            print(f"  {cyan('[*]')} Bloom filter fill ratio: {fill_ratio:.3%}")
+            fpr = (fill_ratio ** BLOOM_HASH_FUNCTIONS) if fill_ratio < 0.5 else 1.0
+            print(f"  {cyan('[*]')} Approx false positive rate: {fpr:.6%}")
         return bloom_filter
 
     def upload_bloom_filter(self, bloom_filter):
@@ -810,19 +850,22 @@ class GPUEngine:
         }
 
     def process_all_words_single_rule(self, base_words, rules, bloom_filter):
-        print(f"{blue('[GPU]')} {bold('Processing ALL words with single rules...')}")
+        if VERBOSE:
+            print(f"{blue('[GPU]')} {bold('Processing ALL words with single rules...')}")
         self.upload_bloom_filter(bloom_filter)
         if not self.compile_kernel():
             return Counter()
         self.gpu_rules = HashcatRuleValidator.validate_rules_for_gpu(rules)
         self.rule_index = {r: i for i, r in enumerate(self.gpu_rules)}
-        print(f"{blue('[INFO]')} {bold('GPU-compatible rules:')} {len(self.gpu_rules):,}")
+        if VERBOSE:
+            print(f"{blue('[INFO]')} {bold('GPU-compatible rules:')} {len(self.gpu_rules):,}")
         rule_counter = Counter()
         batch_size = self.params['WORDS_PER_BATCH']
         num_batches = (len(base_words) + batch_size - 1) // batch_size
-        print(f"{blue('[INFO]')} {bold('Processing ALL')} {len(base_words):,} {bold('words in')} {num_batches} {bold('batches')}")
-        print(f"{blue('[INFO]')} {bold('Batch size:')} {batch_size:,} words")
-        with tqdm(total=num_batches, desc="Processing all words", unit="batch") as pbar:
+        if VERBOSE:
+            print(f"{blue('[INFO]')} {bold('Processing ALL')} {len(base_words):,} {bold('words in')} {num_batches} {bold('batches')}")
+            print(f"{blue('[INFO]')} {bold('Batch size:')} {batch_size:,} words")
+        with tqdm(total=num_batches, desc="Processing all words", unit="batch", disable=False) as pbar:
             for batch_idx in range(num_batches):
                 start_idx = batch_idx * batch_size
                 end_idx = min((batch_idx + 1) * batch_size, len(base_words))
@@ -834,11 +877,13 @@ class GPUEngine:
                 batch_found = self.process_batch_single(batch_data)
                 if batch_found:
                     rule_counter.update(batch_found)
-                pbar.set_postfix({'found': len(rule_counter), 'progress': f"{end_idx:,}/{len(base_words):,}"})
+                if VERBOSE:
+                    pbar.set_postfix({'found': len(rule_counter), 'progress': f"{end_idx:,}/{len(base_words):,}"})
                 pbar.update(1)
                 self.queue.finish()
                 gc.collect()
-        print(f"\n{green('[OK]')} {bold('Total unique single rules found:')} {cyan(len(rule_counter))}")
+        if VERBOSE:
+            print(f"\n{green('[OK]')} {bold('Total unique single rules found:')} {cyan(len(rule_counter))}")
         return rule_counter
 
     def process_batch_single(self, batch_data):
@@ -888,7 +933,8 @@ class GPUEngine:
                         batch_found.append(rule_str)
             return batch_found
         except Exception as e:
-            print(f"{yellow('[WARN]')} GPU single‑rule processing failed: {e}")
+            if VERBOSE:
+                print(f"{yellow('[WARN]')} GPU single‑rule processing failed: {e}")
             self.queue = cl.CommandQueue(self.context)
             return []
         finally:
@@ -933,17 +979,20 @@ class GPUEngine:
         return generated
 
     def generate_informed_chains(self, rules, single_rules_found, max_depth, seed_chains=None):
-        print(f"  {cyan('->')} Generating informed chains up to depth {max_depth}...")
+        if VERBOSE:
+            print(f"  {cyan('->')} Generating informed chains up to depth {max_depth}...")
         valid_rules = [r for r in rules if HashcatRuleValidator.validate_rule_for_gpu(r)]
         if not valid_rules:
-            print(f"  {yellow('[WARN]')} No valid rules found")
+            if VERBOSE:
+                print(f"  {yellow('[WARN]')} No valid rules found")
             return []
         found_set = set(single_rules_found.keys()) if single_rules_found else set()
         hot_rules = [r for r in valid_rules if r in found_set]
         cold_rules = [r for r in valid_rules if r not in found_set]
-        print(f"  {cyan('[*]')} Using all {len(valid_rules)} rules for chain generation")
-        print(f"  {cyan('[*]')} Hot rules (from Phase 1): {len(hot_rules)}")
-        print(f"  {cyan('[*]')} Cold rules: {len(cold_rules)}")
+        if VERBOSE:
+            print(f"  {cyan('[*]')} Using all {len(valid_rules)} rules for chain generation")
+            print(f"  {cyan('[*]')} Hot rules (from Phase 1): {len(hot_rules)}")
+            print(f"  {cyan('[*]')} Cold rules: {len(cold_rules)}")
 
         # --- Prepare seeds ---
         # Depth 1: all valid rules are already in the set
@@ -953,7 +1002,8 @@ class GPUEngine:
         seed_by_depth = defaultdict(set)
 
         # ===== Pure and mixed prepend/append numeric seeds (0‑9999) =====
-        print(f"  {cyan('[*]')} Adding numeric prepend/append seeds (0‑9999, mixed operators allowed)...")
+        if VERBOSE:
+            print(f"  {cyan('[*]')} Adding numeric prepend/append seeds (0‑9999, mixed operators allowed)...")
         digits = '0123456789'
         # Build all sequences of ^d and $d for depths 1-4 (up to max_depth)
         max_seed_depth = min(max_depth, 4)
@@ -990,7 +1040,8 @@ class GPUEngine:
                     seed_by_depth[d].add(sc)
                 else:
                     seed_by_depth[d].add(sc)
-            print(f"  {cyan('[*]')} Loaded {len(seed_chains)} user seed chains")
+            if VERBOSE:
+                print(f"  {cyan('[*]')} Loaded {len(seed_chains)} user seed chains")
 
         # Add all seeds to chains set
         for dset in seed_by_depth.values():
@@ -998,15 +1049,18 @@ class GPUEngine:
 
         # --- Generate chains for each depth ---
         for depth in range(2, max_depth + 1):
-            print(f"  {cyan('->')} Depth {depth} chains...")
+            if VERBOSE:
+                print(f"  {cyan('->')} Depth {depth} chains...")
             budget_key = f'CHAIN_GEN_LIMIT_{depth}'
             target_combinations = self.params.get(budget_key, 0)
             if target_combinations <= 0:
-                print(f"  {yellow('[*]')} Budget for depth {depth} is 0, skipping.")
+                if VERBOSE:
+                    print(f"  {yellow('[*]')} Budget for depth {depth} is 0, skipping.")
                 continue
             max_combinations = len(valid_rules) ** depth
             target_combinations = min(target_combinations, max_combinations)
-            print(f"  {cyan('[*]')} Generating up to {target_combinations:,} chains...")
+            if VERBOSE:
+                print(f"  {cyan('[*]')} Generating up to {target_combinations:,} chains...")
             new_chains = set()
             # Add existing seeds of this depth
             if depth in seed_by_depth:
@@ -1043,11 +1097,13 @@ class GPUEngine:
             seed_by_depth[depth].update(new_chains)
 
         chains_list = list(chains)
-        print(f"  {cyan('[*]')} Generated {len(chains_list):,} chains total")
+        if VERBOSE:
+            print(f"  {cyan('[*]')} Generated {len(chains_list):,} chains total")
         return chains_list
 
     def process_all_words_chain_rules(self, base_words, rules, max_depth, bloom_filter, single_rules_counter, seed_chains=None):
-        print(f"{blue('[GPU]')} {bold('Processing ALL words with rule chains...')}")
+        if VERBOSE:
+            print(f"{blue('[GPU]')} {bold('Processing ALL words with rule chains...')}")
         if self.bloom_buf is None:
             self.upload_bloom_filter(bloom_filter)
         if not self.program:
@@ -1055,19 +1111,22 @@ class GPUEngine:
                 return Counter()
         if not self.rule_index:
             self.rule_index = {r: i for i, r in enumerate(self.gpu_rules)}
-        print(f"{blue('[SETUP]')} {bold('Generating rule chains...')}")
+        if VERBOSE:
+            print(f"{blue('[SETUP]')} {bold('Generating rule chains...')}")
         chains = self.generate_informed_chains(rules, single_rules_counter, max_depth, seed_chains)
         if not chains:
             return Counter()
-        print(f"{blue('[INFO]')} {bold('Total chains generated:')} {len(chains):,}")
+        if VERBOSE:
+            print(f"{blue('[INFO]')} {bold('Total chains generated:')} {len(chains):,}")
         chain_counter = Counter()
         chain_batch_size = self.params['CHAINS_PER_BATCH']
         word_sub_batch = self.params['WORD_SUB_BATCH']
         num_chain_batches = (len(chains) + chain_batch_size - 1) // chain_batch_size
-        print(f"{blue('[INFO]')} {bold('Processing')} {len(chains):,} {bold('chains in')} {num_chain_batches} {bold('batches')}")
-        print(f"{blue('[INFO]')} {bold('Chain batch size:')} {chain_batch_size:,}")
-        print(f"{blue('[INFO]')} {bold('Word sub-batch size:')} {word_sub_batch:,}")
-        with tqdm(total=num_chain_batches, desc="Chain batches", unit="batch") as chain_pbar:
+        if VERBOSE:
+            print(f"{blue('[INFO]')} {bold('Processing')} {len(chains):,} {bold('chains in')} {num_chain_batches} {bold('batches')}")
+            print(f"{blue('[INFO]')} {bold('Chain batch size:')} {chain_batch_size:,}")
+            print(f"{blue('[INFO]')} {bold('Word sub-batch size:')} {word_sub_batch:,}")
+        with tqdm(total=num_chain_batches, desc="Chain batches", unit="batch", disable=False) as chain_pbar:
             for chain_batch_idx in range(0, len(chains), chain_batch_size):
                 chain_end = min(chain_batch_idx + chain_batch_size, len(chains))
                 chain_batch = chains[chain_batch_idx:chain_end]
@@ -1080,10 +1139,14 @@ class GPUEngine:
                     if batch_chains:
                         chain_counter.update(batch_chains)
                     self.queue.finish()
-                chain_pbar.update(1)
-                chain_pbar.set_postfix({'found': len(chain_counter), 'progress': f"{chain_end}/{len(chains)}"})
+                if VERBOSE:
+                    chain_pbar.update(1)
+                    chain_pbar.set_postfix({'found': len(chain_counter), 'progress': f"{chain_end}/{len(chains)}"})
+                else:
+                    chain_pbar.update(1)
                 gc.collect()
-        print(f"\n{green('[OK]')} {bold('Total unique chains found:')} {cyan(len(chain_counter))}")
+        if VERBOSE:
+            print(f"\n{green('[OK]')} {bold('Total unique chains found:')} {cyan(len(chain_counter))}")
         return chain_counter
 
     def _process_chain_batch(self, words, chains):
@@ -1169,7 +1232,8 @@ class GPUEngine:
             return batch_chains
 
         except Exception as e:
-            print(f"{yellow('[WARN]')} GPU chain processing failed: {e}")
+            if VERBOSE:
+                print(f"{yellow('[WARN]')} GPU chain processing failed: {e}")
             self.queue = cl.CommandQueue(self.context)
             return []
         finally:
@@ -1196,10 +1260,11 @@ class GPUExtractor:
         self.seed_rules_file = seed_rules_file
         self.params = calculate_dynamic_parameters(base_count, target_count, None, target_hours)
         self.params['MAX_CHAIN_DEPTH'] = max_depth
-        print(f"{blue('[CONFIG]')} {bold('GPU-Optimized Configuration:')}")
-        for k, v in self.params.items():
-            if isinstance(v, (int, float)) and k not in ('bloom_scale', 'vram_scale', 'free_vram'):
-                print(f"  {cyan('[*]')} {k}: {v:,}" if isinstance(v, int) else f"  {cyan('[*]')} {k}: {v}")
+        if VERBOSE:
+            print(f"{blue('[CONFIG]')} {bold('GPU-Optimized Configuration:')}")
+            for k, v in self.params.items():
+                if isinstance(v, (int, float)) and k not in ('bloom_scale', 'vram_scale', 'free_vram'):
+                    print(f"  {cyan('[*]')} {k}: {v:,}" if isinstance(v, int) else f"  {cyan('[*]')} {k}: {v}")
         self.rules_generator = GPUCompatibleRulesGenerator()
         self.gpu_engine = GPUEngine(self.params)
         self.validator = HashcatRuleValidator()
@@ -1207,7 +1272,8 @@ class GPUExtractor:
     def load_seed_rules(self):
         if not self.seed_rules_file:
             return []
-        print(f"{blue('[SEED]')} {bold('Loading seed rules from:')} {self.seed_rules_file}")
+        if VERBOSE:
+            print(f"{blue('[SEED]')} {bold('Loading seed rules from:')} {self.seed_rules_file}")
         seeds = []
         try:
             with open(self.seed_rules_file, 'r', encoding='latin-1') as f:
@@ -1217,9 +1283,11 @@ class GPUExtractor:
                         if self.validator.validate_rule_for_gpu(line):
                             seeds.append(line)
         except Exception as e:
-            print(f"{yellow('[WARN]')} Could not load seed rules: {e}")
+            if VERBOSE:
+                print(f"{yellow('[WARN]')} Could not load seed rules: {e}")
             return []
-        print(f"{green('[OK]')} {bold('Loaded')} {len(seeds)} {bold('GPU-compatible seed rules')}")
+        if VERBOSE:
+            print(f"{green('[OK]')} {bold('Loaded')} {len(seeds)} {bold('GPU-compatible seed rules')}")
         return seeds
 
     def extract_rules(self, base_words, target_words,
@@ -1228,11 +1296,13 @@ class GPUExtractor:
                       depth6_override=None, depth7_override=None,
                       depth8_override=None, depth9_override=None,
                       depth10_override=None):
-        print(f"{blue('[MAIN]')} {bold('Starting GPU-optimized rule extraction...')}")
+        if VERBOSE:
+            print(f"{blue('[MAIN]')} {bold('Starting GPU-optimized rule extraction...')}")
         all_counts = Counter()
         rules = self.rules_generator.generate_gpu_compatible_rules()
         if not self.gpu_engine.initialize_gpu(self.device_spec):
-            print(f"{yellow('[WARN]')} {bold('GPU not available')}")
+            if VERBOSE:
+                print(f"{yellow('[WARN]')} {bold('GPU not available')}")
             return all_counts
         self.params = calculate_dynamic_parameters(self.base_count, self.target_count, self.gpu_engine.device, self.params['TARGET_SECONDS']/3600)
         self.params['MAX_CHAIN_DEPTH'] = self.max_depth
@@ -1240,19 +1310,22 @@ class GPUExtractor:
         seed_chains = self.load_seed_rules()
         bloom_filter = self.gpu_engine.generate_bloom_filter(target_words)
 
-        print(f"\n{blue('=' * 60)}")
-        print(f"{bold('PHASE 1: SINGLE RULE SEARCH (ALL WORDS)')}")
-        print(f"{blue('=' * 60)}")
+        if VERBOSE:
+            print(f"\n{blue('=' * 60)}")
+            print(f"{bold('PHASE 1: SINGLE RULE SEARCH (ALL WORDS)')}")
+            print(f"{blue('=' * 60)}")
         phase1_start = time.time()
         single_counts = self.gpu_engine.process_all_words_single_rule(base_words, rules, bloom_filter)
         phase1_time = time.time() - phase1_start
         all_counts.update(single_counts)
-        print(f"{green('[OK]')} {bold('Single rules found:')} {cyan(len(single_counts))}")
+        if VERBOSE:
+            print(f"{green('[OK]')} {bold('Single rules found:')} {cyan(len(single_counts))}")
 
         if self.max_depth > 1:
-            print(f"\n{blue('=' * 60)}")
-            print(f"{bold('PHASE 2: RULE CHAIN SEARCH (ALL WORDS)')}")
-            print(f"{blue('=' * 60)}")
+            if VERBOSE:
+                print(f"\n{blue('=' * 60)}")
+                print(f"{bold('PHASE 2: RULE CHAIN SEARCH (ALL WORDS)')}")
+                print(f"{blue('=' * 60)}")
             remaining_time = max(0, self.params['TARGET_SECONDS'] - phase1_time)
             total_work_budget = remaining_time * self.params['EST_COMBOS_PER_SEC'] * TIME_SAFETY_FACTOR
             base_words_len = len(base_words)
@@ -1271,7 +1344,8 @@ class GPUExtractor:
             for d, val in overrides.items():
                 if val is not None and d in depth_budgets:
                     depth_budgets[d] = val
-                    print(f"{blue('[OVERRIDE]')} {bold(f'Depth {d} chains set to:')} {cyan(val)}")
+                    if VERBOSE:
+                        print(f"{blue('[OVERRIDE]')} {bold(f'Depth {d} chains set to:')} {cyan(val)}")
             for d in depth_budgets:
                 depth_budgets[d] = max(0, depth_budgets[d])
             if self.max_chains is not None:
@@ -1280,20 +1354,24 @@ class GPUExtractor:
                     scale = self.max_chains / total_budget
                     for d in depth_budgets:
                         depth_budgets[d] = int(depth_budgets[d] * scale)
-                    print(f"{blue('[OVERRIDE]')} {bold('Scaled chain budgets to fit --max-chains:')} {cyan(self.max_chains)}")
+                    if VERBOSE:
+                        print(f"{blue('[OVERRIDE]')} {bold('Scaled chain budgets to fit --max-chains:')} {cyan(self.max_chains)}")
             for d, budget in depth_budgets.items():
                 self.params[f'CHAIN_GEN_LIMIT_{d}'] = budget
-            print(f"{blue('[DYNAMIC]')} {bold('Phase 1 time:')} {phase1_time:.2f}s, {bold('Remaining:')} {remaining_time:.2f}s")
-            for d in depths:
-                print(f"{blue('[DYNAMIC]')} {bold(f'Depth {d} chain limit:')} {cyan(f'{depth_budgets[d]:,}')}")
+            if VERBOSE:
+                print(f"{blue('[DYNAMIC]')} {bold('Phase 1 time:')} {phase1_time:.2f}s, {bold('Remaining:')} {remaining_time:.2f}s")
+                for d in depths:
+                    print(f"{blue('[DYNAMIC]')} {bold(f'Depth {d} chain limit:')} {cyan(f'{depth_budgets[d]:,}')}")
             chain_counts = self.gpu_engine.process_all_words_chain_rules(
                 base_words, rules, self.max_depth, bloom_filter, single_counts, seed_chains)
             all_counts.update(chain_counts)
-            print(f"{green('[OK]')} {bold('Rule chains found:')} {cyan(len(chain_counts))}")
+            if VERBOSE:
+                print(f"{green('[OK]')} {bold('Rule chains found:')} {cyan(len(chain_counts))}")
 
-        print(f"\n{blue('=' * 60)}")
-        print(f"{bold('FINAL CLEANUP')}")
-        print(f"{blue('=' * 60)}")
+        if VERBOSE:
+            print(f"\n{blue('=' * 60)}")
+            print(f"{bold('FINAL CLEANUP')}")
+            print(f"{blue('=' * 60)}")
         validated_counts = Counter()
         for rule, cnt in all_counts.items():
             if HashcatRuleValidator.validate_rule_for_gpu(rule):
@@ -1984,10 +2062,11 @@ __kernel void find_rule_chains_gpu(
 # ====================================================================
 def load_wordlist_fast(filename):
     words = set()
-    print(f"{blue('[LOAD]')} {bold('Loading:')} {filename}")
+    if VERBOSE:
+        print(f"{blue('[LOAD]')} {bold('Loading:')} {filename}")
     try:
         with open(filename, 'r', encoding='latin-1', errors='ignore') as f:
-            for line in tqdm(f, desc="Loading words"):
+            for line in tqdm(f, desc="Loading words", disable=False):
                 word = line.strip()
                 if word and len(word) <= MAX_WORD_LEN:
                     words.add(word)
@@ -2000,9 +2079,10 @@ def load_wordlist_fast(filename):
         max_len = max(len(w) for w in words_list)
     else:
         avg_len = max_len = 0
-    print(f"{green('[OK]')} {bold('Loaded:')} {cyan(f'{len(words_list):,}')} {bold('words')}")
-    print(f"{blue('[INFO]')} {bold('Average length:')} {cyan(f'{avg_len:.1f}')}")
-    print(f"{blue('[INFO]')} {bold('Max length:')} {cyan(f'{max_len}')}")
+    if VERBOSE:
+        print(f"{green('[OK]')} {bold('Loaded:')} {cyan(f'{len(words_list):,}')} {bold('words')}")
+        print(f"{blue('[INFO]')} {bold('Average length:')} {cyan(f'{avg_len:.1f}')}")
+        print(f"{blue('[INFO]')} {bold('Max length:')} {cyan(f'{max_len}')}")
     return words_list
 
 # ====================================================================
@@ -2022,9 +2102,15 @@ if __name__ == '__main__':
     parser.add_argument('--seed-rules', type=str, default=None, help='File containing seed rules/chains')
     parser.add_argument('--list-devices', action='store_true', help='List OpenCL devices and exit')
     parser.add_argument('--device', type=str, default=None, help='Device index or substring')
+    parser.add_argument('--allow-reject-rules', action='store_true', help='Include reject rules (e.g. !X, ?NX, vNX) in generation (GPU will ignore them)')
+    parser.add_argument('--debug', action='store_true', help='Enable verbose output (detailed generation info, validation messages)')
     for i in range(2, 11):
         parser.add_argument(f'--depth{i}-chains', type=int, default=None, help=f'Override depth {i} chain limit')
     args = parser.parse_args()
+
+    # Set global flags
+    ALLOW_REJECT_RULES = args.allow_reject_rules
+    VERBOSE = args.debug          # verbose mode enabled by --debug
 
     if args.list_devices:
         list_devices()
@@ -2041,19 +2127,22 @@ if __name__ == '__main__':
     if args.max_depth > 12:
         print(f"{yellow('[WARN]')} Very high depth may exhaust memory/time. Proceed with caution.")
 
-    print(f"\n{bold(green('=' * 80))}")
-    print(f"{bold('GPU-COMPATIBLE HASHCAT RULES ENGINE WITH HIT COUNTING & SEEDING')}")
-    print(f"{bold(green('=' * 80))}{Colors.END}\n")
+    if VERBOSE:
+        print(f"\n{bold(green('=' * 80))}")
+        print(f"{bold('GPU-COMPATIBLE HASHCAT RULES ENGINE WITH HIT COUNTING & SEEDING')}")
+        print(f"{bold(green('=' * 80))}{Colors.END}\n")
 
-    print(f"{blue('[INIT]')} {bold('Loading data...')}")
+    if VERBOSE:
+        print(f"{blue('[INIT]')} {bold('Loading data...')}")
     base_words = load_wordlist_fast(args.base_wordlist)
     target_words = load_wordlist_fast(args.target_wordlist)
 
-    print(f"\n{blue('[ANALYSIS]')} {bold('Dataset Analysis:')}")
-    print(f"  {cyan('[*]')} Base words: {len(base_words):,}")
-    print(f"  {cyan('[*]')} Target words: {len(target_words):,}")
-    print(f"  {cyan('[*]')} Processing ALL words")
-    print(f"  {cyan('[*]')} Target completion: {args.target_hours} hours")
+    if VERBOSE:
+        print(f"\n{blue('[ANALYSIS]')} {bold('Dataset Analysis:')}")
+        print(f"  {cyan('[*]')} Base words: {len(base_words):,}")
+        print(f"  {cyan('[*]')} Target words: {len(target_words):,}")
+        print(f"  {cyan('[*]')} Processing ALL words")
+        print(f"  {cyan('[*]')} Target completion: {args.target_hours} hours")
 
     start_time = time.time()
     extractor = GPUExtractor(
@@ -2063,14 +2152,15 @@ if __name__ == '__main__':
         args.seed_rules
     )
 
-    if args.max_chains:
-        print(f"{blue('[OVERRIDE]')} {bold('Max chains set to:')} {cyan(args.max_chains)}")
-    else:
-        print(f"{blue('[OVERRIDE]')} {bold('Max chains:')} {cyan('unlimited')}")
+    if VERBOSE:
+        if args.max_chains:
+            print(f"{blue('[OVERRIDE]')} {bold('Max chains set to:')} {cyan(args.max_chains)}")
+        else:
+            print(f"{blue('[OVERRIDE]')} {bold('Max chains:')} {cyan('unlimited')}")
 
-    print(f"\n{blue('=' * 60)}")
-    print(f"{bold('STARTING GPU-COMPATIBLE RULE EXTRACTION')}")
-    print(f"{blue('=' * 60)}")
+        print(f"\n{blue('=' * 60)}")
+        print(f"{bold('STARTING GPU-COMPATIBLE RULE EXTRACTION')}")
+        print(f"{blue('=' * 60)}")
 
     depth_overrides = {}
     for i in range(2, 11):
@@ -2083,7 +2173,8 @@ if __name__ == '__main__':
     end_time = time.time()
     elapsed_hours = (end_time - start_time) / 3600
 
-    print(f"\n{blue('[SAVE]')} {bold('Saving results...')}")
+    if VERBOSE:
+        print(f"\n{blue('[SAVE]')} {bold('Saving results...')}")
     if ":" not in rule_counts:
         rule_counts[":"] = 0
     sorted_items = sorted(rule_counts.items(), key=lambda x: (-x[1], x[0]))
@@ -2097,24 +2188,24 @@ if __name__ == '__main__':
             if rule != ":":
                 f.write(f"{rule}\n")
 
-    print(f"\n{bold(green('=' * 80))}")
-    print(f"{bold('FINAL RESULTS')}")
-    print(f"{bold(green('=' * 80))}")
-    print(f"{blue('[INFO]')} {bold('Base words:')} {cyan(f'{len(base_words):,}')}")
-    print(f"{blue('[INFO]')} {bold('Target words:')} {cyan(f'{len(target_words):,}')}")
-    print(f"{blue('[INFO]')} {bold('Max depth:')} {cyan(f'{args.max_depth}')}")
-    print(f"{blue('[INFO]')} {bold('Total time:')} {cyan(f'{elapsed_hours:.2f} hours ({end_time - start_time:.2f}s)')}")
-    print(f"{blue('[INFO]')} {bold('Target time:')} {cyan(f'{args.target_hours} hours')}")
-    print(f"{green('[RESULT]')} {bold('GPU-compatible rules found:')} {cyan(f'{len(rule_counts)}')}")
-    print(f"{green('[RESULT]')} {bold('Total hits:')} {cyan(f'{sum(rule_counts.values()):,}')}")
+    if VERBOSE:
+        print(f"\n{bold(green('=' * 80))}")
+        print(f"{bold('FINAL RESULTS')}")
+        print(f"{bold(green('=' * 80))}")
+        print(f"{blue('[INFO]')} {bold('Base words:')} {cyan(f'{len(base_words):,}')}")
+        print(f"{blue('[INFO]')} {bold('Target words:')} {cyan(f'{len(target_words):,}')}")
+        print(f"{blue('[INFO]')} {bold('Max depth:')} {cyan(f'{args.max_depth}')}")
+        print(f"{blue('[INFO]')} {bold('Total time:')} {cyan(f'{elapsed_hours:.2f} hours ({end_time - start_time:.2f}s)')}")
+        print(f"{blue('[INFO]')} {bold('Target time:')} {cyan(f'{args.target_hours} hours')}")
+        print(f"{green('[RESULT]')} {bold('GPU-compatible rules found:')} {cyan(f'{len(rule_counts)}')}")
+        print(f"{green('[RESULT]')} {bold('Total hits:')} {cyan(f'{sum(rule_counts.values()):,}')}")
 
-    if sorted_items:
-        print(f"{blue('[SAMPLE]')} {bold('Top 20 most frequent rules:')}")
-        for i, (rule, count) in enumerate(sorted_items[:20]):
-            depth = len(rule.split())
-            print(f"  {cyan(f'{i+1:2d}.')} [{depth}] {rule} (hits: {count})")
+        if sorted_items:
+            print(f"{blue('[SAMPLE]')} {bold('Top 20 most frequent rules:')}")
+            for i, (rule, count) in enumerate(sorted_items[:20]):
+                depth = len(rule.split())
+                print(f"  {cyan(f'{i+1:2d}.')} [{depth}] {rule} (hits: {count})")
 
-    print(f"{blue('[OUTPUT]')} {bold('Output saved to:')} {bold(args.output)}")
-    print(f"{blue('[NOTE]')} {bold('All rules are GPU-compatible and syntactically valid for Hashcat')}")
-    print(f"{bold(green('=' * 80))}{Colors.END}")
-
+        print(f"{blue('[OUTPUT]')} {bold('Output saved to:')} {bold(args.output)}")
+        print(f"{blue('[NOTE]')} {bold('All rules are GPU-compatible and syntactically valid for Hashcat')}")
+        print(f"{bold(green('=' * 80))}{Colors.END}")
