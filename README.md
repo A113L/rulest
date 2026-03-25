@@ -73,7 +73,7 @@ A complete redesign built around GPU efficiency, Hashcat compatibility, and inte
 | Aspect | v1 (`rulest.py`) | v2 (`rulest_v2.py`) |
 |---|---|---|
 | **Rule validation** | None — invalid rules passed to Hashcat | Full `HashcatRuleValidator` against GPU spec (max 255 ops) |
-| **Rule set size** | ~2,700 static rules | 13,321 GPU-validated Hashcat single rules across 9 categories |
+| **Rule set size** | ~2,700 static rules | 5,645 GPU-validated Hashcat single rules across 9 categories |
 | **Search strategy** | Naive BFS — every rule applied blindly | Phase 1 single-rule sweep → Phase 2 hot-biased chain generation |
 | **Target lookup** | Python `set` (host RAM, per-result) | 64 MB Bloom filter uploaded once to GPU VRAM (FNV-1a, 4 hash functions) |
 | **Chain state** | Temp `.tmp` files on disk per depth | In-memory, GPU buffer-based with proper release and `gc.collect()` |
