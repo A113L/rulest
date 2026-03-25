@@ -87,32 +87,17 @@ FNV1A_OFFSET_BASIS = 2166136261
 FNV1A_SEED1 = 0xDEADBEEF
 FNV1A_SEED2 = 0xCAFEBABE
 
-# ====================================================================
-# --- HELPER: Identify rejection rules ---
-# ====================================================================
-def is_rejection_rule(rule: str) -> bool:
-    """Return True if rule is a Hashcat rejection rule (e.g., !X, ?NX, (X, etc.)"""
-    if not rule:
-        return False
-    # Single‑character rejection rules (Q in some kernels)
-    if len(rule) == 1 and rule in ('Q',):
-        return True
-    # Two‑character rejection rules: !X, /X, (X, )X, <N, >N, _N
-    if len(rule) == 2 and rule[0] in ('!', '/', '(', ')', '<', '>', '_'):
-        return True
-    # Three‑character rejection rules: ?NX, =NX
-    if len(rule) == 3 and rule[0] in ('?', '='):
-        return True
-    return False
+# Hashcat rule limits
+MAX_GPU_RULES = 255                    # Hard limit from Hashcat's GPU implementation
 
 # ====================================================================
-# --- HASHCAT RULE VALIDATION (UPDATED FOR FULL KERNEL) ---
+# --- HASHCAT RULE VALIDATION (GPU COMPATIBILITY) ---
 # ====================================================================
 
 class HashcatRuleValidator:
-    """Validates rules according to the complete kernel implementation"""
+    """Validates rules according to Hashcat's official GPU compatibility"""
 
-    MAX_GPU_RULES = 255
+    MAX_GPU_RULES = MAX_GPU_RULES
 
     @staticmethod
     def is_digit(c):
@@ -134,11 +119,7 @@ class HashcatRuleValidator:
 
     @staticmethod
     def validate_rule_for_gpu(rule_str):
-        """Validate rule for GPU compatibility using the kernel's full rule set"""
-        # Reject rejection rules early
-        if is_rejection_rule(rule_str):
-            return False
-
+        """Validate rule for GPU compatibility (max 255 ops, correct arguments)"""
         line_len = len(rule_str)
         pos = 0
         cnt = 0
@@ -150,28 +131,63 @@ class HashcatRuleValidator:
                 pos += 1
                 continue
 
-            # --- Single‑character rules (no arguments) ---
-            if c in (':', 'l', 'u', 'c', 'C', 't', 'r', 'd', 'f', 'k', 'K',
-                     'z', 'Z', 'q', 'E', '[', ']', '{', '}', 'M', '4', '6', '_', 'Q'):
+            # --- Commands with no arguments ---
+            if c in (':', 'l', 'u', 'c', 'C', 't', 'r', 'd', 'f', 'a', 'q', 'k', 'K', 'E',
+                     '{', '}', '[', ']'):
                 pos += 1
 
-            # --- Two‑character rules (one digit or a character) ---
-            elif c in ('T', 'D', 'L', 'R', '+', '-', '.', ',', '^', '$', '@',
-                       '!', '/', 'p', '(', ')', '<', '>', '_', 'y', 'Y', "'"):
+            # --- Commands with one decimal digit ---
+            elif c in ('T', 'D', 'L', 'R', '+', '-', '.', ',', "'", 'z', 'Z', 'y', 'Y'):
                 pos += 1
-                if pos >= line_len:
+                if pos >= line_len or not HashcatRuleValidator.is_digit(rule_str[pos]):
                     return False
                 pos += 1
 
-            # --- Three‑character rules (sXY, *nm, xnm, Onm, iNX, oNX, ?NX, =NX, eX, 3NX, vNX) ---
-            elif c in ('s', '*', 'x', 'O', 'i', 'o', '?', '=', 'e', '3', 'v'):
+            # --- Commands with one digit and then a character (any) ---
+            elif c in ('i', 'o', '3'):                         # Added '3' for toggle after Nth separator
                 pos += 1
-                if pos >= line_len:
+                if pos >= line_len or not HashcatRuleValidator.is_digit(rule_str[pos]):
                     return False
                 pos += 1
-                if pos >= line_len:
+                if pos >= line_len:   # need the character
                     return False
                 pos += 1
+
+            # --- Commands with two decimal digits ---
+            elif c in ('x', '*', 'O'):                         # Added 'O' for omit range
+                pos += 1
+                if pos >= line_len or not HashcatRuleValidator.is_digit(rule_str[pos]):
+                    return False
+                pos += 1
+                if pos >= line_len or not HashcatRuleValidator.is_digit(rule_str[pos]):
+                    return False
+                pos += 1
+
+            # --- p : duplicate word times (one digit) ---
+            elif c == 'p':
+                pos += 1
+                if pos >= line_len or not HashcatRuleValidator.is_digit(rule_str[pos]):
+                    return False
+                pos += 1
+
+            # --- s : substitution (two chars) ---
+            elif c == 's':
+                pos += 1
+                if pos >= line_len: return False
+                pos += 1
+                if pos >= line_len: return False
+                pos += 1
+
+            # --- Commands with one character (no digit) ---
+            elif c in ('@', 'e', '$', '^'):
+                pos += 1
+                if pos >= line_len: return False
+                pos += 1
+
+            # --- Memory / reject rules (not supported on GPU) ---
+            elif c in ('X', '4', '6', 'M', 'v', '3',           # memory rules
+                       '<', '>', '!', '/', '(', ')', '=', '%', 'Q', '?'):
+                return False
 
             else:
                 # Unknown command
@@ -208,7 +224,7 @@ def fnv1a_32(data, seed=FNV1A_SEED1):
     return h
 
 # ====================================================================
-# --- GPU DEVICE SELECTION (unchanged) ---
+# --- GPU DEVICE SELECTION ---
 # ====================================================================
 
 def get_all_devices():
@@ -326,7 +342,7 @@ def estimate_free_vram(device):
         return 1 * 1024**3
 
 # ====================================================================
-# --- DYNAMIC CONSTANTS CALCULATION (unchanged) ---
+# --- DYNAMIC CONSTANTS CALCULATION ---
 # ====================================================================
 
 def calculate_dynamic_parameters(base_count, target_count, device=None, target_hours=0.5):
@@ -430,117 +446,103 @@ def calculate_dynamic_parameters(base_count, target_count, device=None, target_h
     }
 
 # ====================================================================
-# --- GPU-COMPATIBLE HASHCAT RULES GENERATION (UPDATED) ---
+# --- GPU-COMPATIBLE HASHCAT RULES GENERATION ---
 # ====================================================================
 
 class GPUCompatibleRulesGenerator:
-    """Generate ALL rules supported by the provided Hashcat kernel"""
+    """Generate ONLY GPU-compatible Hashcat rules"""
 
     def __init__(self):
         self.validator = HashcatRuleValidator()
 
     def generate_gpu_compatible_rules(self):
-        """Generate all GPU-compatible Hashcat rules as per the kernel"""
+        """Generate GPU-compatible Hashcat rules only"""
         rules = set()
 
-        print(f"{blue('[SETUP]')} {bold('Generating full Hashcat rules (kernel-compatible)...')}")
+        print(f"{blue('[SETUP]')} {bold('Generating GPU-compatible Hashcat rules...')}")
 
-        # ===== SINGLE-CHAR RULES =====
-        print(f"  {cyan('[*]')} Single-character rules...")
-        single_rules = [
-            ':', 'l', 'u', 'c', 'C', 't', 'r', 'd', 'f', 'k', 'K',
-            'z', 'Z', 'q', 'E', '[', ']', '{', '}', 'M', '4', '6', '_', 'Q'
+        # ===== CATEGORY 1: SIMPLE RULES =====
+        print(f"  {cyan('[*]')} Simple rules...")
+        simple_rules = [
+            'l', 'u', 'c', 'C', 't', 'r', 'd', 'f', 'p', 'z', 'Z', 'q', 'E',
+            '{', '}', '[', ']', 'k', 'K', ':'
         ]
-        rules.update(single_rules)
+        rules.update(simple_rules)
 
-        # ===== TWO-CHARACTER RULES =====
-        print(f"  {cyan('[*]')} Two-character rules...")
+        # ===== CATEGORY 2: POSITION-BASED RULES (decimal digits) =====
+        print(f"  {cyan('[*]')} Position-based rules (0-9 only)...")
         digits = '0123456789'
-        ascii_printable = ''.join(chr(i) for i in range(32, 127))
 
-        # Position-based with digit
-        for cmd in ['T', 'D', 'L', 'R', '+', '-', '.', ',']:
+        position_cmds = ['T', 'D', 'L', 'R', '+', '-', '.', ',', "'", 'z', 'Z', 'y', 'Y']
+        for cmd in position_cmds:
             for pos in digits:
                 rules.add(f'{cmd}{pos}')
 
-        # Prepend/Append
-        for cmd in ['^', '$']:
-            for ch in ascii_printable:
-                rules.add(f'{cmd}{ch}')
+        # Two position rules (both digits)
+        for cmd in ['x', '*', 'O']:               # Added 'O' for omit range
+            for pos1 in digits:
+                for pos2 in digits:
+                    rules.add(f'{cmd}{pos1}{pos2}')
 
-        # Delete all instances
-        for ch in ascii_printable:
-            rules.add(f'@{ch}')
+        # ===== CATEGORY 3: PREFIX/SUFFIX =====
+        print(f"  {cyan('[*]')} Prefix/suffix rules...")
+        for i in range(32, 127):
+            char = chr(i)
+            rules.add(f'^{char}')
+            rules.add(f'${char}')
+            rules.add(f'@{char}')
 
-        # Reject if contains / does not contain
-        for cmd in ['!', '/']:
-            for ch in ascii_printable:
-                rules.add(f'{cmd}{ch}')
+        # ===== CATEGORY 4: SUBSTITUTIONS (sXY) =====
+        print(f"  {cyan('[*]')} Substitution rules...")
+        leet_subs = [
+            ('a', '@'), ('a', '4'), ('e', '3'), ('i', '1'), ('o', '0'),
+            ('s', '$'), ('s', '5'), ('t', '7'), ('l', '1'), ('g', '9'),
+            ('b', '8'), ('z', '2')
+        ]
+        for orig, sub in leet_subs:
+            rules.add(f's{orig}{sub}')
 
-        # Duplicate word N times (pN)
-        for n in digits:
-            rules.add(f'p{n}')
-
-        # Reject if first/last character != X
-        for cmd in ['(', ')']:
-            for ch in ascii_printable:
-                rules.add(f'{cmd}{ch}')
-
-        # Length comparisons
-        for cmd in ['<', '>', '_']:
-            for n in digits:
-                rules.add(f'{cmd}{n}')
-
-        # Duplicate first/last N characters (yN, YN)
-        for cmd in ['y', 'Y']:
-            for n in digits:
-                rules.add(f'{cmd}{n}')
-
-        # Truncate at position N (apostrophe N)
-        for n in digits:
-            rules.add(f"'{n}")
-
-        # ===== THREE-CHARACTER RULES =====
-        print(f"  {cyan('[*]')} Three-character rules...")
-        digits = '0123456789'
-
-        # Substitution sXY
-        for orig in ascii_printable:
-            for sub in ascii_printable:
+        for orig in string.ascii_lowercase + string.ascii_uppercase:
+            for sub in string.digits + string.punctuation:
                 if orig != sub:
                     rules.add(f's{orig}{sub}')
 
-        # Swap *nm, extract xnm, omit Onm
-        for cmd in ['*', 'x', 'O']:
-            for n in digits:
-                for m in digits:
-                    rules.add(f'{cmd}{n}{m}')
+        # ===== CATEGORY 5: INSERTION/OVERWRITE =====
+        print(f"  {cyan('[*]')} Insertion/overwrite rules...")
+        for pos in digits:
+            for char in string.ascii_letters + string.digits + '!@#$%^&*()_+-=[]{}|;:,.<>?/~':
+                rules.add(f'i{pos}{char}')
+                rules.add(f'o{pos}{char}')
 
-        # Insert iNX, overwrite oNX
-        for cmd in ['i', 'o']:
-            for n in digits:
-                for ch in ascii_printable:
-                    rules.add(f'{cmd}{n}{ch}')
-
-        # Reject ?NX (if char at N != X) and =NX (if char at N == X)
-        for cmd in ['?', '=']:
-            for n in digits:
-                for ch in ascii_printable:
-                    rules.add(f'{cmd}{n}{ch}')
-
-        # Title case with separator eX
-        for ch in ascii_printable:
-            rules.add(f'e{ch}')
-
-        # Toggle after Nth separator 3NX
+        # ===== CATEGORY 6: EXTRACTION/SWAP =====
+        print(f"  {cyan('[*]')} Extraction/swap rules...")
         for n in digits:
-            for ch in ascii_printable:
-                rules.add(f'3{n}{ch}')
+            for m in digits:
+                if n != m:
+                    rules.add(f'x{n}{m}')
+                    rules.add(f'*{n}{m}')
+                # Also add O (omit) for all combos (including n==m?) O works with any n,m
+                rules.add(f'O{n}{m}')           # Add O rules for all digit pairs
 
-        # Insert every N characters vNX
-        #for n in digits:
-        #    for ch in ascii_printable:
-        #        rules.add(f'v{n}{ch}')
+        # ===== CATEGORY 7: DUPLICATION =====
+        print(f"  {cyan('[*]')} Duplication rules...")
+        for n in range(1, 10):
+            rules.add(f'p{n}')
+            rules.add(f'y{n}')
+            rules.add(f'Y{n}')
+            rules.add(f'z{n}')
+            rules.add(f'Z{n}')
+
+        # ===== CATEGORY 8: TITLE CASE WITH SEPARATOR =====
+        print(f"  {cyan('[*]')} Title case rules...")
+        for separator in [' ', '-', '_', '.', ',', ';', ':', '|', '/', '\\', '+', '*', '&', '^', '%', '$', '#', '@', '!', '~', '`']:
+            rules.add(f'e{separator}')
+
+        # ===== CATEGORY 9: TOGGLE AFTER NTH SEPARATOR (3NX) =====
+        print(f"  {cyan('[*]')} Toggle after Nth separator rules...")
+        for n in digits:
+            for separator in string.ascii_letters + string.digits + '!@#$%^&*()_+-=[]{}|;:,.<>?/~':
+                rules.add(f'3{n}{separator}')
 
         # Convert to list and validate
         rules_list = list(rules)
@@ -552,25 +554,15 @@ class GPUCompatibleRulesGenerator:
                 if 1 <= len(rule) <= MAX_RULE_LEN:
                     valid_rules.append(rule)
 
-        # --- NEW: Exclude rejection rules (and optionally vNX) ---
-        print(f"  {cyan('[*]')} Filtering out rejection rules...")
-        filtered_rules = [r for r in valid_rules if not is_rejection_rule(r)]
-
-        # If you also want to exclude the 'vNX' rule, uncomment the next line:
-        # filtered_rules = [r for r in filtered_rules if not r.startswith('v')]
-
-        print(f"  {green('[OK]')} Removed {len(valid_rules) - len(filtered_rules)} rejection rules.")
-        # ---------------------------------------------------------
-
-        print(f"{green('[OK]')} {bold('Generated:')} {cyan(f'{len(filtered_rules):,}')} {bold('GPU-compatible Hashcat rules')}")
-        return filtered_rules
+        print(f"{green('[OK]')} {bold('Generated:')} {cyan(f'{len(valid_rules):,}')} {bold('GPU-compatible Hashcat rules')}")
+        return valid_rules
 
 # ====================================================================
-# --- GPU ENGINE WITH UPDATED KERNEL (FULL RULE SET) ---
+# --- GPU ENGINE WITH DYNAMIC WORKLOAD PROCESSING ---
 # ====================================================================
 
 class GPUEngine:
-    """GPU-accelerated engine with dynamic workload processing and full rule set"""
+    """GPU-accelerated engine with dynamic workload processing"""
 
     def __init__(self, params):
         self.params = params
@@ -632,12 +624,13 @@ class GPUEngine:
             return False
 
     def compile_kernel(self):
-        """Compile the GPU kernel with full rule set"""
+        """Compile the GPU kernel with injected constants"""
         try:
-            print(f"{blue('[SETUP]')} {bold('Compiling GPU-compatible kernel (full rule set)...')}")
+            print(f"{blue('[SETUP]')} {bold('Compiling GPU-compatible kernel...')}")
 
             # Use a template and format with dynamic values
-            kernel_source = GPU_COMPATIBLE_KERNEL_TEMPLATE.format(
+            kernel_template = GPU_COMPATIBLE_KERNEL_TEMPLATE
+            kernel_source = kernel_template.format(
                 BLOOM_FILTER_SIZE=self.params['BLOOM_FILTER_SIZE'],
                 MAX_SAFE_RESULTS_PER_BATCH=self.params['MAX_SAFE_RESULTS_PER_BATCH'],
                 MAX_CHAIN_DEPTH=self.params['MAX_CHAIN_DEPTH'],
@@ -852,12 +845,11 @@ class GPUEngine:
             return batch_found
 
         except Exception as e:
-            print(f"{yellow('[WARN]')} GPU single‑rule processing failed: {e}")
-            # Recreate command queue to recover
-            self.queue = cl.CommandQueue(self.context)
+            print(f"{yellow('[WARN]')} GPU processing failed: {e}")
             return []
         finally:
-            # release buffers
+            self.queue.finish()
+            # Release buffers (list comprehension to avoid NameError)
             for buf in (base_buf, base_offsets_buf, base_lengths_buf,
                         rules_buf, rule_offsets_buf, rule_lengths_buf,
                         found_rules_buf, found_count_buf):
@@ -1172,11 +1164,9 @@ class GPUEngine:
 
         except Exception as e:
             print(f"{yellow('[WARN]')} GPU chain processing failed: {e}")
-            # Recreate command queue to recover
-            self.queue = cl.CommandQueue(self.context)
             return []
         finally:
-            # release buffers
+            self.queue.finish()
             for buf in (base_buf, base_offsets_buf, base_lengths_buf,
                         rules_buf, rule_offsets_buf, rule_lengths_buf,
                         chain_seq_buf, chain_depth_buf,
@@ -1187,7 +1177,7 @@ class GPUEngine:
                     pass
 
 # ====================================================================
-# --- GPU EXTRACTOR (unchanged except for rule generation) ---
+# --- GPU EXTRACTOR ---
 # ====================================================================
 
 class GPUExtractor:
@@ -1352,7 +1342,7 @@ class GPUExtractor:
         return validated_counts
 
 # ====================================================================
-# --- GPU KERNEL TEMPLATE (FULL RULE SET, INTEGRATED WITH BLOOM FILTER) ---
+# --- GPU KERNEL TEMPLATE (with placeholders) ---
 # ====================================================================
 
 GPU_COMPATIBLE_KERNEL_TEMPLATE = """
@@ -1379,6 +1369,38 @@ uint fnv1a_32_local(const unsigned char *data, int len, uint seed) {{
 }}
 
 // ============================================================================
+// UTILITY FUNCTIONS
+// ============================================================================
+
+inline int is_lower(unsigned char c) {{
+    return (c >= 'a' && c <= 'z');
+}}
+
+inline int is_upper(unsigned char c) {{
+    return (c >= 'A' && c <= 'Z');
+}}
+
+inline int is_digit(unsigned char c) {{
+    return (c >= '0' && c <= '9');
+}}
+
+inline unsigned char to_lower(unsigned char c) {{
+    if (is_upper(c)) return c + 32;
+    return c;
+}}
+
+inline unsigned char to_upper(unsigned char c) {{
+    if (is_lower(c)) return c - 32;
+    return c;
+}}
+
+inline unsigned char toggle_case(unsigned char c) {{
+    if (is_lower(c)) return c - 32;
+    if (is_upper(c)) return c + 32;
+    return c;
+}}
+
+// ============================================================================
 // BLOOM FILTER CHECK
 // ============================================================================
 
@@ -1399,71 +1421,25 @@ int bloom_check(__global const uchar *bloom_filter, const unsigned char *word, i
 }}
 
 // ============================================================================
-// UTILITY FUNCTIONS (from full Hashcat kernel)
+// GPU-COMPATIBLE RULE APPLICATION (SAFE FOR OPENCL)
 // ============================================================================
 
-int is_lower(unsigned char c) {{
-    return (c >= 'a' && c <= 'z');
-}}
-
-int is_upper(unsigned char c) {{
-    return (c >= 'A' && c <= 'Z');
-}}
-
-int is_digit(unsigned char c) {{
-    return (c >= '0' && c <= '9');
-}}
-
-int is_alnum(unsigned char c) {{
-    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9');
-}}
-
-unsigned char toggle_case(unsigned char c) {{
-    if (is_lower(c)) return c - 32;
-    if (is_upper(c)) return c + 32;
-    return c;
-}}
-
-unsigned char to_lower(unsigned char c) {{
-    if (is_upper(c)) return c + 32;
-    return c;
-}}
-
-unsigned char to_upper(unsigned char c) {{
-    if (is_lower(c)) return c - 32;
-    return c;
-}}
-
-// Count occurrences of character X in a string
-int count_char(const unsigned char* str, int len, unsigned char x) {{
-    int cnt = 0;
-    for (int i = 0; i < len; i++) {{
-        if (str[i] == x) cnt++;
-    }}
-    return cnt;
-}}
-
-// ============================================================================
-// RULE APPLICATION (COMPLETE HASHCAT RULE ENGINE)
-// ============================================================================
-
-// Returns: 1 if the rule was applied (word may be changed or unchanged), 0 if the rule rejected the word.
 int apply_gpu_rule(
     const unsigned char *rule_str, int rule_len,
     const unsigned char *input_word, int input_len,
     unsigned char *output_word, int *output_len
 ) {{
-    // Start with the input word
+    // Initialize with input
+    *output_len = input_len;
     for (int i = 0; i < input_len; i++) {{
         output_word[i] = input_word[i];
     }}
     output_word[input_len] = '\\0';
-    *output_len = input_len;
-    int changed = 0;   // 0 = no change, 1 = changed, -1 = reject
 
-    if (rule_len == 0) return 1; // no rule, accept as is
+    if (rule_len == 0 || input_len == 0) return 1;
 
     unsigned char cmd = rule_str[0];
+    int changed = 0;
 
     // ------------------------------------------------------------------------
     // SINGLE CHARACTER RULES
@@ -1471,103 +1447,122 @@ int apply_gpu_rule(
     if (rule_len == 1) {{
         switch (cmd) {{
             case 'l': // Lowercase all
-                for (int i = 0; i < *output_len; i++) output_word[i] = to_lower(output_word[i]);
+                for (int i = 0; i < *output_len; i++) {{
+                    output_word[i] = to_lower(output_word[i]);
+                }}
                 changed = 1;
                 break;
             case 'u': // Uppercase all
-                for (int i = 0; i < *output_len; i++) output_word[i] = to_upper(output_word[i]);
+                for (int i = 0; i < *output_len; i++) {{
+                    output_word[i] = to_upper(output_word[i]);
+                }}
                 changed = 1;
                 break;
             case 'c': // Capitalize first, lowercase rest
                 if (*output_len > 0) {{
                     output_word[0] = to_upper(output_word[0]);
-                    for (int i = 1; i < *output_len; i++) output_word[i] = to_lower(output_word[i]);
+                    for (int i = 1; i < *output_len; i++) {{
+                        output_word[i] = to_lower(output_word[i]);
+                    }}
                 }}
                 changed = 1;
                 break;
             case 'C': // Lowercase first, uppercase rest
                 if (*output_len > 0) {{
                     output_word[0] = to_lower(output_word[0]);
-                    for (int i = 1; i < *output_len; i++) output_word[i] = to_upper(output_word[i]);
+                    for (int i = 1; i < *output_len; i++) {{
+                        output_word[i] = to_upper(output_word[i]);
+                    }}
                 }}
                 changed = 1;
                 break;
-            case 't': // Toggle case all
-                for (int i = 0; i < *output_len; i++) output_word[i] = toggle_case(output_word[i]);
+            case 't': // Toggle case
+                for (int i = 0; i < *output_len; i++) {{
+                    output_word[i] = toggle_case(output_word[i]);
+                }}
                 changed = 1;
                 break;
             case 'r': // Reverse
                 for (int i = 0; i < *output_len / 2; i++) {{
-                    unsigned char tmp = output_word[i];
+                    unsigned char temp = output_word[i];
                     output_word[i] = output_word[*output_len - 1 - i];
-                    output_word[*output_len - 1 - i] = tmp;
+                    output_word[*output_len - 1 - i] = temp;
                 }}
                 changed = 1;
                 break;
-            case 'k': // Swap first two
-                if (*output_len >= 2) {{
-                    unsigned char tmp = output_word[0];
-                    output_word[0] = output_word[1];
-                    output_word[1] = tmp;
-                    changed = 1;
-                }}
-                break;
-            case 'K': // Swap last two
-                if (*output_len >= 2) {{
-                    unsigned char tmp = output_word[*output_len - 2];
-                    output_word[*output_len - 2] = output_word[*output_len - 1];
-                    output_word[*output_len - 1] = tmp;
-                    changed = 1;
-                }}
-                break;
-            case ':': // Identity
-                changed = 0;
-                break;
-            case 'd': // Duplicate whole word
+            case 'd': // Duplicate
                 if (*output_len * 2 <= MAX_OUTPUT_LEN) {{
                     for (int i = 0; i < *output_len; i++) {{
                         output_word[*output_len + i] = output_word[i];
                     }}
                     *output_len *= 2;
-                    changed = 1;
                 }}
+                changed = 1;
                 break;
-            case 'f': // Reflect (word + reverse)
+            case 'f': // Reflect
                 if (*output_len * 2 <= MAX_OUTPUT_LEN) {{
                     for (int i = 0; i < *output_len; i++) {{
                         output_word[*output_len + i] = output_word[*output_len - 1 - i];
                     }}
                     *output_len *= 2;
-                    changed = 1;
                 }}
+                changed = 1;
                 break;
-            case 'p': // Pluralize (add 's')
-                if (*output_len + 1 <= MAX_OUTPUT_LEN) {{
-                    output_word[*output_len] = 's';
-                    (*output_len)++;
-                    changed = 1;
-                }}
-                break;
-            case 'z': // Duplicate first character
-                if (*output_len + 1 <= MAX_OUTPUT_LEN) {{
+            case '{{': // Rotate left
+                if (*output_len > 1) {{
                     unsigned char first = output_word[0];
-                    for (int i = *output_len; i > 0; i--) {{
-                        output_word[i] = output_word[i-1];
+                    for (int i = 0; i < *output_len - 1; i++) {{
+                        output_word[i] = output_word[i + 1];
                     }}
-                    output_word[0] = first;
-                    (*output_len)++;
-                    changed = 1;
+                    output_word[*output_len - 1] = first;
                 }}
+                changed = 1;
                 break;
-            case 'Z': // Duplicate last character
-                if (*output_len + 1 <= MAX_OUTPUT_LEN) {{
+            case '}}': // Rotate right
+                if (*output_len > 1) {{
                     unsigned char last = output_word[*output_len - 1];
-                    output_word[*output_len] = last;
-                    (*output_len)++;
-                    changed = 1;
+                    for (int i = *output_len - 1; i > 0; i--) {{
+                        output_word[i] = output_word[i - 1];
+                    }}
+                    output_word[0] = last;
                 }}
+                changed = 1;
                 break;
-            case 'q': // Duplicate every character
+            case '[': // Delete first char
+                if (*output_len > 0) {{
+                    for (int i = 0; i < *output_len - 1; i++) {{
+                        output_word[i] = output_word[i + 1];
+                    }}
+                    (*output_len)--;
+                }}
+                changed = 1;
+                break;
+            case ']': // Delete last char
+                if (*output_len > 0) {{
+                    (*output_len)--;
+                }}
+                changed = 1;
+                break;
+            case 'k': // Swap first two
+                if (*output_len >= 2) {{
+                    unsigned char temp = output_word[0];
+                    output_word[0] = output_word[1];
+                    output_word[1] = temp;
+                }}
+                changed = 1;
+                break;
+            case 'K': // Swap last two
+                if (*output_len >= 2) {{
+                    unsigned char temp = output_word[*output_len - 2];
+                    output_word[*output_len - 2] = output_word[*output_len - 1];
+                    output_word[*output_len - 1] = temp;
+                }}
+                changed = 1;
+                break;
+            case ':': // No operation
+                changed = 0;
+                break;
+            case 'q': // Duplicate all chars
                 if (*output_len * 2 <= MAX_OUTPUT_LEN) {{
                     unsigned char temp[MAX_OUTPUT_LEN];
                     for (int i = 0; i < *output_len; i++) temp[i] = output_word[i];
@@ -1577,287 +1572,254 @@ int apply_gpu_rule(
                         output_word[idx++] = temp[i];
                     }}
                     *output_len *= 2;
-                    changed = 1;
                 }}
+                changed = 1;
                 break;
-            case 'E': // Title case (space-separated)
-                {{
-                    int capitalize_next = 1;
+            case 'E': // Title case
+                if (*output_len > 0) {{
+                    int capitalize = 1;
                     for (int i = 0; i < *output_len; i++) {{
-                        if (capitalize_next && is_lower(output_word[i]))
+                        if (capitalize && is_lower(output_word[i])) {{
                             output_word[i] = to_upper(output_word[i]);
-                        if (output_word[i] == ' ' || output_word[i] == '-' || output_word[i] == '_')
-                            capitalize_next = 1;
-                        else
-                            capitalize_next = 0;
+                            capitalize = 0;
+                        }}
+                        if (output_word[i] == ' ' || output_word[i] == '-' || output_word[i] == '_') {{
+                            capitalize = 1;
+                        }}
                     }}
-                    changed = 1;
                 }}
+                changed = 1;
                 break;
-            case '[': // Delete first character
-                if (*output_len > 0) {{
-                    for (int i = 1; i < *output_len; i++) output_word[i-1] = output_word[i];
-                    (*output_len)--;
-                    changed = 1;
-                }}
-                break;
-            case ']': // Delete last character
-                if (*output_len > 0) {{
-                    (*output_len)--;
-                    changed = 1;
-                }}
-                break;
-            case '{{': // Rotate left by one
-                if (*output_len > 1) {{
-                    unsigned char first = output_word[0];
-                    for (int i = 0; i < *output_len - 1; i++) output_word[i] = output_word[i+1];
-                    output_word[*output_len - 1] = first;
-                    changed = 1;
-                }}
-                break;
-            case '}}': // Rotate right by one
-                if (*output_len > 1) {{
-                    unsigned char last = output_word[*output_len - 1];
-                    for (int i = *output_len - 1; i > 0; i--) output_word[i] = output_word[i-1];
-                    output_word[0] = last;
-                    changed = 1;
-                }}
-                break;
-            case 'M': // Memorize (placeholder – no effect)
-                changed = 0;
-                break;
-            case '4': // Append memory (placeholder)
-                changed = 0;
-                break;
-            case '6': // Prepend memory (placeholder)
-                changed = 0;
-                break;
-            case '_': // No operation (placeholder)
-                changed = 0;
-                break;
-            case 'Q': // Reject if memory equals current (placeholder – always reject? We'll treat as no‑op for now)
-                // In real Hashcat this would reject; we keep as no‑op for now.
-                changed = 0;
-                break;
-            default:
-                changed = 0;
-                break;
+            // 'a' removed because it causes errors in Hashcat
         }}
     }}
     // ------------------------------------------------------------------------
-    // TWO‑CHARACTER RULES
+    // TWO CHARACTER RULES (cmd + one parameter)
     // ------------------------------------------------------------------------
     else if (rule_len == 2) {{
-        unsigned char arg = rule_str[1];
-        int n = (is_digit(arg)) ? (arg - '0') : 0;
+        unsigned char param = rule_str[1];
 
-        switch (cmd) {{
-            case 'T': // Toggle at position n
-                if (n < *output_len) {{
-                    output_word[n] = toggle_case(output_word[n]);
-                    changed = 1;
+        if (cmd == '^') {{ // Prepend
+            if (*output_len + 1 <= MAX_OUTPUT_LEN) {{
+                for (int i = *output_len; i > 0; i--) {{
+                    output_word[i] = output_word[i - 1];
                 }}
-                break;
-            case 'D': // Delete at n
-                if (n < *output_len) {{
-                    for (int i = n; i < *output_len - 1; i++) output_word[i] = output_word[i+1];
-                    (*output_len)--;
-                    changed = 1;
-                }}
-                break;
-            case 'L': // Delete left of n (keep n..end)
-                if (n < *output_len) {{
-                    int new_len = *output_len - n;
-                    for (int i = 0; i < new_len; i++) output_word[i] = output_word[n + i];
-                    *output_len = new_len;
-                    changed = 1;
-                }}
-                break;
-            case 'R': // Delete right of n (keep 0..n)
-                if (n < *output_len) {{
-                    *output_len = n + 1;
-                    changed = 1;
-                }}
-                break;
-            case '+': // ASCII increment at n
-                if (n < *output_len && output_word[n] < 255) {{
-                    output_word[n]++;
-                    changed = 1;
-                }}
-                break;
-            case '-': // ASCII decrement at n
-                if (n < *output_len && output_word[n] > 0) {{
-                    output_word[n]--;
-                    changed = 1;
-                }}
-                break;
-            case '.': // Replace with next char (ASCII+1)
-                if (n < *output_len && output_word[n] < 255) {{
-                    output_word[n]++;
-                    changed = 1;
-                }}
-                break;
-            case ',': // Replace with previous char (ASCII-1)
-                if (n < *output_len && output_word[n] > 0) {{
-                    output_word[n]--;
-                    changed = 1;
-                }}
-                break;
-            case '^': // Prepend character
-                if (*output_len + 1 <= MAX_OUTPUT_LEN) {{
-                    for (int i = *output_len; i > 0; i--) output_word[i] = output_word[i-1];
-                    output_word[0] = arg;
-                    (*output_len)++;
-                    changed = 1;
-                }}
-                break;
-            case '$': // Append character
-                if (*output_len + 1 <= MAX_OUTPUT_LEN) {{
-                    output_word[*output_len] = arg;
-                    (*output_len)++;
-                    changed = 1;
-                }}
-                break;
-            case '@': // Delete all instances of char
-                {{
-                    int new_len = 0;
-                    for (int i = 0; i < *output_len; i++) {{
-                        if (output_word[i] != arg) output_word[new_len++] = output_word[i];
-                        else changed = 1;
-                    }}
-                    *output_len = new_len;
-                }}
-                break;
-            case '!': // Reject if word contains X
-                {{
-                    int reject = 0;
-                    for (int i = 0; i < *output_len; i++) {{
-                        if (output_word[i] == arg) {{ reject = 1; break; }}
-                    }}
-                    if (reject) return 0;
-                    changed = 0;
-                }}
-                break;
-            case '/': // Reject if word does NOT contain X
-                {{
-                    int found = 0;
-                    for (int i = 0; i < *output_len; i++) {{
-                        if (output_word[i] == arg) {{ found = 1; break; }}
-                    }}
-                    if (!found) return 0;
-                    changed = 0;
-                }}
-                break;
-            case 'p': // Duplicate word N times (pN)
-                {{
-                    int mult = n;
-                    if (mult <= 0) mult = 1;
-                    int total_len = *output_len * mult;
-                    if (total_len <= MAX_OUTPUT_LEN) {{
-                        unsigned char temp[MAX_OUTPUT_LEN];
-                        for (int i = 0; i < *output_len; i++) temp[i] = output_word[i];
-                        for (int rep = 1; rep < mult; rep++) {{
-                            for (int i = 0; i < *output_len; i++) {{
-                                output_word[rep * *output_len + i] = temp[i];
-                            }}
-                        }}
-                        *output_len = total_len;
-                        changed = 1;
-                    }}
-                }}
-                break;
-            case '(': // Reject if first character != X
-                if (*output_len == 0 || output_word[0] != arg) return 0;
-                changed = 0;
-                break;
-            case ')': // Reject if last character != X
-                if (*output_len == 0 || output_word[*output_len - 1] != arg) return 0;
-                changed = 0;
-                break;
-            case '<': // Reject if word_len > N
-                if (*output_len > n) return 0;
-                changed = 0;
-                break;
-            case '>': // Reject if word_len < N
-                if (*output_len < n) return 0;
-                changed = 0;
-                break;
-            case '_': // Reject if word_len != N
-                if (*output_len != n) return 0;
-                changed = 0;
-                break;
-            case 'y': // Duplicate first N characters (yN)
-                {{
-                    int nn = n;
-                    if (nn > *output_len) nn = *output_len;
-                    if (*output_len + nn <= MAX_OUTPUT_LEN) {{
-                        for (int i = 0; i < nn; i++) {{
-                            output_word[*output_len + i] = output_word[i];
-                        }}
-                        *output_len += nn;
-                        changed = 1;
-                    }}
-                }}
-                break;
-            case 'Y': // Duplicate last N characters (YN)
-                {{
-                    int nn = n;
-                    if (nn > *output_len) nn = *output_len;
-                    if (*output_len + nn <= MAX_OUTPUT_LEN) {{
-                        for (int i = 0; i < nn; i++) {{
-                            output_word[*output_len + i] = output_word[*output_len - nn + i];
-                        }}
-                        *output_len += nn;
-                        changed = 1;
-                    }}
-                }}
-                break;
-            case '\\'': // Truncate at position N (keep 0..N-1)
-                if (n < *output_len) {{
-                    *output_len = n;
-                    changed = 1;
-                }}
-                break;
-            default:
-                changed = 0;
-                break;
-        }}
-    }}
-    // ------------------------------------------------------------------------
-    // THREE‑CHARACTER RULES
-    // ------------------------------------------------------------------------
-    else if (rule_len == 3) {{
-        unsigned char arg1 = rule_str[1];
-        unsigned char arg2 = rule_str[2];
-        int n = (is_digit(arg1)) ? (arg1 - '0') : 0;
-        int m = (is_digit(arg2)) ? (arg2 - '0') : 0;
-
-        if (cmd == 's') {{ // Substitution sXY
-            for (int i = 0; i < *output_len; i++) {{
-                if (output_word[i] == arg1) output_word[i] = arg2;
-            }}
-            changed = 1;
-        }}
-        else if (cmd == '*') {{ // Swap *NM (positions N and M)
-            if (n < *output_len && m < *output_len && n != m) {{
-                unsigned char tmp = output_word[n];
-                output_word[n] = output_word[m];
-                output_word[m] = tmp;
+                output_word[0] = param;
+                (*output_len)++;
                 changed = 1;
             }}
         }}
-        else if (cmd == 'x') {{ // Extract xNM (substring from N of length M)
+        else if (cmd == '$') {{ // Append
+            if (*output_len + 1 <= MAX_OUTPUT_LEN) {{
+                output_word[*output_len] = param;
+                (*output_len)++;
+                changed = 1;
+            }}
+        }}
+        else if (cmd == '@') {{ // Delete all instances of char
+            int new_len = 0;
+            for (int i = 0; i < *output_len; i++) {{
+                if (output_word[i] != param) {{
+                    output_word[new_len++] = output_word[i];
+                }} else {{
+                    changed = 1;
+                }}
+            }}
+            *output_len = new_len;
+        }}
+        else if (cmd == 'p') {{ // Duplicate word times (already handled in single? No, pN is two-char)
+            // Actually pN is two characters (p and a digit). But we already handle pN in three-char? No, it's two-char.
+            // We'll handle it here as a two-char rule.
+            int n = param - '0';
+            if (n > 0 && *output_len * (n + 1) <= MAX_OUTPUT_LEN) {{
+                int original_len = *output_len;
+                for (int rep = 0; rep < n; rep++) {{
+                    for (int i = 0; i < original_len; i++) {{
+                        output_word[*output_len + i] = output_word[i];
+                    }}
+                    *output_len += original_len;
+                }}
+                changed = 1;
+            }}
+        }}
+        else if (cmd == 'T' && is_digit(param)) {{ // Toggle at position
+            int pos = param - '0';
+            if (pos < *output_len) {{
+                output_word[pos] = toggle_case(output_word[pos]);
+                changed = 1;
+            }}
+        }}
+        else if (cmd == 'D' && is_digit(param)) {{ // Delete at position
+            int pos = param - '0';
+            if (pos < *output_len) {{
+                for (int i = pos; i < *output_len - 1; i++) {{
+                    output_word[i] = output_word[i + 1];
+                }}
+                (*output_len)--;
+                changed = 1;
+            }}
+        }}
+        else if (cmd == 'L' && is_digit(param)) {{ // Bitwise shift left (new)
+            int pos = param - '0';
+            if (pos < *output_len) {{
+                output_word[pos] = output_word[pos] << 1;
+                changed = 1;
+            }}
+        }}
+        else if (cmd == 'R' && is_digit(param)) {{ // Bitwise shift right (new)
+            int pos = param - '0';
+            if (pos < *output_len) {{
+                output_word[pos] = output_word[pos] >> 1;
+                changed = 1;
+            }}
+        }}
+        else if (cmd == '+' && is_digit(param)) {{ // Increment at position
+            int pos = param - '0';
+            if (pos < *output_len && output_word[pos] < 255) {{
+                output_word[pos]++;
+                changed = 1;
+            }}
+        }}
+        else if (cmd == '-' && is_digit(param)) {{ // Decrement at position
+            int pos = param - '0';
+            if (pos < *output_len && output_word[pos] > 0) {{
+                output_word[pos]--;
+                changed = 1;
+            }}
+        }}
+        else if (cmd == '.' && is_digit(param)) {{ // Replace with char+1 (new)
+            int pos = param - '0';
+            if (pos < *output_len) {{
+                output_word[pos] = output_word[pos] + 1;
+                changed = 1;
+            }}
+        }}
+        else if (cmd == ',' && is_digit(param)) {{ // Replace with char-1 (new)
+            int pos = param - '0';
+            if (pos < *output_len) {{
+                output_word[pos] = output_word[pos] - 1;
+                changed = 1;
+            }}
+        }}
+        else if (cmd == '\\'' && is_digit(param)) {{ // Truncate at position (keep up to pos)
+            int pos = param - '0';
+            if (pos < *output_len) {{
+                *output_len = pos + 1;
+                changed = 1;
+            }}
+        }}
+        else if (cmd == 'z' && is_digit(param)) {{ // Duplicate first character N times
+            int n = param - '0';
+            if (*output_len + n <= MAX_OUTPUT_LEN) {{
+                unsigned char first = output_word[0];
+                for (int i = *output_len + n - 1; i >= n; i--) {{
+                    output_word[i] = output_word[i - n];
+                }}
+                for (int i = 0; i < n; i++) {{
+                    output_word[i] = first;
+                }}
+                *output_len += n;
+                changed = 1;
+            }}
+        }}
+        else if (cmd == 'Z' && is_digit(param)) {{ // Duplicate last character N times
+            int n = param - '0';
+            if (*output_len + n <= MAX_OUTPUT_LEN) {{
+                unsigned char last = output_word[*output_len - 1];
+                for (int i = 0; i < n; i++) {{
+                    output_word[*output_len + i] = last;
+                }}
+                *output_len += n;
+                changed = 1;
+            }}
+        }}
+        else if (cmd == 'y' && is_digit(param)) {{ // Duplicate first block of length N
+            int n = param - '0';
+            if (*output_len + n <= MAX_OUTPUT_LEN) {{
+                for (int i = 0; i < n; i++) {{
+                    output_word[*output_len + i] = output_word[i];
+                }}
+                *output_len += n;
+                changed = 1;
+            }}
+        }}
+        else if (cmd == 'Y' && is_digit(param)) {{ // Duplicate last block of length N
+            int n = param - '0';
+            if (*output_len + n <= MAX_OUTPUT_LEN) {{
+                for (int i = 0; i < n; i++) {{
+                    output_word[*output_len + i] = output_word[*output_len - n + i];
+                }}
+                *output_len += n;
+                changed = 1;
+            }}
+        }}
+    }}
+    // ------------------------------------------------------------------------
+    // THREE CHARACTER RULES
+    // ------------------------------------------------------------------------
+    else if (rule_len == 3) {{
+        unsigned char param1 = rule_str[1];
+        unsigned char param2 = rule_str[2];
+
+        if (cmd == 's') {{ // Substitute
+            for (int i = 0; i < *output_len; i++) {{
+                if (output_word[i] == param1) {{
+                    output_word[i] = param2;
+                    changed = 1;
+                }}
+            }}
+        }}
+        else if (cmd == 'i' && is_digit(param1)) {{ // Insert at position
+            int pos = param1 - '0';
+            if (pos <= *output_len && *output_len + 1 <= MAX_OUTPUT_LEN) {{
+                for (int i = *output_len; i > pos; i--) {{
+                    output_word[i] = output_word[i - 1];
+                }}
+                output_word[pos] = param2;
+                (*output_len)++;
+                changed = 1;
+            }}
+        }}
+        else if (cmd == 'o' && is_digit(param1)) {{ // Overwrite at position
+            int pos = param1 - '0';
+            if (pos < *output_len) {{
+                output_word[pos] = param2;
+                changed = 1;
+            }}
+        }}
+        else if (cmd == 'e') {{ // Title case with separator
+            unsigned char separator = param1;
+            if (*output_len > 0) {{
+                int capitalize = 1;
+                for (int i = 0; i < *output_len; i++) {{
+                    if (capitalize && is_lower(output_word[i])) {{
+                        output_word[i] = to_upper(output_word[i]);
+                        capitalize = 0;
+                    }}
+                    if (output_word[i] == separator) {{
+                        capitalize = 1;
+                    }}
+                }}
+                changed = 1;
+            }}
+        }}
+        else if (cmd == 'x' && is_digit(param1) && is_digit(param2)) {{ // Extract
+            int n = param1 - '0';
+            int m = param2 - '0';
+            if (n > m) {{ int temp = n; n = m; m = temp; }}
             if (n < *output_len) {{
                 int new_len = 0;
-                for (int i = n; i < *output_len && new_len < m; i++) {{
+                for (int i = n; i <= m && i < *output_len; i++) {{
                     output_word[new_len++] = output_word[i];
                 }}
                 *output_len = new_len;
                 changed = 1;
             }}
         }}
-        else if (cmd == 'O') {{ // Omit ONM (delete M chars starting at N)
-            if (n < *output_len) {{
+        else if (cmd == 'O' && is_digit(param1) && is_digit(param2)) {{ // Omit range (delete M chars from N)
+            int n = param1 - '0';
+            int m = param2 - '0';
+            if (n < *output_len && m > 0) {{
                 int end = n + m;
                 if (end > *output_len) end = *output_len;
                 int shift = end - n;
@@ -1868,85 +1830,39 @@ int apply_gpu_rule(
                 changed = 1;
             }}
         }}
-        else if (cmd == 'i') {{ // Insert iNX (insert X at position N)
-            if (n <= *output_len && *output_len + 1 <= MAX_OUTPUT_LEN) {{
-                for (int i = *output_len; i > n; i--) output_word[i] = output_word[i-1];
-                output_word[n] = arg2;
-                (*output_len)++;
+        else if (cmd == '*' && is_digit(param1) && is_digit(param2)) {{ // Swap positions
+            int n = param1 - '0';
+            int m = param2 - '0';
+            if (n < *output_len && m < *output_len && n != m) {{
+                unsigned char temp = output_word[n];
+                output_word[n] = output_word[m];
+                output_word[m] = temp;
                 changed = 1;
             }}
         }}
-        else if (cmd == 'o') {{ // Overwrite oNX (overwrite at N with X)
-            if (n < *output_len) {{
-                output_word[n] = arg2;
-                changed = 1;
-            }}
-        }}
-        else if (cmd == '?') {{ // Reject ?NX (if char at N != X)
-            if (n >= *output_len || output_word[n] != arg2) return 0;
-            changed = 0;
-        }}
-        else if (cmd == '=') {{ // Reject =NX (if char at N == X)
-            if (n < *output_len && output_word[n] == arg2) return 0;
-            changed = 0;
-        }}
-        else if (cmd == 'e') {{ // Title with separator eX
-            int capitalize = 1;
-            for (int i = 0; i < *output_len; i++) {{
-                if (capitalize && is_lower(output_word[i]))
-                    output_word[i] = to_upper(output_word[i]);
-                if (output_word[i] == arg1)
-                    capitalize = 1;
-                else
-                    capitalize = 0;
-            }}
-            changed = 1;
-        }}
-        else if (cmd == '3') {{ // Toggle after Nth separator 3NX
+        else if (cmd == '3' && is_digit(param1)) {{ // Toggle after Nth separator (new)
+            int n = param1 - '0';
+            unsigned char separator = param2;
             int count = 0;
-            int pos = -1;
+            int found = -1;
             for (int i = 0; i < *output_len; i++) {{
-                if (output_word[i] == arg2) {{
+                if (output_word[i] == separator) {{
                     count++;
                     if (count == n) {{
-                        pos = i;
+                        found = i;
                         break;
                     }}
                 }}
             }}
-            if (pos != -1 && pos + 1 < *output_len) {{
-                output_word[pos + 1] = toggle_case(output_word[pos + 1]);
+            if (found != -1 && found + 1 < *output_len) {{
+                output_word[found + 1] = toggle_case(output_word[found + 1]);
                 changed = 1;
             }}
         }}
-        else if (cmd == 'v') {{ // Insert every N characters vNX
-            if (n > 0) {{
-                int new_len = *output_len;
-                int inserts = (*output_len) / n;
-                if (*output_len + inserts <= MAX_OUTPUT_LEN) {{
-                    unsigned char temp[MAX_OUTPUT_LEN];
-                    for (int i = 0; i < *output_len; i++) temp[i] = output_word[i];
-                    int idx = 0;
-                    for (int i = 0; i < *output_len; i++) {{
-                        output_word[idx++] = temp[i];
-                        if ((i+1) % n == 0 && i+1 < *output_len) {{
-                            output_word[idx++] = arg2;
-                        }}
-                    }}
-                    *output_len = idx;
-                    changed = 1;
-                }}
-            }}
-        }}
-        else {{
-            changed = 0;
-        }}
     }}
 
-    // If the rule was rejected, return 0; otherwise return 1.
-    if (changed == -1) return 0;
     output_word[*output_len] = '\\0';
-    return 1;
+    return changed ? 1 : 0;
 }}
 
 // ============================================================================
@@ -1999,7 +1915,7 @@ __kernel void find_single_rules_gpu(
     int output_len;
     int result = apply_gpu_rule(rule_str, rule_len, input_word, word_len, output_word, &output_len);
 
-    if (result && output_len > 0) {{
+    if (result > 0 && output_len > 0) {{
         if (bloom_check(bloom_filter, output_word, output_len)) {{
             int idx = atomic_inc(found_count);
             if (idx < MAX_CHAINS_TO_FIND) {{
@@ -2072,7 +1988,6 @@ __kernel void find_rule_chains_gpu(
         }}
         rule_str[rule_len] = '\\0';
 
-        // Append rule to chain string
         for (int i = 0; i < rule_len && chain_pos < MAX_CHAIN_STRING_LEN - 2; i++) {{
             chain_buffer[chain_pos++] = rule_str[i];
         }}
@@ -2083,7 +1998,7 @@ __kernel void find_rule_chains_gpu(
         int new_len;
         int result = apply_gpu_rule(rule_str, rule_len, current_word, current_len, temp_word, &new_len);
 
-        if (result == 0 || new_len == 0) {{
+        if (result <= 0 || new_len == 0) {{
             return;
         }}
 
@@ -2110,7 +2025,7 @@ __kernel void find_rule_chains_gpu(
 """
 
 # ====================================================================
-# --- UTILITY FUNCTIONS (unchanged) ---
+# --- UTILITY FUNCTIONS ---
 # ====================================================================
 
 def load_wordlist_fast(filename):
@@ -2143,7 +2058,7 @@ def load_wordlist_fast(filename):
     return words_list
 
 # ====================================================================
-# --- MAIN EXECUTION (unchanged except for --max-depth now unlimited) ---
+# --- MAIN EXECUTION ---
 # ====================================================================
 
 if __name__ == '__main__':
@@ -2267,7 +2182,7 @@ if __name__ == '__main__':
     sorted_items = sorted(rule_counts.items(), key=lambda x: (-x[1], x[0]))
 
     with open(args.output, 'w', encoding='latin-1') as f:
-        f.write(f"# Generated by rulest_v2.0.py (full kernel)\n")
+        f.write(f"# Generated by rulest_v2.0.py (seeded)\n")
         f.write(f"# Total unique rules: {len(rule_counts)}\n")
         f.write(f"# Total hits (sum of frequencies): {sum(rule_counts.values())}\n")
         f.write(":\n")  # explicitly write ":" first
