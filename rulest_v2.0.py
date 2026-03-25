@@ -427,7 +427,7 @@ def get_max_allocation(device):
 # ====================================================================
 # --- DYNAMIC PARAMETERS ---
 # ====================================================================
-def calculate_dynamic_parameters(base_count, target_count, device=None, target_hours=0.5):
+def calculate_dynamic_parameters(base_count, target_count, device=None, target_hours=0.5, bloom_size_mb=None):
     if device:
         try:
             max_work_group_size = device.get_info(cl.device_info.MAX_WORK_GROUP_SIZE)
@@ -471,14 +471,24 @@ def calculate_dynamic_parameters(base_count, target_count, device=None, target_h
     target_seconds = target_hours * 3600
     max_combinations_time_limit = int(EST_COMBOS_PER_SEC * target_seconds * TIME_SAFETY_FACTOR)
 
-    BASE_BLOOM_SIZE = 1024 * 1024 * BLOOM_FILTER_MAX_MB
-    bloom_scale = max(1.0, math.log10(base_count + target_count) / 2.0)
-    BLOOM_FILTER_SIZE_BYTES = int(BASE_BLOOM_SIZE * min(bloom_scale, 2.0))
-    MAX_BLOOM_BYTES = BLOOM_FILTER_MAX_MB * 1024 * 1024
-    if vram_gb < 4:
-        MAX_BLOOM_BYTES = 32 * 1024 * 1024
-    BLOOM_FILTER_SIZE_BYTES = min(BLOOM_FILTER_SIZE_BYTES, MAX_BLOOM_BYTES)
-    BLOOM_FILTER_SIZE = BLOOM_FILTER_SIZE_BYTES * 8
+    # Bloom filter size – either user‑specified or auto‑calculated
+    if bloom_size_mb is not None:
+        BLOOM_FILTER_SIZE_BYTES = bloom_size_mb * 1024 * 1024
+        if device:
+            free_vram = estimate_free_vram(device)
+            if BLOOM_FILTER_SIZE_BYTES > free_vram:
+                print(f"{yellow('[WARN]')} Bloom filter size exceeds free VRAM ({free_vram/1024**3:.1f}GB). Reducing to {free_vram/1024**3:.1f}GB.")
+                BLOOM_FILTER_SIZE_BYTES = free_vram
+        BLOOM_FILTER_SIZE = BLOOM_FILTER_SIZE_BYTES * 8
+    else:
+        BASE_BLOOM_SIZE = 1024 * 1024 * BLOOM_FILTER_MAX_MB
+        bloom_scale = max(1.0, math.log10(base_count + target_count) / 2.0)
+        BLOOM_FILTER_SIZE_BYTES = int(BASE_BLOOM_SIZE * min(bloom_scale, 2.0))
+        MAX_BLOOM_BYTES = BLOOM_FILTER_MAX_MB * 1024 * 1024
+        if vram_gb < 4:
+            MAX_BLOOM_BYTES = 32 * 1024 * 1024
+        BLOOM_FILTER_SIZE_BYTES = min(BLOOM_FILTER_SIZE_BYTES, MAX_BLOOM_BYTES)
+        BLOOM_FILTER_SIZE = BLOOM_FILTER_SIZE_BYTES * 8
 
     WORDS_PER_BATCH = max(1000, int(BASE_WORDS_PER_BATCH * vram_scale))
     CHAINS_PER_BATCH = max(500, int(BASE_CHAINS_PER_BATCH * vram_scale))
@@ -507,7 +517,7 @@ def calculate_dynamic_parameters(base_count, target_count, device=None, target_h
         'OPTIMAL_GLOBAL_MULTIPLIER': OPTIMAL_GLOBAL_MULTIPLIER,
         'EST_COMBOS_PER_SEC': EST_COMBOS_PER_SEC,
         'TARGET_SECONDS': target_seconds,
-        'bloom_scale': bloom_scale,
+        'bloom_scale': bloom_scale if bloom_size_mb is None else None,
         'vram_scale': vram_scale,
         'free_vram': free_vram
     }
@@ -716,8 +726,9 @@ class GPUEngine:
         if available < 0:
             available = 0
 
-        # Max number of result slots we can fit
-        max_slots = available // MAX_CHAIN_STRING_LEN
+        # Max number of result slots we can fit (each result is chain string + int + uint)
+        stride = MAX_CHAIN_STRING_LEN + 4 + 4
+        max_slots = available // stride
         if max_slots < 1:
             max_slots = 1
 
@@ -978,7 +989,7 @@ class GPUEngine:
                 generated.add(pattern_key)
         return generated
 
-    def generate_informed_chains(self, rules, single_rules_found, max_depth, seed_chains=None):
+    def generate_informed_chains(self, rules, single_rules_found, max_depth, seed_chains=None, max_total_chains=None):
         if VERBOSE:
             print(f"  {cyan('->')} Generating informed chains up to depth {max_depth}...")
         valid_rules = [r for r in rules if HashcatRuleValidator.validate_rule_for_gpu(r)]
@@ -1097,11 +1108,16 @@ class GPUEngine:
             seed_by_depth[depth].update(new_chains)
 
         chains_list = list(chains)
+        # Apply global max chains limit if specified
+        if max_total_chains is not None and len(chains_list) > max_total_chains:
+            chains_list = random.sample(chains_list, max_total_chains)
+            if VERBOSE:
+                print(f"  {cyan('[*]')} Limited chains to {max_total_chains:,} (random sample)")
         if VERBOSE:
-            print(f"  {cyan('[*]')} Generated {len(chains_list):,} chains total")
+            print(f"  {cyan('[*]')} Final chain count: {len(chains_list):,}")
         return chains_list
 
-    def process_all_words_chain_rules(self, base_words, rules, max_depth, bloom_filter, single_rules_counter, seed_chains=None):
+    def process_all_words_chain_rules(self, base_words, rules, max_depth, bloom_filter, single_rules_counter, seed_chains=None, max_total_chains=None):
         if VERBOSE:
             print(f"{blue('[GPU]')} {bold('Processing ALL words with rule chains...')}")
         if self.bloom_buf is None:
@@ -1113,12 +1129,13 @@ class GPUEngine:
             self.rule_index = {r: i for i, r in enumerate(self.gpu_rules)}
         if VERBOSE:
             print(f"{blue('[SETUP]')} {bold('Generating rule chains...')}")
-        chains = self.generate_informed_chains(rules, single_rules_counter, max_depth, seed_chains)
+        chains = self.generate_informed_chains(rules, single_rules_counter, max_depth, seed_chains, max_total_chains)
         if not chains:
             return Counter()
         if VERBOSE:
             print(f"{blue('[INFO]')} {bold('Total chains generated:')} {len(chains):,}")
         chain_counter = Counter()
+        seen_mappings = set()  # (base_idx, output_hash) -> counted
         chain_batch_size = self.params['CHAINS_PER_BATCH']
         word_sub_batch = self.params['WORD_SUB_BATCH']
         num_chain_batches = (len(chains) + chain_batch_size - 1) // chain_batch_size
@@ -1135,9 +1152,12 @@ class GPUEngine:
                     word_batch = base_words[word_start:word_end]
                     if not word_batch:
                         continue
-                    batch_chains = self._process_chain_batch(word_batch, chain_batch)
-                    if batch_chains:
-                        chain_counter.update(batch_chains)
+                    batch_results = self._process_chain_batch(word_batch, chain_batch)
+                    for chain_str, base_idx, out_hash in batch_results:
+                        key = (base_idx, out_hash)
+                        if key not in seen_mappings:
+                            seen_mappings.add(key)
+                            chain_counter[chain_str] += 1
                     self.queue.finish()
                 if VERBOSE:
                     chain_pbar.update(1)
@@ -1194,7 +1214,8 @@ class GPUEngine:
             # Ensure max_output_size is not zero
             if max_output_size == 0:
                 max_output_size = 1
-            found_chains_buf = cl.Buffer(self.context, mf.WRITE_ONLY, max_output_size * MAX_CHAIN_STRING_LEN)
+            stride = MAX_CHAIN_STRING_LEN + 4 + 4  # chain string + int + uint
+            found_chains_buf = cl.Buffer(self.context, mf.WRITE_ONLY, max_output_size * stride)
             found_count_buf = cl.Buffer(self.context, mf.READ_WRITE, 4)
             zero_count = np.array([0], dtype=np.int32)
             cl.enqueue_copy(self.queue, found_count_buf, zero_count)
@@ -1219,17 +1240,25 @@ class GPUEngine:
             found_count = np.zeros(1, dtype=np.int32)
             cl.enqueue_copy(self.queue, found_count, found_count_buf)
             num_found = min(found_count[0], max_output_size)
-            batch_chains = []
+            batch_results = []
             if num_found > 0:
-                found_data = np.zeros(num_found * MAX_CHAIN_STRING_LEN, dtype=np.uint8)
+                found_data = np.zeros(num_found * stride, dtype=np.uint8)
                 cl.enqueue_copy(self.queue, found_data, found_chains_buf)
                 for i in range(num_found):
-                    start = i * MAX_CHAIN_STRING_LEN
-                    chain_bytes = bytes(found_data[start:start + MAX_CHAIN_STRING_LEN])
+                    offset = i * stride
+                    # Chain string
+                    chain_bytes = bytes(found_data[offset:offset + MAX_CHAIN_STRING_LEN])
                     chain_str = chain_bytes.split(b'\0')[0].decode('latin-1', errors='ignore')
-                    if chain_str:
-                        batch_chains.append(chain_str)
-            return batch_chains
+                    if not chain_str:
+                        continue
+                    # Base index
+                    base_idx = np.frombuffer(found_data[offset+MAX_CHAIN_STRING_LEN:offset+MAX_CHAIN_STRING_LEN+4],
+                                             dtype=np.int32)[0]
+                    # Output hash
+                    out_hash = np.frombuffer(found_data[offset+MAX_CHAIN_STRING_LEN+4:offset+MAX_CHAIN_STRING_LEN+8],
+                                             dtype=np.uint32)[0]
+                    batch_results.append((chain_str, base_idx, out_hash))
+            return batch_results
 
         except Exception as e:
             if VERBOSE:
@@ -1251,14 +1280,16 @@ class GPUEngine:
 # --- GPU EXTRACTOR ---
 # ====================================================================
 class GPUExtractor:
-    def __init__(self, base_count, target_count, max_depth, device_spec=None, target_hours=0.5, max_chains=None, seed_rules_file=None):
+    def __init__(self, base_count, target_count, max_depth, device_spec=None, target_hours=0.5,
+                 max_chains=None, seed_rules_file=None, bloom_size_mb=None):
         self.base_count = base_count
         self.target_count = target_count
         self.max_depth = max_depth
         self.device_spec = device_spec
         self.max_chains = max_chains
         self.seed_rules_file = seed_rules_file
-        self.params = calculate_dynamic_parameters(base_count, target_count, None, target_hours)
+        self.bloom_size_mb = bloom_size_mb
+        self.params = calculate_dynamic_parameters(base_count, target_count, None, target_hours, bloom_size_mb)
         self.params['MAX_CHAIN_DEPTH'] = max_depth
         if VERBOSE:
             print(f"{blue('[CONFIG]')} {bold('GPU-Optimized Configuration:')}")
@@ -1304,7 +1335,9 @@ class GPUExtractor:
             if VERBOSE:
                 print(f"{yellow('[WARN]')} {bold('GPU not available')}")
             return all_counts
-        self.params = calculate_dynamic_parameters(self.base_count, self.target_count, self.gpu_engine.device, self.params['TARGET_SECONDS']/3600)
+        # Recalculate parameters now that we have a device, but keep the user's bloom size if given
+        self.params = calculate_dynamic_parameters(self.base_count, self.target_count, self.gpu_engine.device,
+                                                   self.params['TARGET_SECONDS']/3600, self.bloom_size_mb)
         self.params['MAX_CHAIN_DEPTH'] = self.max_depth
         self.gpu_engine.params = self.params
         seed_chains = self.load_seed_rules()
@@ -1353,7 +1386,11 @@ class GPUExtractor:
                 if total_budget > self.max_chains:
                     scale = self.max_chains / total_budget
                     for d in depth_budgets:
-                        depth_budgets[d] = int(depth_budgets[d] * scale)
+                        old = depth_budgets[d]
+                        depth_budgets[d] = int(old * scale)
+                        # Ensure we keep at least one chain for depths that originally had a budget
+                        if old > 0 and depth_budgets[d] == 0:
+                            depth_budgets[d] = 1
                     if VERBOSE:
                         print(f"{blue('[OVERRIDE]')} {bold('Scaled chain budgets to fit --max-chains:')} {cyan(self.max_chains)}")
             for d, budget in depth_budgets.items():
@@ -1363,7 +1400,7 @@ class GPUExtractor:
                 for d in depths:
                     print(f"{blue('[DYNAMIC]')} {bold(f'Depth {d} chain limit:')} {cyan(f'{depth_budgets[d]:,}')}")
             chain_counts = self.gpu_engine.process_all_words_chain_rules(
-                base_words, rules, self.max_depth, bloom_filter, single_counts, seed_chains)
+                base_words, rules, self.max_depth, bloom_filter, single_counts, seed_chains, self.max_chains)
             all_counts.update(chain_counts)
             if VERBOSE:
                 print(f"{green('[OK]')} {bold('Rule chains found:')} {cyan(len(chain_counts))}")
@@ -1390,6 +1427,12 @@ GPU_COMPATIBLE_KERNEL_TEMPLATE = """
 #define MAX_CHAIN_DEPTH {MAX_CHAIN_DEPTH}
 #define BLOOM_FILTER_SIZE {BLOOM_FILTER_SIZE}
 #define BLOOM_HASH_FUNCTIONS {BLOOM_HASH_FUNCTIONS}
+
+// Result structure stride
+#define CHAIN_RESULT_STR_OFFSET 0
+#define CHAIN_RESULT_IDX_OFFSET MAX_CHAIN_STRING_LEN
+#define CHAIN_RESULT_HASH_OFFSET (MAX_CHAIN_STRING_LEN + sizeof(int))
+#define CHAIN_RESULT_STRIDE (MAX_CHAIN_STRING_LEN + sizeof(int) + sizeof(uint))
 
 // ============================================================================
 // FNV-1a HASH FUNCTION (GPU VERSION)
@@ -2047,11 +2090,20 @@ __kernel void find_rule_chains_gpu(
     if (bloom_check(bloom_filter, current_word, current_len)) {{
         int idx = atomic_inc(found_count);
         if (idx < MAX_CHAINS_TO_FIND) {{
-            __global char *output_ptr = found_chains + idx * MAX_CHAIN_STRING_LEN;
+            __global char *output_ptr = found_chains + idx * CHAIN_RESULT_STRIDE;
+
+            // Chain string
             for (int i = 0; i < chain_pos && i < MAX_CHAIN_STRING_LEN - 1; i++) {{
-                output_ptr[i] = chain_buffer[i];
+                output_ptr[CHAIN_RESULT_STR_OFFSET + i] = chain_buffer[i];
             }}
-            output_ptr[chain_pos] = '\\0';
+            output_ptr[CHAIN_RESULT_STR_OFFSET + chain_pos] = '\\0';
+
+            // Base word index
+            *((__global int *)(output_ptr + CHAIN_RESULT_IDX_OFFSET)) = word_idx;
+
+            // Output hash
+            uint out_hash = fnv1a_32_local(current_word, current_len, 0xDEADBEEF);
+            *((__global uint *)(output_ptr + CHAIN_RESULT_HASH_OFFSET)) = out_hash;
         }}
     }}
 }}
@@ -2100,6 +2152,7 @@ if __name__ == '__main__':
     parser.add_argument('--max-chains', type=int, default=None, help='Maximum TOTAL chains to generate')
     parser.add_argument('--target-hours', type=float, default=0.5, help='Target completion time in hours')
     parser.add_argument('--seed-rules', type=str, default=None, help='File containing seed rules/chains')
+    parser.add_argument('--bloom-size-mb', type=int, default=None, help='Manual Bloom filter size in MB (auto if not set)')
     parser.add_argument('--list-devices', action='store_true', help='List OpenCL devices and exit')
     parser.add_argument('--device', type=str, default=None, help='Device index or substring')
     parser.add_argument('--allow-reject-rules', action='store_true', help='Include reject rules (e.g. !X, ?NX, vNX) in generation (GPU will ignore them)')
@@ -2149,7 +2202,7 @@ if __name__ == '__main__':
         len(base_words), len(target_words),
         args.max_depth, args.device,
         args.target_hours, args.max_chains,
-        args.seed_rules
+        args.seed_rules, args.bloom_size_mb
     )
 
     if VERBOSE:
