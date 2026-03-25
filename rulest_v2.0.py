@@ -88,6 +88,24 @@ FNV1A_SEED1 = 0xDEADBEEF
 FNV1A_SEED2 = 0xCAFEBABE
 
 # ====================================================================
+# --- HELPER: Identify rejection rules ---
+# ====================================================================
+def is_rejection_rule(rule: str) -> bool:
+    """Return True if rule is a Hashcat rejection rule (e.g., !X, ?NX, (X, etc.)"""
+    if not rule:
+        return False
+    # Single‑character rejection rules (Q in some kernels)
+    if len(rule) == 1 and rule in ('Q',):
+        return True
+    # Two‑character rejection rules: !X, /X, (X, )X, <N, >N, _N
+    if len(rule) == 2 and rule[0] in ('!', '/', '(', ')', '<', '>', '_'):
+        return True
+    # Three‑character rejection rules: ?NX, =NX
+    if len(rule) == 3 and rule[0] in ('?', '='):
+        return True
+    return False
+
+# ====================================================================
 # --- HASHCAT RULE VALIDATION (UPDATED FOR FULL KERNEL) ---
 # ====================================================================
 
@@ -117,6 +135,10 @@ class HashcatRuleValidator:
     @staticmethod
     def validate_rule_for_gpu(rule_str):
         """Validate rule for GPU compatibility using the kernel's full rule set"""
+        # Reject rejection rules early
+        if is_rejection_rule(rule_str):
+            return False
+
         line_len = len(rule_str)
         pos = 0
         cnt = 0
@@ -140,9 +162,6 @@ class HashcatRuleValidator:
                 if pos >= line_len:
                     return False
                 pos += 1
-
-            # --- Two‑character rule with digit (only pN, yN, YN) already covered above ---
-            # Actually p, y, Y are already in the list; they take a digit as second char.
 
             # --- Three‑character rules (sXY, *nm, xnm, Onm, iNX, oNX, ?NX, =NX, eX, 3NX, vNX) ---
             elif c in ('s', '*', 'x', 'O', 'i', 'o', '?', '=', 'e', '3', 'v'):
@@ -533,8 +552,18 @@ class GPUCompatibleRulesGenerator:
                 if 1 <= len(rule) <= MAX_RULE_LEN:
                     valid_rules.append(rule)
 
-        print(f"{green('[OK]')} {bold('Generated:')} {cyan(f'{len(valid_rules):,}')} {bold('GPU-compatible Hashcat rules')}")
-        return valid_rules
+        # --- NEW: Exclude rejection rules (and optionally vNX) ---
+        print(f"  {cyan('[*]')} Filtering out rejection rules...")
+        filtered_rules = [r for r in valid_rules if not is_rejection_rule(r)]
+
+        # If you also want to exclude the 'vNX' rule, uncomment the next line:
+        # filtered_rules = [r for r in filtered_rules if not r.startswith('v')]
+
+        print(f"  {green('[OK]')} Removed {len(valid_rules) - len(filtered_rules)} rejection rules.")
+        # ---------------------------------------------------------
+
+        print(f"{green('[OK]')} {bold('Generated:')} {cyan(f'{len(filtered_rules):,}')} {bold('GPU-compatible Hashcat rules')}")
+        return filtered_rules
 
 # ====================================================================
 # --- GPU ENGINE WITH UPDATED KERNEL (FULL RULE SET) ---
@@ -823,11 +852,12 @@ class GPUEngine:
             return batch_found
 
         except Exception as e:
-            print(f"{yellow('[WARN]')} GPU processing failed: {e}")
+            print(f"{yellow('[WARN]')} GPU single‑rule processing failed: {e}")
+            # Recreate command queue to recover
+            self.queue = cl.CommandQueue(self.context)
             return []
         finally:
-            self.queue.finish()
-            # Release buffers (list comprehension to avoid NameError)
+            # release buffers
             for buf in (base_buf, base_offsets_buf, base_lengths_buf,
                         rules_buf, rule_offsets_buf, rule_lengths_buf,
                         found_rules_buf, found_count_buf):
@@ -1142,9 +1172,11 @@ class GPUEngine:
 
         except Exception as e:
             print(f"{yellow('[WARN]')} GPU chain processing failed: {e}")
+            # Recreate command queue to recover
+            self.queue = cl.CommandQueue(self.context)
             return []
         finally:
-            self.queue.finish()
+            # release buffers
             for buf in (base_buf, base_offsets_buf, base_lengths_buf,
                         rules_buf, rule_offsets_buf, rule_lengths_buf,
                         chain_seq_buf, chain_depth_buf,
@@ -1603,7 +1635,7 @@ int apply_gpu_rule(
             case '_': // No operation (placeholder)
                 changed = 0;
                 break;
-            case 'Q': // Reject if memory equals current (placeholder – always reject? We'll treat as no reject)
+            case 'Q': // Reject if memory equals current (placeholder – always reject? We'll treat as no‑op for now)
                 // In real Hashcat this would reject; we keep as no‑op for now.
                 changed = 0;
                 break;
