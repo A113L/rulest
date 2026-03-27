@@ -1,3 +1,21 @@
+#!/usr/bin/env python3
+"""
+rulest — GPU-Compatible Hashcat Rules Engine
+=============================================
+Extracts hashcat rules/chains by comparing a base wordlist against a target
+wordlist.  GPU bloom filter screening (Phase 1: single rules, Phase 2: chains)
+is followed by signature-based functional minimization.
+
+Key feature: --sig-words / --min-word-len
+  After GPU extraction, rules are deduplicated by their functional signature —
+  the tuple of outputs produced when applied to a fixed probe set of words with
+  length >= min_word_len.  Rules that produce identical outputs on every probe
+  word are considered functionally equivalent; only the one with the highest
+  GPU hit-count is retained.  The final ruleset is written to a single file
+  sorted by GPU frequency (descending, UTF-8).
+
+"""
+
 import os
 import sys
 import numpy as np
@@ -5,1306 +23,1248 @@ import pyopencl as cl
 import argparse
 import string
 import itertools
-from collections import defaultdict, deque, Counter
+from collections import defaultdict, Counter
 from tqdm import tqdm
-import mmap
 import time
-import hashlib
-import signal
 import math
-import zlib
 import random
-import json
-from typing import List, Dict, Set, Tuple, Optional
+from typing import Dict, Set, Tuple, Optional, List
 import gc
+import multiprocessing as mp
+from functools import partial
+import datetime
 
-# ================== CONFIGURATION ==================
-VERBOSE = False              # Set to True to see detailed output (use --debug)
-ALLOW_REJECT_RULES = False   # If True, allow reject rules in validation (GPU will ignore them)
+# ================== GLOBAL FLAGS ===================
+VERBOSE            = False   # set by --debug
+ALLOW_REJECT_RULES = False   # set by --allow-reject-rules
 # ==================================================
 
-# Suppress compiler warnings
 os.environ['PYOPENCL_COMPILER_OUTPUT'] = '0'
 
-# -------------------------------------------------------------------
-# Color codes
-# -------------------------------------------------------------------
-class Colors:
-    RED = '\033[91m'
-    GREEN = '\033[92m'
-    YELLOW = '\033[93m'
-    BLUE = '\033[94m'
-    MAGENTA = '\033[95m'
-    CYAN = '\033[96m'
-    WHITE = '\033[97m'
-    BOLD = '\033[1m'
-    UNDERLINE = '\033[4m'
-    END = '\033[0m'
+# ====================================================================
+# --- COLORS ---
+# ====================================================================
+class C:
+    RED    = '\033[91m'; GREEN  = '\033[92m'; YELLOW = '\033[93m'
+    BLUE   = '\033[94m'; CYAN   = '\033[96m'; MAGENTA= '\033[95m'
+    BOLD   = '\033[1m';  DIM    = '\033[2m';  END    = '\033[0m'
 
-def red(text): return f"{Colors.RED}{text}{Colors.END}"
-def green(text): return f"{Colors.GREEN}{text}{Colors.END}"
-def yellow(text): return f"{Colors.YELLOW}{text}{Colors.END}"
-def blue(text): return f"{Colors.BLUE}{text}{Colors.END}"
-def magenta(text): return f"{Colors.MAGENTA}{text}{Colors.END}"
-def cyan(text): return f"{Colors.CYAN}{text}{Colors.END}"
-def bold(text): return f"{Colors.BOLD}{text}{Colors.END}"
+def red(t):     return f"{C.RED}{t}{C.END}"
+def green(t):   return f"{C.GREEN}{t}{C.END}"
+def yellow(t):  return f"{C.YELLOW}{t}{C.END}"
+def blue(t):    return f"{C.BLUE}{t}{C.END}"
+def cyan(t):    return f"{C.CYAN}{t}{C.END}"
+def magenta(t): return f"{C.MAGENTA}{t}{C.END}"
+def bold(t):    return f"{C.BOLD}{t}{C.END}"
+def dim(t):     return f"{C.DIM}{t}{C.END}"
 
-# -------------------------------------------------------------------
-# Constants
-# -------------------------------------------------------------------
-MAX_WORD_LEN = 256
-MAX_RULE_LEN = 16
-MAX_OUTPUT_LEN = 512
+# ====================================================================
+# --- LOGGING SYSTEM ---
+# ====================================================================
+def log_info(msg: str) -> None:
+    """Always printed — key milestones and final stats."""
+    print(msg)
+
+def log_debug(msg: str) -> None:
+    """Only printed in --debug mode."""
+    if VERBOSE:
+        print(f"{dim('[dbg]')} {msg}")
+
+def log_warn(msg: str) -> None:
+    """Always printed — non-fatal warnings."""
+    print(yellow(f"[WARN] {msg}"))
+
+def log_error(msg: str) -> None:
+    """Always printed — errors."""
+    print(red(f"[ERROR] {msg}"))
+
+def log_section(title: str) -> None:
+    """Section header — only in --debug mode."""
+    if VERBOSE:
+        bar = '─' * 56
+        print(f"\n{cyan(bar)}")
+        print(f"{cyan('│')} {bold(title)}")
+        print(f"{cyan(bar)}")
+
+# ====================================================================
+# --- BANNER ---
+# ====================================================================
+BANNER = f"""{green(bold('''
+ ██████╗ ██╗   ██╗██╗     ███████╗███████╗████████╗
+ ██╔══██╗██║   ██║██║     ██╔════╝██╔════╝╚══██╔══╝
+ ██████╔╝██║   ██║██║     █████╗  ███████╗   ██║
+ ██╔══██╗██║   ██║██║     ██╔══╝  ╚════██║   ██║
+ ██║  ██║╚██████╔╝███████╗███████╗███████║   ██║
+ ╚═╝  ╚═╝ ╚═════╝ ╚══════╝╚══════╝╚══════╝   ╚═╝'''))}{C.END}
+  {dim('GPU-Compatible Hashcat Rules Engine')}
+  {dim('github.com/A113L/rulest')}
+"""
+
+def print_banner() -> None:
+    print(BANNER)
+
+# ====================================================================
+# --- CONSTANTS ---
+# ====================================================================
+MAX_WORD_LEN         = 256
+MAX_RULE_LEN         = 16
+MAX_OUTPUT_LEN       = 512
 MAX_CHAIN_STRING_LEN = 128
+MAX_HASHCAT_CHAIN    = 31          # hashcat's maximum rule chain length
 
-VRAM_USAGE_FACTOR = 0.55
+VRAM_USAGE_FACTOR    = 0.55
 BLOOM_HASH_FUNCTIONS = 4
-BLOOM_FILTER_MAX_MB = 64
-BLOOM_FILTER_MIN_MB = 16
+BLOOM_FILTER_MAX_MB  = 256
 
-BASELINE_COMBOS_PER_SEC = 120_000_000
+BASELINE_COMBOS_PER_SEC         = 120_000_000
 LOW_END_COMPUTE_UNITS_THRESHOLD = 20
-LOW_END_COMBOS_PER_SEC = 40_000_000
+LOW_END_COMBOS_PER_SEC          = 40_000_000
 
 POSSIBLE_WORK_GROUP_SIZES = [32, 64, 128, 256, 512, 1024]
 
-# Batch sizes – original values
-BASE_WORDS_PER_BATCH = 5000
-BASE_CHAINS_PER_BATCH = 2000
-BASE_WORD_SUB_BATCH = 20000
-BASE_MAX_SAFE_RESULTS = 25000
+BASE_WORDS_PER_BATCH         = 5000
+BASE_CHAINS_PER_BATCH        = 2000
+BASE_WORD_SUB_BATCH          = 20000
+BASE_MAX_SAFE_RESULTS        = 25000
 
-HOT_RULE_RATIO = 0.6
-EXTENSION_RATIO = 0.3
-MAX_ATTEMPTS_MULTIPLIER = 5
-
-TIME_SAFETY_FACTOR = 0.9
+HOT_RULE_RATIO               = 0.6
+EXTENSION_RATIO              = 0.3
+MAX_ATTEMPTS_MULTIPLIER      = 5
+TIME_SAFETY_FACTOR           = 0.9
 OPTIMAL_GLOBAL_MULTIPLIER_BASE = 16
 
-FNV1A_PRIME = 16777619
+FNV1A_PRIME        = 16777619
 FNV1A_OFFSET_BASIS = 2166136261
-FNV1A_SEED1 = 0xDEADBEEF
-FNV1A_SEED2 = 0xCAFEBABE
+FNV1A_SEED1        = 0xDEADBEEF
+FNV1A_SEED2        = 0xCAFEBABE
 
 MAX_GPU_RULES = 255
 
+# Default probe-set parameters for signature-based minimization
+DEFAULT_SIG_WORDS    = 21   # number of words to use as the probe set
+DEFAULT_MIN_WORD_LEN = 10   # minimum word length for probe words
+
+# Sentinel used in signatures when a rule contains unsupported opcodes
+_UNSUPPORTED_SENTINEL = object()
+
 # ====================================================================
-# --- HELPER: Identify rules to exclude ---
+# --- RULE EXCLUSION FILTER ---
 # ====================================================================
 def should_exclude_rule(rule: str) -> bool:
-    """Return True if rule is unwanted (rejection, memory, vNX, etc.)"""
     if ALLOW_REJECT_RULES:
         return False
     if not rule:
         return False
-    # Single‑character problematic rules (z and Z are valid, so keep them)
     if len(rule) == 1 and rule in ('_', 'M', '4', '6', 'Q'):
         return True
-    # Two‑character rejection rules (e.g., !X, /X, (X, )X, <N, >N, _N)
     if len(rule) == 2 and rule[0] in ('!', '/', '(', ')', '<', '>', '_'):
         return True
-    # Three‑character rejection rules (?NX, =NX)
-    if len(rule) == 3 and rule[0] in ('?', '='):
-        return True
-    # vNX rules (three‑character starting with 'v')
-    if len(rule) == 3 and rule[0] == 'v':
+    if len(rule) == 3 and rule[0] in ('?', '=', 'v'):
         return True
     return False
 
 # ====================================================================
-# --- HASHCAT RULE VALIDATION (GPU COMPATIBILITY) ---
+# --- HASHCAT RULE VALIDATOR ---
 # ====================================================================
 class HashcatRuleValidator:
     MAX_GPU_RULES = MAX_GPU_RULES
 
     @staticmethod
-    def is_digit(c):
+    def is_digit(c: str) -> bool:
         return '0' <= c <= '9'
 
     @staticmethod
-    def is_hex_digit(c):
-        return ('0' <= c <= '9') or ('A' <= c <= 'F') or ('a' <= c <= 'f')
-
-    @staticmethod
-    def conv_ctoi(c):
-        if '0' <= c <= '9':
-            return ord(c) - ord('0')
-        elif 'A' <= c <= 'Z':
-            return ord(c) - ord('A') + 10
-        elif 'a' <= c <= 'z':
-            return ord(c) - ord('a') + 10
-        return -1
-
-    @staticmethod
-    def validate_rule_for_gpu(rule_str):
-        """Validate rule for GPU compatibility (max 255 ops, correct arguments)"""
-        # Early reject unwanted rules
+    def validate_rule_for_gpu(rule_str: str) -> bool:
         if should_exclude_rule(rule_str):
-            if VERBOSE:
-                print(f"  Excluded (rejection/memory/vNX): {rule_str}")
             return False
-
-        line_len = len(rule_str)
-        pos = 0
-        cnt = 0
-
-        while pos < line_len:
+        pos = 0; cnt = 0; n = len(rule_str)
+        isd = HashcatRuleValidator.is_digit
+        while pos < n:
             c = rule_str[pos]
-
             if c == ' ':
-                pos += 1
-                continue
-
-            # --- Special case: p, z, Z can be single or two‑character ---
+                pos += 1; continue
+            # p / z / Z  — digit suffix is OPTIONAL
             if c in ('p', 'z', 'Z'):
-                # Check if next character is a digit (two‑character rule)
-                if pos + 1 < line_len and HashcatRuleValidator.is_digit(rule_str[pos+1]):
-                    # Two‑character rule (pN, zN, ZN)
-                    pos += 2
-                    cnt += 1
-                else:
-                    # Single‑character rule (p, z, Z)
-                    pos += 1
-                    cnt += 1
-                continue
-
-            # --- Commands with no arguments (single character) ---
-            if c in (':', 'l', 'u', 'c', 'C', 't', 'r', 'd', 'f', 'a', 'q', 'k', 'K', 'E',
-                     '{', '}', '[', ']'):
-                pos += 1
                 cnt += 1
+                pos += 1
+                if pos < n and isd(rule_str[pos]):
+                    pos += 1
                 continue
-
-            # --- Commands with one decimal digit (always two characters) ---
+            if c in (':', 'l', 'u', 'c', 'C', 't', 'r', 'd', 'f',
+                     'a', 'q', 'k', 'K', 'E', '{', '}', '[', ']'):
+                pos += 1; cnt += 1; continue
             if c in ('T', 'D', 'L', 'R', '+', '-', '.', ',', "'", 'y', 'Y'):
                 pos += 1
-                if pos >= line_len or not HashcatRuleValidator.is_digit(rule_str[pos]):
-                    if VERBOSE:
-                        print(f"  Invalid (missing digit after {c}): {rule_str}")
-                    return False
-                pos += 1
-                cnt += 1
-                continue
-
-            # --- Commands with one digit and then a character (any) ---
+                if pos >= n or not isd(rule_str[pos]): return False
+                pos += 1; cnt += 1; continue
             if c in ('i', 'o', '3'):
                 pos += 1
-                if pos >= line_len or not HashcatRuleValidator.is_digit(rule_str[pos]):
-                    if VERBOSE:
-                        print(f"  Invalid (missing digit after {c}): {rule_str}")
-                    return False
+                if pos >= n or not isd(rule_str[pos]): return False
                 pos += 1
-                if pos >= line_len:
-                    if VERBOSE:
-                        print(f"  Invalid (missing character after {c}N): {rule_str}")
-                    return False
-                pos += 1
-                cnt += 1
-                continue
-
-            # --- Commands with two decimal digits ---
+                if pos >= n: return False
+                pos += 1; cnt += 1; continue
             if c in ('x', '*', 'O'):
                 pos += 1
-                if pos >= line_len or not HashcatRuleValidator.is_digit(rule_str[pos]):
-                    if VERBOSE:
-                        print(f"  Invalid (missing first digit after {c}): {rule_str}")
-                    return False
+                if pos >= n or not isd(rule_str[pos]): return False
                 pos += 1
-                if pos >= line_len or not HashcatRuleValidator.is_digit(rule_str[pos]):
-                    if VERBOSE:
-                        print(f"  Invalid (missing second digit after {c}): {rule_str}")
-                    return False
-                pos += 1
-                cnt += 1
-                continue
-
-            # --- s : substitution (two chars) ---
+                if pos >= n or not isd(rule_str[pos]): return False
+                pos += 1; cnt += 1; continue
             if c == 's':
                 pos += 1
-                if pos >= line_len:
-                    if VERBOSE:
-                        print(f"  Invalid (missing first substitution char): {rule_str}")
-                    return False
-                pos += 1
-                if pos >= line_len:
-                    if VERBOSE:
-                        print(f"  Invalid (missing second substitution char): {rule_str}")
-                    return False
-                pos += 1
-                cnt += 1
-                continue
-
-            # --- Commands with one character (no digit) ---
+                if pos + 1 >= n: return False
+                pos += 2; cnt += 1; continue
             if c in ('@', 'e', '$', '^'):
                 pos += 1
-                if pos >= line_len:
-                    if VERBOSE:
-                        print(f"  Invalid (missing argument after {c}): {rule_str}")
-                    return False
-                pos += 1
-                cnt += 1
-                continue
-
-            # --- Two‑character reject rules (if allowed) ---
-            if ALLOW_REJECT_RULES and c in ('!', '/', '(', ')', '<', '>', '_'):
-                pos += 1
-                if pos >= line_len:
-                    if VERBOSE:
-                        print(f"  Invalid (missing argument after {c}): {rule_str}")
-                    return False
-                # any character is accepted
-                pos += 1
-                cnt += 1
-                continue
-
-            # --- Three‑character reject rules (if allowed) ---
-            if ALLOW_REJECT_RULES and c in ('?', '=', 'v'):
-                pos += 1
-                if pos >= line_len or not HashcatRuleValidator.is_digit(rule_str[pos]):
-                    if VERBOSE:
-                        print(f"  Invalid (missing digit after {c}): {rule_str}")
-                    return False
-                pos += 1
-                if pos >= line_len:
-                    if VERBOSE:
-                        print(f"  Invalid (missing character after {c}N): {rule_str}")
-                    return False
-                pos += 1
-                cnt += 1
-                continue
-
-            # --- Memory / reject rules (not supported on GPU) ---
-            if c in ('X', '4', '6', 'M', 'v', '<', '>', '!', '/', '(', ')', '=', '%', 'Q', '?'):
-                if VERBOSE:
-                    print(f"  Excluded (unsupported command {c}): {rule_str}")
-                return False
-
-            # --- Unknown command ---
-            if VERBOSE:
-                print(f"  Invalid (unknown command {c}): {rule_str}")
+                if pos >= n: return False
+                pos += 1; cnt += 1; continue
             return False
-
-        # Check rule count limit
-        if cnt > HashcatRuleValidator.MAX_GPU_RULES:
-            if VERBOSE:
-                print(f"  Invalid (too many rules): {rule_str}")
-            return False
-
-        return True
+        return cnt <= HashcatRuleValidator.MAX_GPU_RULES
 
     @staticmethod
     def validate_rules_for_gpu(rules):
-        valid_rules = []
-        for rule in rules:
-            # FIX: use strip('\n\r') instead of strip() so that rules whose
-            # argument IS a space character (e.g. "^ " = prepend space,
-            # "e " = title-case on space separator) are not silently truncated
-            # to bare commands that then fail validation.
-            rule = rule.strip('\n\r')
-            if not rule:
-                continue
-            if HashcatRuleValidator.validate_rule_for_gpu(rule):
-                valid_rules.append(rule)
-        return valid_rules
+        valid = []
+        for r in rules:
+            r = r.strip('\n\r')
+            if r and HashcatRuleValidator.validate_rule_for_gpu(r):
+                valid.append(r)
+        return valid
 
 # ====================================================================
-# --- FNV-1a HASH ---
+# --- FNV-1a ---
 # ====================================================================
 def fnv1a_32(data, seed=FNV1A_SEED1):
     h = seed ^ FNV1A_OFFSET_BASIS
     for b in data:
-        h ^= b
-        h = (h * FNV1A_PRIME) & 0xFFFFFFFF
+        h ^= b; h = (h * FNV1A_PRIME) & 0xFFFFFFFF
     return h
 
 # ====================================================================
-# --- GPU DEVICE SELECTION ---
+# --- PYTHON-SIDE RULE APPLICATOR ---
 # ====================================================================
+def _py_apply_single_rule(rule: str, word: str) -> Optional[str]:
+    """Apply one hashcat rule. Returns None for unsupported opcodes."""
+    if not rule:
+        return word
+    w   = list(word.encode('latin-1'))
+    cmd = rule[0]
+    def dg(c): return ord(c) - 48 if '0' <= c <= '9' else -1
+    try:
+        if   cmd == ':': pass
+        elif cmd == 'l': w = [c | 0x20 if 65<=c<=90 else c for c in w]
+        elif cmd == 'u': w = [c & ~0x20 if 97<=c<=122 else c for c in w]
+        elif cmd == 'c':
+            if w:
+                w[0] = w[0] & ~0x20 if 97<=w[0]<=122 else w[0]
+                w[1:] = [c | 0x20 if 65<=c<=90 else c for c in w[1:]]
+        elif cmd == 'C':
+            if w:
+                w[0] = w[0] | 0x20 if 65<=w[0]<=90 else w[0]
+                w[1:] = [c & ~0x20 if 97<=c<=122 else c for c in w[1:]]
+        elif cmd == 't':
+            w = [c|0x20 if 65<=c<=90 else (c&~0x20 if 97<=c<=122 else c) for c in w]
+        elif cmd == 'r': w = w[::-1]
+        elif cmd == 'd': w = w + w
+        elif cmd == 'f': w = w + w[::-1]
+        elif cmd == '{':
+            if len(w) > 1: w = w[1:] + [w[0]]
+        elif cmd == '}':
+            if len(w) > 1: w = [w[-1]] + w[:-1]
+        elif cmd == '[':
+            if w: w = w[1:]
+        elif cmd == ']':
+            if w: w = w[:-1]
+        elif cmd == 'k':
+            if len(w) >= 2: w[0], w[1] = w[1], w[0]
+        elif cmd == 'K':
+            if len(w) >= 2: w[-1], w[-2] = w[-2], w[-1]
+        elif cmd == 'q':
+            out = []
+            for c in w: out += [c, c]
+            w = out
+        elif cmd == 'E':
+            out = []; cap = True
+            for c in w:
+                out.append(c & ~0x20 if cap and 97<=c<=122 else c)
+                cap = c in (32, 45, 95)
+            w = out
+        elif cmd == '^' and len(rule)==2: w = [ord(rule[1])] + w
+        elif cmd == '$' and len(rule)==2: w = w + [ord(rule[1])]
+        elif cmd == '@' and len(rule)==2:
+            ch = ord(rule[1]); w = [c for c in w if c != ch]
+        elif cmd == 'p' and len(rule)==2:
+            n = dg(rule[1])
+            if n > 0: orig = w[:]; [w.__iadd__(orig) for _ in range(n)]
+        elif cmd == 'T' and len(rule)==2:
+            p = dg(rule[1])
+            if 0 <= p < len(w):
+                c = w[p]; w[p] = c|0x20 if 65<=c<=90 else (c&~0x20 if 97<=c<=122 else c)
+        elif cmd == 'D' and len(rule)==2:
+            p = dg(rule[1])
+            if 0 <= p < len(w): w.pop(p)
+        elif cmd == 'L' and len(rule)==2:
+            p = dg(rule[1])
+            if 0 <= p < len(w): w[p] = (w[p] << 1) & 0xFF
+        elif cmd == 'R' and len(rule)==2:
+            p = dg(rule[1])
+            if 0 <= p < len(w): w[p] = (w[p] >> 1) & 0xFF
+        elif cmd == '+' and len(rule)==2:
+            p = dg(rule[1])
+            if 0 <= p < len(w): w[p] = (w[p] + 1) & 0xFF
+        elif cmd == '-' and len(rule)==2:
+            p = dg(rule[1])
+            if 0 <= p < len(w): w[p] = (w[p] - 1) & 0xFF
+        elif cmd in ('.', ',') and len(rule)==2:
+            p = dg(rule[1]); delta = 1 if cmd == '.' else -1
+            if 0 <= p < len(w): w[p] = (w[p] + delta) & 0xFF
+        elif cmd == "'" and len(rule)==2:
+            p = dg(rule[1])
+            if 0 <= p < len(w): w = w[:p+1]
+        elif cmd == 'z' and len(rule)==2:
+            n = dg(rule[1])
+            if n > 0 and w: w = [w[0]] * n + w
+        elif cmd == 'Z' and len(rule)==2:
+            n = dg(rule[1])
+            if n > 0 and w: w = w + [w[-1]] * n
+        elif cmd == 'y' and len(rule)==2:
+            n = dg(rule[1])
+            if n > 0: w = w[:n] + w
+        elif cmd == 'Y' and len(rule)==2:
+            n = dg(rule[1])
+            if n > 0 and len(w) >= n: w = w + w[-n:]
+        elif cmd == 's' and len(rule)==3:
+            a, b = ord(rule[1]), ord(rule[2])
+            w = [b if c==a else c for c in w]
+        elif cmd == 'i' and len(rule)==3:
+            p, ch = dg(rule[1]), ord(rule[2])
+            if 0 <= p <= len(w): w.insert(p, ch)
+        elif cmd == 'o' and len(rule)==3:
+            p, ch = dg(rule[1]), ord(rule[2])
+            if 0 <= p < len(w): w[p] = ch
+        elif cmd == 'e' and len(rule)>=2:
+            sep = ord(rule[1]); out = []; cap = True
+            for c in w:
+                out.append(c & ~0x20 if cap and 97<=c<=122 else c)
+                cap = (c == sep)
+            w = out
+        elif cmd == 'x' and len(rule)==3:
+            a, b = dg(rule[1]), dg(rule[2])
+            if a > b: a, b = b, a
+            w = w[a:b+1]
+        elif cmd == 'O' and len(rule)==3:
+            p, m = dg(rule[1]), dg(rule[2])
+            if 0 <= p < len(w) and m > 0: w = w[:p] + w[p+m:]
+        elif cmd == '*' and len(rule)==3:
+            a, b = dg(rule[1]), dg(rule[2])
+            if 0<=a<len(w) and 0<=b<len(w) and a!=b: w[a], w[b] = w[b], w[a]
+        elif cmd == '3' and len(rule)==3:
+            n, sep = dg(rule[1]), ord(rule[2]); cnt = 0
+            for i, c in enumerate(w):
+                if c == sep:
+                    cnt += 1
+                    if cnt == n and i+1 < len(w):
+                        ci = w[i+1]
+                        w[i+1] = ci|0x20 if 65<=ci<=90 else (ci&~0x20 if 97<=ci<=122 else ci)
+                        break
+        else:
+            return None
+    except Exception:
+        return None
+    try:
+        return bytes(w).decode('latin-1')
+    except Exception:
+        return None
+
+
+def py_apply_chain(chain: str, word: str) -> Optional[str]:
+    """Apply space-separated rule chain. Returns None if any opcode unsupported."""
+    cur = word
+    for r in chain.split():
+        cur = _py_apply_single_rule(r, cur)
+        if cur is None:
+            return None
+    return cur
+
+# ====================================================================
+# --- SIGNATURE-BASED FUNCTIONAL MINIMIZATION ---
+# ====================================================================
+
+def _build_probe_set(base_words: list, sig_words: int, min_word_len: int,
+                     seed: int = 42) -> List[str]:
+    """
+    Select *sig_words* probe words of length >= min_word_len from base_words.
+    Falls back to shorter words if not enough long words are available.
+    The selection is deterministic (fixed seed).
+    """
+    long_words = [w for w in base_words if len(w) >= min_word_len]
+    rng = random.Random(seed)
+
+    if len(long_words) >= sig_words:
+        return rng.sample(long_words, sig_words)
+
+    # Not enough long words — use what we have + fill from the rest
+    short_words = [w for w in base_words if len(w) < min_word_len]
+    needed = sig_words - len(long_words)
+    fill   = rng.sample(short_words, min(needed, len(short_words)))
+    probe  = long_words + fill
+
+    if len(probe) < sig_words:
+        log_warn(
+            f"Only {len(probe)} words available for probe set "
+            f"(requested {sig_words}). Minimization may be less precise."
+        )
+    return probe
+
+
+def compute_rule_signature(rule: str, probe_words: List[str]) -> tuple:
+    """
+    Compute the functional signature of *rule* over *probe_words*.
+
+    The signature is a tuple of outputs (one per probe word).  When the rule
+    contains an unsupported opcode, the entire tuple is replaced by the
+    single-element tuple ``('__UNSUPPORTED__',)`` so that all unsupported rules
+    are bucketed together and the highest-GPU-count one survives.
+    """
+    outputs = []
+    for word in probe_words:
+        out = py_apply_chain(rule, word)
+        if out is None:
+            return ('__UNSUPPORTED__',)
+        outputs.append(out)
+    return tuple(outputs)
+
+
+def minimize_by_signature(
+    rule_counter: Counter,
+    base_words:   list,
+    sig_words:    int = DEFAULT_SIG_WORDS,
+    min_word_len: int = DEFAULT_MIN_WORD_LEN,
+) -> Counter:
+    """
+    Deduplicate *rule_counter* by functional signature.
+
+    Algorithm
+    ---------
+    1. Build a probe set of *sig_words* words with length >= *min_word_len*
+       drawn deterministically from *base_words*.
+    2. For every candidate rule (with a tqdm progress bar), compute its
+       signature = tuple of outputs on the probe set.
+    3. Group rules that share the same signature — they are functionally
+       equivalent on the probe set.
+    4. Within each group, keep the rule with the **highest GPU hit-count**
+       (ties broken by shortest depth, then lexicographic order).
+    5. Return a Counter of surviving rules with their original GPU counts.
+
+    Rules containing unsupported opcodes are bucketed into a single
+    '__UNSUPPORTED__' group; one representative (highest count) is kept.
+
+    Parameters
+    ----------
+    rule_counter : Counter
+        Raw GPU bloom-filter hit counts keyed by rule string.
+    base_words : list
+        Full list of base words loaded from the base wordlist.
+    sig_words : int
+        Number of probe words used to build each signature.
+    min_word_len : int
+        Minimum character length for probe words.
+
+    Returns
+    -------
+    Counter
+        Surviving rules mapped to their original GPU hit-counts.
+    """
+    if not rule_counter:
+        return Counter()
+
+    probe = _build_probe_set(base_words, sig_words, min_word_len)
+
+    log_section("POST-PROCESSING — Signature-Based Functional Minimization")
+    log_info(f"[MINIMIZE] Candidates  : {bold(str(len(rule_counter)))}")
+    log_info(f"[MINIMIZE] Probe words : {bold(str(len(probe)))}  "
+             f"(min length {min_word_len}+)")
+    log_debug(f"Probe set: {probe}")
+
+    # sig_map[signature] = list of (rule, gpu_count)
+    sig_map: Dict[tuple, List[Tuple[str, int]]] = defaultdict(list)
+
+    rule_items = list(rule_counter.items())
+
+    with tqdm(
+        total=len(rule_items),
+        desc=green("  Minimizing"),
+        unit="rule",
+        ncols=88,
+        bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}",
+    ) as pbar:
+        n_groups = 0
+        for rule, gpu_count in rule_items:
+            sig = compute_rule_signature(rule, probe)
+            sig_map[sig].append((rule, gpu_count))
+            n_groups = len(sig_map)
+            pbar.update(1)
+            pbar.set_postfix({"unique_sigs": cyan(str(n_groups))}, refresh=False)
+
+    # Within each signature group, keep the rule with the highest GPU count.
+    # Tie-break: prefer shorter chain depth, then lexicographic order.
+    def _group_key(item: Tuple[str, int]) -> tuple:
+        rule, gpu_count = item
+        return (-gpu_count, len(rule.split()), rule)
+
+    survivors = Counter()
+    n_unsupported = 0
+    for sig, group in sig_map.items():
+        if sig == ('__UNSUPPORTED__',):
+            n_unsupported = len(group)
+        best_rule, best_count = min(group, key=_group_key)
+        survivors[best_rule] = best_count
+
+    removed    = len(rule_counter) - len(survivors)
+    n_groups   = len(sig_map)
+    log_info(f"[MINIMIZE] {green('Done')}")
+    log_info(f"           Unique signatures : {bold(cyan(str(n_groups))):>12s}")
+    log_info(f"           Rules kept        : {bold(green(str(len(survivors)))):>12s}")
+    log_info(f"           Rules removed     : {bold(red(str(removed))):>12s}  "
+             f"({removed / max(1, len(rule_counter)):.1%})")
+    if n_unsupported:
+        log_info(f"           Unsupported (kept 1 each group) : "
+                 f"{bold(str(n_unsupported))}")
+    log_debug(f"minimize_by_signature complete: "
+              f"kept={len(survivors)}, removed={removed}, sig_groups={n_groups}")
+
+    return survivors
+
+
+# ====================================================================
+# ====================================================================
+#  PRESERVE THIS BLOCK FROM THE ORIGINAL rulest_v2.py
+#  (lines ~622 – ~1498 in the original file)
+#
+#  Copy-paste the following functions/classes verbatim:
+#
+#    def load_wordlist(...)
+#    class GPUExtractor:
+#        ...   (all methods)
+#
+#  Nothing in that block needs to be changed.
+# ====================================================================
+# ====================================================================
+
+# --------------------------------------------------------------------
+# GPU device helpers (from original)
+# --------------------------------------------------------------------
 def get_all_devices():
     devices = []
-    platforms = cl.get_platforms()
-    for plat in platforms:
-        try:
-            gpu_devices = plat.get_devices(cl.device_type.GPU)
-            for dev in gpu_devices:
-                devices.append((plat, dev))
-        except Exception:
-            pass
-        try:
-            cpu_devices = plat.get_devices(cl.device_type.CPU)
-            for dev in cpu_devices:
-                devices.append((plat, dev))
-        except Exception:
-            pass
+    for plat in cl.get_platforms():
+        for dtype in (cl.device_type.GPU, cl.device_type.CPU):
+            try:
+                for dev in plat.get_devices(dtype): devices.append((plat, dev))
+            except Exception: pass
     return devices
 
 def list_devices():
-    devices = get_all_devices()
-    if not devices:
-        print(f"{red('[ERROR]')} No OpenCL devices found.")
-        sys.exit(1)
-    print(f"\n{blue('[DEVICES]')} Available OpenCL devices:")
-    for idx, (plat, dev) in enumerate(devices):
-        name = dev.get_info(cl.device_info.NAME)
-        typ = cl.device_type.to_string(dev.get_info(cl.device_info.TYPE))
-        print(f"  {cyan(f'{idx}:')} {name} ({typ}) – Platform: {plat.name}")
+    devs = get_all_devices()
+    if not devs:
+        log_error("No OpenCL devices found."); sys.exit(1)
+    log_info(f"\n{blue('Available OpenCL devices:')}")
+    for i, (p, d) in enumerate(devs):
+        t = cl.device_type.to_string(d.get_info(cl.device_info.TYPE))
+        log_info(f"  {cyan(str(i)+':')} {d.get_info(cl.device_info.NAME)} ({t}) — {p.name}")
     print()
 
 def get_device_by_spec(spec: Optional[str]):
-    if spec is None:
-        return get_best_gpu_device()
-    devices = get_all_devices()
-    if not devices:
-        raise RuntimeError("No OpenCL devices found")
+    if spec is None: return get_best_gpu_device()
+    devs = get_all_devices()
+    if not devs: raise RuntimeError("No OpenCL devices found")
     if spec.isdigit():
-        idx = int(spec)
-        if 0 <= idx < len(devices):
-            return devices[idx][1]
-        else:
-            raise RuntimeError(f"Device index {idx} out of range (0-{len(devices)-1})")
-    spec_lower = spec.lower()
-    matches = []
-    for plat, dev in devices:
-        name = dev.get_info(cl.device_info.NAME).lower()
-        if spec_lower in name:
-            matches.append(dev)
-    if len(matches) == 1:
-        return matches[0]
-    elif len(matches) > 1:
-        print(f"{yellow('[WARN]')} Multiple devices match '{spec}'; using the first one.")
-        return matches[0]
-    else:
-        raise RuntimeError(f"No device found matching '{spec}'")
+        i = int(spec)
+        if 0 <= i < len(devs): return devs[i][1]
+        raise RuntimeError(f"Device index {i} out of range")
+    lo = spec.lower()
+    m  = [d for _, d in devs if lo in d.get_info(cl.device_info.NAME).lower()]
+    if len(m) == 1: return m[0]
+    if len(m) >  1:
+        log_warn(f"Multiple devices match '{spec}'; using first."); return m[0]
+    raise RuntimeError(f"No device matching '{spec}'")
 
 def get_best_gpu_device():
-    platforms = cl.get_platforms()
-    if not platforms:
-        raise RuntimeError("No OpenCL platforms found")
-    best_device = None
-    best_score = -1
-    for plat in platforms:
-        try:
-            devices = plat.get_devices(cl.device_type.GPU)
-        except Exception:
-            continue
-        for dev in devices:
-            name = dev.get_info(cl.device_info.NAME).upper()
-            score = 0
-            if 'NVIDIA' in name or 'AMD' in name:
-                score += 10
-            if 'RTX' in name or 'GTX' in name:
-                score += 5
-            cu = dev.get_info(cl.device_info.MAX_COMPUTE_UNITS)
-            score += cu
-            if score > best_score:
-                best_score = score
-                best_device = dev
-    if best_device is None:
-        for plat in platforms:
-            try:
-                best_device = plat.get_devices(cl.device_type.GPU)[0]
-                break
-            except Exception:
-                continue
-    if best_device is None:
-        raise RuntimeError("No GPU device found")
-    return best_device
+    best = None; best_score = -1
+    for p in cl.get_platforms():
+        try: devs = p.get_devices(cl.device_type.GPU)
+        except: continue
+        for d in devs:
+            name  = d.get_info(cl.device_info.NAME).upper()
+            score = (10 if 'NVIDIA' in name or 'AMD' in name else 0)
+            score += (5 if 'RTX' in name or 'GTX' in name else 0)
+            score += d.get_info(cl.device_info.MAX_COMPUTE_UNITS)
+            if score > best_score: best_score = score; best = d
+    if best is None:
+        for p in cl.get_platforms():
+            try: return p.get_devices(cl.device_type.GPU)[0]
+            except: pass
+    if best is None: raise RuntimeError("No GPU found")
+    return best
 
 def estimate_free_vram(device):
-    try:
-        total = device.get_info(cl.device_info.GLOBAL_MEM_SIZE)
-        return int(total * VRAM_USAGE_FACTOR)
-    except Exception:
-        return 1 * 1024**3
+    try: return int(device.get_info(cl.device_info.GLOBAL_MEM_SIZE) * VRAM_USAGE_FACTOR)
+    except: return 1 * 1024**3
 
 def get_max_allocation(device):
-    """Return maximum buffer size that can be allocated on this device."""
-    try:
-        return device.get_info(cl.device_info.MAX_MEM_ALLOC_SIZE)
-    except:
-        return 1024 * 1024 * 1024  # fallback 1GB
+    try: return device.get_info(cl.device_info.MAX_MEM_ALLOC_SIZE)
+    except: return 1024**3
 
-# ====================================================================
-# --- DYNAMIC PARAMETERS ---
-# ====================================================================
-def calculate_dynamic_parameters(base_count, target_count, device=None, target_hours=0.5, bloom_size_mb=None):
+# --------------------------------------------------------------------
+# Dynamic parameters (from original)
+# --------------------------------------------------------------------
+def calculate_dynamic_parameters(base_count, target_count, device=None,
+                                  target_hours=0.5, bloom_mb_override=None):
     if device:
         try:
-            max_work_group_size = device.get_info(cl.device_info.MAX_WORK_GROUP_SIZE)
-            max_compute_units = device.get_info(cl.device_info.MAX_COMPUTE_UNITS)
-            global_mem = device.get_info(cl.device_info.GLOBAL_MEM_SIZE)
-            free_vram = estimate_free_vram(device)
-            vram_gb = free_vram / (1024**3)
-            is_nvidia = 'NVIDIA' in device.get_info(cl.device_info.NAME).upper()
-            LOCAL_WORK_SIZE = max([s for s in POSSIBLE_WORK_GROUP_SIZES if s <= max_work_group_size])
-            if is_nvidia and max_compute_units >= 38:
-                LOCAL_WORK_SIZE = min(512, LOCAL_WORK_SIZE)
-            OPTIMAL_GLOBAL_MULTIPLIER = max_compute_units * OPTIMAL_GLOBAL_MULTIPLIER_BASE
-            EST_COMBOS_PER_SEC = BASELINE_COMBOS_PER_SEC
-            if max_compute_units < LOW_END_COMPUTE_UNITS_THRESHOLD:
-                EST_COMBOS_PER_SEC = LOW_END_COMBOS_PER_SEC
-            if VERBOSE:
-                print(f"{blue('[GPU]')} {bold('Work Group Limits:')}")
-                print(f"  {cyan('[*]')} Max work group size: {max_work_group_size}")
-                print(f"  {cyan('[*]')} Compute units: {max_compute_units}")
-                print(f"  {cyan('[*]')} Global memory: {global_mem // (1024**3)}GB")
-                print(f"  {cyan('[*]')} Estimated free VRAM: {vram_gb:.1f}GB")
-                print(f"  {cyan('[*]')} Using work group size: {LOCAL_WORK_SIZE}")
+            mwgs = device.get_info(cl.device_info.MAX_WORK_GROUP_SIZE)
+            mcu  = device.get_info(cl.device_info.MAX_COMPUTE_UNITS)
+            fv   = estimate_free_vram(device)
+            vgb  = fv / 1024**3
+            isn  = 'NVIDIA' in device.get_info(cl.device_info.NAME).upper()
+            lws  = max(s for s in POSSIBLE_WORK_GROUP_SIZES if s <= mwgs)
+            if isn and mcu >= 38: lws = min(512, lws)
+            est  = (LOW_END_COMBOS_PER_SEC if mcu < LOW_END_COMPUTE_UNITS_THRESHOLD
+                    else BASELINE_COMBOS_PER_SEC)
+            log_debug(f"GPU: CU={mcu}, VRAM~{vgb:.1f}GB, WGS={lws}, "
+                      f"est={est//1_000_000}M combos/s")
         except Exception:
-            LOCAL_WORK_SIZE = 256
-            OPTIMAL_GLOBAL_MULTIPLIER = 38 * OPTIMAL_GLOBAL_MULTIPLIER_BASE
-            EST_COMBOS_PER_SEC = BASELINE_COMBOS_PER_SEC
-            max_compute_units = 38
-            free_vram = 2 * 1024**3
-            vram_gb = 2.0
+            lws = 256; est = BASELINE_COMBOS_PER_SEC; mcu = 38; fv = 2*1024**3; vgb = 2.0
     else:
-        LOCAL_WORK_SIZE = 256
-        OPTIMAL_GLOBAL_MULTIPLIER = 608
-        EST_COMBOS_PER_SEC = BASELINE_COMBOS_PER_SEC
-        max_compute_units = 38
-        free_vram = 2 * 1024**3
-        vram_gb = 2.0
+        lws = 256; est = BASELINE_COMBOS_PER_SEC; mcu = 38; fv = 2*1024**3; vgb = 2.0
 
-    vram_scale = min(1.0, vram_gb / 8.0)
-    vram_scale = max(0.25, vram_scale)
+    vram_scale = max(0.25, min(1.0, vgb / 8.0))
+    ts         = target_hours * 3600
+    eff_bloom  = bloom_mb_override or BLOOM_FILTER_MAX_MB
+    bsize_b    = min(1024*1024*eff_bloom*2, eff_bloom*1024*1024)
+    if vgb < 4: bsize_b = min(bsize_b, 32*1024*1024)
+    bloom_bits = bsize_b * 8
 
-    target_seconds = target_hours * 3600
-    max_combinations_time_limit = int(EST_COMBOS_PER_SEC * target_seconds * TIME_SAFETY_FACTOR)
-
-    # Bloom filter size – either user‑specified or auto‑calculated
-    if bloom_size_mb is not None:
-        BLOOM_FILTER_SIZE_BYTES = bloom_size_mb * 1024 * 1024
-        if device:
-            free_vram = estimate_free_vram(device)
-            if BLOOM_FILTER_SIZE_BYTES > free_vram:
-                print(f"{yellow('[WARN]')} Bloom filter size exceeds free VRAM ({free_vram/1024**3:.1f}GB). Reducing to {free_vram/1024**3:.1f}GB.")
-                BLOOM_FILTER_SIZE_BYTES = free_vram
-        BLOOM_FILTER_SIZE = BLOOM_FILTER_SIZE_BYTES * 8
-    else:
-        BASE_BLOOM_SIZE = 1024 * 1024 * BLOOM_FILTER_MAX_MB
-        bloom_scale = max(1.0, math.log10(base_count + target_count) / 2.0)
-        BLOOM_FILTER_SIZE_BYTES = int(BASE_BLOOM_SIZE * min(bloom_scale, 2.0))
-        MAX_BLOOM_BYTES = BLOOM_FILTER_MAX_MB * 1024 * 1024
-        if vram_gb < 4:
-            MAX_BLOOM_BYTES = 32 * 1024 * 1024
-        BLOOM_FILTER_SIZE_BYTES = min(BLOOM_FILTER_SIZE_BYTES, MAX_BLOOM_BYTES)
-        BLOOM_FILTER_SIZE = BLOOM_FILTER_SIZE_BYTES * 8
-
-    WORDS_PER_BATCH = max(1000, int(BASE_WORDS_PER_BATCH * vram_scale))
-    CHAINS_PER_BATCH = max(500, int(BASE_CHAINS_PER_BATCH * vram_scale))
-    WORD_SUB_BATCH = max(5000, int(BASE_WORD_SUB_BATCH * vram_scale))
-    MAX_SAFE_RESULTS_PER_BATCH = max(5000, int(BASE_MAX_SAFE_RESULTS * vram_scale))
-
-    MAX_CHAINS_TO_FIND = 2**31 - 1
-
-    if VERBOSE:
-        print(f"\n{blue('[TIME]')} {bold(f'Target completion: {target_hours} hours')}")
-        print(f"{blue('[PERF]')} {bold('Estimated processing speed:')} {cyan(f'{EST_COMBOS_PER_SEC:,}')} combos/sec")
-        print(f"{blue('[PERF]')} {bold('Max combinations in time:')} {cyan(f'{max_combinations_time_limit:,}')}")
-        print(f"{blue('[VRAM]')} {bold('Bloom filter size:')} {cyan(f'{BLOOM_FILTER_SIZE_BYTES / 1024 / 1024:.1f}MB')}")
-        print(f"{blue('[VRAM]')} {bold('Batch sizes:')} {cyan(f'{WORDS_PER_BATCH}/{CHAINS_PER_BATCH}/{WORD_SUB_BATCH}')}")
-        print(f"{blue('[VRAM]')} {bold('Max output per batch:')} {cyan(f'{MAX_SAFE_RESULTS_PER_BATCH:,}')}")
-        print(f"{blue('[LIMIT]')} {bold('Global cap:')} {cyan('unlimited')}")
+    if target_count > 0:
+        fill = 1.0 - math.exp(-BLOOM_HASH_FUNCTIONS * target_count / bloom_bits)
+        fpr  = fill ** BLOOM_HASH_FUNCTIONS
+        msg  = (f"Bloom: {bsize_b//1024//1024}MB, fill={fill:.3%}, FPR~{fpr:.6%}"
+                + (" ← HIGH, raise --bloom-mb" if fpr > 0.01 else ""))
+        log_debug(msg)
+        if fpr > 0.01:
+            log_warn(f"Bloom filter FPR {fpr:.3%} is high — consider --bloom-mb {eff_bloom*2}")
 
     return {
-        'BLOOM_FILTER_SIZE': BLOOM_FILTER_SIZE,
-        'WORDS_PER_BATCH': WORDS_PER_BATCH,
-        'CHAINS_PER_BATCH': CHAINS_PER_BATCH,
-        'WORD_SUB_BATCH': WORD_SUB_BATCH,
-        'MAX_SAFE_RESULTS_PER_BATCH': MAX_SAFE_RESULTS_PER_BATCH,
-        'MAX_CHAINS_TO_FIND': MAX_CHAINS_TO_FIND,
-        'LOCAL_WORK_SIZE': LOCAL_WORK_SIZE,
-        'OPTIMAL_GLOBAL_MULTIPLIER': OPTIMAL_GLOBAL_MULTIPLIER,
-        'EST_COMBOS_PER_SEC': EST_COMBOS_PER_SEC,
-        'TARGET_SECONDS': target_seconds,
-        'bloom_scale': bloom_scale if bloom_size_mb is None else None,
-        'vram_scale': vram_scale,
-        'free_vram': free_vram
+        'BLOOM_FILTER_SIZE'         : bloom_bits,
+        'WORDS_PER_BATCH'           : max(1000, int(BASE_WORDS_PER_BATCH  * vram_scale)),
+        'CHAINS_PER_BATCH'          : max(500,  int(BASE_CHAINS_PER_BATCH * vram_scale)),
+        'WORD_SUB_BATCH'            : max(5000, int(BASE_WORD_SUB_BATCH   * vram_scale)),
+        'MAX_SAFE_RESULTS_PER_BATCH': max(5000, int(BASE_MAX_SAFE_RESULTS * vram_scale)),
+        'MAX_CHAINS_TO_FIND'        : 2**31 - 1,
+        'LOCAL_WORK_SIZE'           : lws,
+        'OPTIMAL_GLOBAL_MULTIPLIER' : mcu * OPTIMAL_GLOBAL_MULTIPLIER_BASE,
+        'EST_COMBOS_PER_SEC'        : est,
+        'TARGET_SECONDS'            : ts,
+        'vram_scale'                : vram_scale,
+        'free_vram'                 : fv,
     }
 
-# ====================================================================
-# --- GPU-COMPATIBLE RULES GENERATION (VERBOSE) ---
-# ====================================================================
+# --------------------------------------------------------------------
+# GPU-compatible rules generator (from original)
+# --------------------------------------------------------------------
 class GPUCompatibleRulesGenerator:
     def __init__(self):
         self.validator = HashcatRuleValidator()
 
     def generate_gpu_compatible_rules(self):
-        rules = set()
-        if VERBOSE:
-            print(f"{blue('[SETUP]')} {bold('Generating GPU-compatible Hashcat rules...')}")
-
-        # ===== CATEGORY 1: SIMPLE RULES =====
-        if VERBOSE:
-            print(f"  {cyan('[*]')} Simple rules...")
-        simple_rules = [
-            'l', 'u', 'c', 'C', 't', 'r', 'd', 'f', 'p', 'z', 'Z', 'q', 'E',
-            '{', '}', '[', ']', 'k', 'K', ':'
-        ]
-        rules.update(simple_rules)
-        if VERBOSE:
-            print(f"    Generated {len(simple_rules)} simple rules (first 10: {', '.join(simple_rules[:10])})")
-
-        # ===== CATEGORY 2: POSITION-BASED RULES =====
-        if VERBOSE:
-            print(f"  {cyan('[*]')} Position-based rules (0-9 only)...")
+        rules  = set()
         digits = '0123456789'
-        pos_cmds = ['T', 'D', 'L', 'R', '+', '-', '.', ',', "'", 'z', 'Z', 'y', 'Y']
-        pos_rules = []
-        for cmd in pos_cmds:
-            for pos in digits:
-                r = f'{cmd}{pos}'
-                rules.add(r)
-                pos_rules.append(r)
-        if VERBOSE:
-            print(f"    Generated {len(pos_rules)} position-based rules (first 10: {', '.join(pos_rules[:10])})")
 
-        # Two position rules
-        two_pos_cmds = ['x', '*', 'O']
-        two_pos_rules = []
-        for cmd in two_pos_cmds:
+        # Single‑letter rules (excluding p, z, Z because they need a digit)
+        rules.update(['l','u','c','C','t','r','d','f',
+                      'q','E','{','}','[',']','k','K',':'])
+
+        # Two‑letter rules that need a digit
+        for cmd in ('T','D','L','R','+','-','.',',', "'", 'z','Z','y','Y'):
+            for pos in digits: rules.add(f'{cmd}{pos}')
+
+        # Two‑letter rules that need a digit (p)
+        for pos in digits:
+            rules.add(f'p{pos}')
+
+        # Three‑letter rules that need two digits
+        for cmd in ('x','*','O'):
             for p1 in digits:
-                for p2 in digits:
-                    r = f'{cmd}{p1}{p2}'
-                    rules.add(r)
-                    two_pos_rules.append(r)
-        if VERBOSE:
-            print(f"    Generated {len(two_pos_rules)} two-position rules (first 10: {', '.join(two_pos_rules[:10])})")
+                for p2 in digits: rules.add(f'{cmd}{p1}{p2}')
 
-        # ===== CATEGORY 3: PREFIX/SUFFIX (PRINTABLE ASCII, EXCLUDING SPACE) =====
-        if VERBOSE:
-            print(f"  {cyan('[*]')} Prefix/suffix rules (printable ASCII, excluding space)...")
-        prefix_suffix = set()
-        for i in range(33, 127):  # chr(33)='!' through chr(126)='~'; chr(32)=' ' excluded
-            char = chr(i)
-            prefix_suffix.add(f'^{char}')
-            prefix_suffix.add(f'${char}')
-            prefix_suffix.add(f'@{char}')
-        rules.update(prefix_suffix)
-        if VERBOSE:
-            examples = [f'^{chr(i)}' for i in range(33, 43)] + [f'${chr(i)}' for i in range(33, 43)]
-            print(f"    Generated {len(prefix_suffix)} prefix/suffix rules (first 10: {', '.join(examples[:10])})")
+        for i in range(33, 127):
+            ch = chr(i)
+            rules.add(f'^{ch}'); rules.add(f'${ch}'); rules.add(f'@{ch}')
 
-        # ===== CATEGORY 4: SUBSTITUTIONS =====
-        if VERBOSE:
-            print(f"  {cyan('[*]')} Substitution rules...")
-        leet_subs = [
-            ('a', '@'), ('a', '4'), ('e', '3'), ('i', '1'), ('o', '0'),
-            ('s', '$'), ('s', '5'), ('t', '7'), ('l', '1'), ('g', '9'),
-            ('b', '8'), ('z', '2')
-        ]
-        sub_rules = []
-        for orig, sub in leet_subs:
-            r = f's{orig}{sub}'
-            rules.add(r)
-            sub_rules.append(r)
         for orig in string.ascii_lowercase + string.ascii_uppercase:
             for sub in string.digits + string.punctuation:
-                if orig != sub:
-                    r = f's{orig}{sub}'
-                    rules.add(r)
-                    sub_rules.append(r)
-        if VERBOSE:
-            print(f"    Generated {len(sub_rules)} substitution rules (first 10: {', '.join(sub_rules[:10])})")
+                if orig != sub: rules.add(f's{orig}{sub}')
 
-        # ===== CATEGORY 5: INSERTION/OVERWRITE =====
-        if VERBOSE:
-            print(f"  {cyan('[*]')} Insertion/overwrite rules...")
-        io_rules = []
+        chars = string.ascii_letters + string.digits + '!@#$%^&*()_+-=[]{}|;:,.<>?/~'
         for pos in digits:
-            for char in string.ascii_letters + string.digits + '!@#$%^&*()_+-=[]{}|;:,.<>?/~':
-                i_rule = f'i{pos}{char}'
-                o_rule = f'o{pos}{char}'
-                rules.add(i_rule)
-                rules.add(o_rule)
-                io_rules.append(i_rule)
-                io_rules.append(o_rule)
-        if VERBOSE:
-            print(f"    Generated {len(io_rules)} insertion/overwrite rules (first 10: {', '.join(io_rules[:10])})")
+            for ch in chars:
+                rules.add(f'i{pos}{ch}'); rules.add(f'o{pos}{ch}')
 
-        # ===== CATEGORY 6: EXTRACTION/SWAP =====
-        if VERBOSE:
-            print(f"  {cyan('[*]')} Extraction/swap rules...")
-        extract_swap = set()
-        for n in digits:
-            for m in digits:
-                if n != m:
-                    extract_swap.add(f'x{n}{m}')
-                    extract_swap.add(f'*{n}{m}')
-                extract_swap.add(f'O{n}{m}')
-        rules.update(extract_swap)
-        if VERBOSE:
-            print(f"    Generated {len(extract_swap)} extraction/swap rules (first 10: {', '.join(list(extract_swap)[:10])})")
-
-        # ===== CATEGORY 7: DUPLICATION =====
-        if VERBOSE:
-            print(f"  {cyan('[*]')} Duplication rules...")
-        dup_rules = set()
         for n in range(1, 10):
-            dup_rules.add(f'p{n}')
-            dup_rules.add(f'y{n}')
-            dup_rules.add(f'Y{n}')
-            dup_rules.add(f'z{n}')
-            dup_rules.add(f'Z{n}')
-        rules.update(dup_rules)
-        if VERBOSE:
-            print(f"    Generated {len(dup_rules)} duplication rules (first 10: {', '.join(list(dup_rules)[:10])})")
+            for ch in ('p','y','Y','z','Z'): rules.add(f'{ch}{n}')
 
-        # ===== CATEGORY 8: TITLE CASE WITH SEPARATOR =====
-        if VERBOSE:
-            print(f"  {cyan('[*]')} Title case rules...")
-        title_rules = set()
-        for sep in ['-', '_', '.', ',', ';', ':', '|', '/', '\\', '+', '*', '&', '^', '%', '$', '#', '@', '!', '~', '`']:
-            title_rules.add(f'e{sep}')
-        rules.update(title_rules)
-        if VERBOSE:
-            print(f"    Generated {len(title_rules)} title case rules (first 10: {', '.join(list(title_rules)[:10])})")
+        for sep in '-_.,;:|/\\+*&^%$#@!~`':
+            rules.add(f'e{sep}')
 
-        # ===== CATEGORY 9: TOGGLE AFTER NTH SEPARATOR =====
-        if VERBOSE:
-            print(f"  {cyan('[*]')} Toggle after Nth separator rules...")
-        toggle_rules = set()
+        chars2 = string.ascii_letters + string.digits + '!@#$%^&*()_+-=[]{}|;:,.<>?/~'
         for n in digits:
-            for sep in string.ascii_letters + string.digits + '!@#$%^&*()_+-=[]{}|;:,.<>?/~':
-                toggle_rules.add(f'3{n}{sep}')
-        rules.update(toggle_rules)
-        if VERBOSE:
-            print(f"    Generated {len(toggle_rules)} toggle-after-Nth rules (first 10: {', '.join(list(toggle_rules)[:10])})")
+            for sep in chars2: rules.add(f'3{n}{sep}')
 
-        # Convert to list and validate
-        rules_list = list(rules)
-        valid_rules = []
-        excluded_count = 0
+        valid = [r for r in rules
+                 if self.validator.validate_rule_for_gpu(r) and 1 <= len(r) <= MAX_RULE_LEN]
 
-        if VERBOSE:
-            print(f"  {cyan('[*]')} Validating rules for GPU compatibility...")
-        for rule in tqdm(rules_list, desc="Validating", leave=False, disable=False):
-            if self.validator.validate_rule_for_gpu(rule):
-                if 1 <= len(rule) <= MAX_RULE_LEN:
-                    valid_rules.append(rule)
-            else:
-                excluded_count += 1
+        log_debug(f"Generated {len(valid):,} GPU-compatible atomic rules")
+        return valid
 
-        if VERBOSE:
-            print(f"{green('[OK]')} {bold('Generated:')} {cyan(f'{len(valid_rules):,}')} {bold('GPU-compatible Hashcat rules')} "
-                  f"(excluded {excluded_count} invalid/unwanted)")
-        return valid_rules
+# --------------------------------------------------------------------
+# OpenCL kernel (from original)
+# --------------------------------------------------------------------
+GPU_KERNEL_TEMPLATE = r"""
+#define MAX_WORD_LEN         {MAX_WORD_LEN}
+#define MAX_RULE_LEN         {MAX_RULE_LEN}
+#define MAX_OUTPUT_LEN       {MAX_OUTPUT_LEN}
+#define MAX_CHAIN_STRING_LEN {MAX_CHAIN_STRING_LEN}
+#define MAX_CHAINS_TO_FIND   {MAX_SAFE_RESULTS_PER_BATCH}
+#define MAX_CHAIN_DEPTH      {MAX_CHAIN_DEPTH}
+#define BLOOM_FILTER_SIZE    {BLOOM_FILTER_SIZE}
+#define BLOOM_HASH_FUNCTIONS {BLOOM_HASH_FUNCTIONS}
 
-# ====================================================================
-# --- GPU ENGINE (with error recovery) ---
-# ====================================================================
+uint fnv1a(const unsigned char *d,int len,uint seed){{
+    uint h=seed^2166136261U;for(int i=0;i<len;i++){{h^=d[i];h*=16777619U;}}return h;
+}}
+inline int isl(unsigned char c){{return c>='a'&&c<='z';}}
+inline int isu(unsigned char c){{return c>='A'&&c<='Z';}}
+inline int isd(unsigned char c){{return c>='0'&&c<='9';}}
+inline unsigned char tol(unsigned char c){{return isu(c)?c+32:c;}}
+inline unsigned char tou(unsigned char c){{return isl(c)?c-32:c;}}
+inline unsigned char tog(unsigned char c){{return isl(c)?c-32:(isu(c)?c+32:c);}}
+
+int bloom(__global const uchar *bf,const unsigned char *w,int len){{
+    uint h1=fnv1a(w,len,0xDEADBEEF),h2=fnv1a(w,len,0xCAFEBABE);
+    for(int i=0;i<BLOOM_HASH_FUNCTIONS;i++){{
+        uint idx=(h1+i*h2)%BLOOM_FILTER_SIZE;
+        if(!(bf[idx/8]&(1<<(idx%8))))return 0;
+    }}return 1;
+}}
+
+int apply(const unsigned char *rs,int rl,
+          const unsigned char *in,int il,
+          unsigned char *out,int *ol){{
+    *ol=il;for(int i=0;i<il;i++)out[i]=in[i];out[il]='\0';
+    if(!rl||!il)return 1;
+    unsigned char cmd=rs[0];int changed=0;
+    if(rl==1){{
+        switch(cmd){{
+        case 'l':for(int i=0;i<*ol;i++)out[i]=tol(out[i]);changed=1;break;
+        case 'u':for(int i=0;i<*ol;i++)out[i]=tou(out[i]);changed=1;break;
+        case 'c':if(*ol>0){{out[0]=tou(out[0]);for(int i=1;i<*ol;i++)out[i]=tol(out[i]);}}changed=1;break;
+        case 'C':if(*ol>0){{out[0]=tol(out[0]);for(int i=1;i<*ol;i++)out[i]=tou(out[i]);}}changed=1;break;
+        case 't':for(int i=0;i<*ol;i++)out[i]=tog(out[i]);changed=1;break;
+        case 'r':for(int i=0;i<*ol/2;i++){{unsigned char t=out[i];out[i]=out[*ol-1-i];out[*ol-1-i]=t;}}changed=1;break;
+        case 'd':if(*ol*2<=MAX_OUTPUT_LEN){{for(int i=0;i<*ol;i++)out[*ol+i]=out[i];*ol*=2;}}changed=1;break;
+        case 'f':if(*ol*2<=MAX_OUTPUT_LEN){{for(int i=0;i<*ol;i++)out[*ol+i]=out[*ol-1-i];*ol*=2;}}changed=1;break;
+        case '{{':if(*ol>1){{unsigned char f=out[0];for(int i=0;i<*ol-1;i++)out[i]=out[i+1];out[*ol-1]=f;}}changed=1;break;
+        case '}}':if(*ol>1){{unsigned char l=out[*ol-1];for(int i=*ol-1;i>0;i--)out[i]=out[i-1];out[0]=l;}}changed=1;break;
+        case '[':if(*ol>0){{for(int i=0;i<*ol-1;i++)out[i]=out[i+1];(*ol)--;}}changed=1;break;
+        case ']':if(*ol>0)(*ol)--;changed=1;break;
+        case 'k':if(*ol>=2){{unsigned char t=out[0];out[0]=out[1];out[1]=t;}}changed=1;break;
+        case 'K':if(*ol>=2){{unsigned char t=out[*ol-2];out[*ol-2]=out[*ol-1];out[*ol-1]=t;}}changed=1;break;
+        case ':':break;
+        case 'q':if(*ol*2<=MAX_OUTPUT_LEN){{
+            unsigned char tmp[MAX_OUTPUT_LEN];for(int i=0;i<*ol;i++)tmp[i]=out[i];
+            int idx=0;for(int i=0;i<*ol;i++){{out[idx++]=tmp[i];out[idx++]=tmp[i];}}*ol*=2;
+        }}changed=1;break;
+        case 'E':{{int cap=1;for(int i=0;i<*ol;i++){{
+            if(cap&&isl(out[i])){{out[i]=tou(out[i]);cap=0;}}
+            if(out[i]==' '||out[i]=='-'||out[i]=='_')cap=1;
+        }}}}changed=1;break;
+        }}
+    }}else if(rl==2){{
+        unsigned char p=rs[1];
+        if(cmd=='^'){{if(*ol+1<=MAX_OUTPUT_LEN){{for(int i=*ol;i>0;i--)out[i]=out[i-1];out[0]=p;(*ol)++;changed=1;}}}}
+        else if(cmd=='$'){{if(*ol+1<=MAX_OUTPUT_LEN){{out[*ol]=p;(*ol)++;changed=1;}}}}
+        else if(cmd=='@'){{int nl=0;for(int i=0;i<*ol;i++){{if(out[i]!=p)out[nl++]=out[i];else changed=1;}}*ol=nl;}}
+        else if(cmd=='p'){{int n=p-'0';if(n>0&&*ol*(n+1)<=MAX_OUTPUT_LEN){{int o=*ol;for(int r=0;r<n;r++){{for(int i=0;i<o;i++)out[*ol+i]=out[i];*ol+=o;}}changed=1;}}}}
+        else if(cmd=='T'&&isd(p)){{int pos=p-'0';if(pos<*ol){{out[pos]=tog(out[pos]);changed=1;}}}}
+        else if(cmd=='D'&&isd(p)){{int pos=p-'0';if(pos<*ol){{for(int i=pos;i<*ol-1;i++)out[i]=out[i+1];(*ol)--;changed=1;}}}}
+        else if(cmd=='L'&&isd(p)){{int pos=p-'0';if(pos<*ol){{out[pos]<<=1;changed=1;}}}}
+        else if(cmd=='R'&&isd(p)){{int pos=p-'0';if(pos<*ol){{out[pos]>>=1;changed=1;}}}}
+        else if(cmd=='+'&&isd(p)){{int pos=p-'0';if(pos<*ol&&out[pos]<255){{out[pos]++;changed=1;}}}}
+        else if(cmd=='-'&&isd(p)){{int pos=p-'0';if(pos<*ol&&out[pos]>0){{out[pos]--;changed=1;}}}}
+        else if((cmd=='.'||cmd==',')&&isd(p)){{int pos=p-'0';if(pos<*ol){{out[pos]+=(cmd=='.'?1:-1);changed=1;}}}}
+        else if(cmd=='\''&&isd(p)){{int pos=p-'0';if(pos<*ol){{*ol=pos+1;changed=1;}}}}
+        else if(cmd=='z'&&isd(p)){{int n=p-'0';if(*ol+n<=MAX_OUTPUT_LEN){{unsigned char f=out[0];for(int i=*ol+n-1;i>=n;i--)out[i]=out[i-n];for(int i=0;i<n;i++)out[i]=f;*ol+=n;changed=1;}}}}
+        else if(cmd=='Z'&&isd(p)){{int n=p-'0';if(*ol+n<=MAX_OUTPUT_LEN){{unsigned char l=out[*ol-1];for(int i=0;i<n;i++)out[*ol+i]=l;*ol+=n;changed=1;}}}}
+        else if(cmd=='y'&&isd(p)){{int n=p-'0';if(*ol+n<=MAX_OUTPUT_LEN){{for(int i=0;i<n;i++)out[*ol+i]=out[i];*ol+=n;changed=1;}}}}
+        else if(cmd=='Y'&&isd(p)){{int n=p-'0';if(*ol+n<=MAX_OUTPUT_LEN){{for(int i=0;i<n;i++)out[*ol+i]=out[*ol-n+i];*ol+=n;changed=1;}}}}
+    }}else if(rl==3){{
+        unsigned char p1=rs[1],p2=rs[2];
+        if(cmd=='s'){{for(int i=0;i<*ol;i++)if(out[i]==p1){{out[i]=p2;changed=1;}}}}
+        else if(cmd=='i'&&isd(p1)){{int pos=p1-'0';if(pos<=*ol&&*ol+1<=MAX_OUTPUT_LEN){{for(int i=*ol;i>pos;i--)out[i]=out[i-1];out[pos]=p2;(*ol)++;changed=1;}}}}
+        else if(cmd=='o'&&isd(p1)){{int pos=p1-'0';if(pos<*ol){{out[pos]=p2;changed=1;}}}}
+        else if(cmd=='e'){{int cap=1;for(int i=0;i<*ol;i++){{if(cap&&isl(out[i])){{out[i]=tou(out[i]);cap=0;}}if(out[i]==p1)cap=1;}}changed=1;}}
+        else if(cmd=='x'&&isd(p1)&&isd(p2)){{int a=p1-'0',b=p2-'0';if(a>b){{int t=a;a=b;b=t;}}if(a<*ol){{int nl=0;for(int i=a;i<=b&&i<*ol;i++)out[nl++]=out[i];*ol=nl;changed=1;}}}}
+        else if(cmd=='O'&&isd(p1)&&isd(p2)){{int n=p1-'0',m=p2-'0';if(n<*ol&&m>0){{int e=n+m;if(e>*ol)e=*ol;int sh=e-n;for(int i=e;i<*ol;i++)out[i-sh]=out[i];*ol-=sh;changed=1;}}}}
+        else if(cmd=='*'&&isd(p1)&&isd(p2)){{int a=p1-'0',b=p2-'0';if(a<*ol&&b<*ol&&a!=b){{unsigned char t=out[a];out[a]=out[b];out[b]=t;changed=1;}}}}
+        else if(cmd=='3'&&isd(p1)){{int n=p1-'0',cnt=0,found=-1;for(int i=0;i<*ol;i++)if(out[i]==p2&&++cnt==n){{found=i;break;}}if(found!=-1&&found+1<*ol){{out[found+1]=tog(out[found+1]);changed=1;}}}}
+    }}
+    out[*ol]='\0';return changed?1:0;
+}}
+
+__kernel void find_single_rules_gpu(
+    __global const unsigned char *bw,__global const int *bo,__global const int *bl,
+    __global const unsigned char *rs,__global const int *ro,__global const int *rl,
+    __global const uchar *bf,const int nw,const int nr,
+    __global char *found,__global volatile int *cnt)
+{{
+    int gid=get_global_id(0);if(gid>=nw*nr)return;
+    int wi=gid/nr,ri=gid%nr;
+    unsigned char iw[MAX_WORD_LEN],ow[MAX_OUTPUT_LEN],rr[MAX_RULE_LEN];
+    int wl=bl[wi];for(int i=0;i<wl;i++)iw[i]=bw[bo[wi]+i];iw[wl]='\0';
+    int rlen=rl[ri];for(int i=0;i<rlen;i++)rr[i]=rs[ro[ri]+i];rr[rlen]='\0';
+    int ol;apply(rr,rlen,iw,wl,ow,&ol);
+    int same=(ol==wl);for(int i=0;i<wl&&same;i++)if(ow[i]!=iw[i])same=0;
+    if(!same&&ol>0&&bloom(bf,ow,ol)){{
+        int idx=atomic_inc(cnt);
+        if(idx<MAX_CHAINS_TO_FIND){{
+            __global char *p=found+idx*MAX_CHAIN_STRING_LEN;
+            for(int i=0;i<rlen&&i<MAX_CHAIN_STRING_LEN-1;i++)p[i]=rr[i];p[rlen]='\0';
+        }}
+    }}
+}}
+
+/* Chain kernel: do NOT abort on result==0 (rule had no effect on this particular
+   word — still a valid chain step).  Only abort if the word becomes empty.      */
+__kernel void find_rule_chains_gpu(
+    __global const unsigned char *bw,__global const int *bo,__global const int *bl,
+    __global const unsigned char *rs,__global const int *ro,__global const int *rl,
+    __global const int *cseq,__global const int *cdep,
+    __global const uchar *bf,const int nw,const int nc,const int mcd,
+    __global char *found,__global volatile int *cnt)
+{{
+    int gid=get_global_id(0);if(gid>=nw*nc)return;
+    int wi=gid/nc,ci=gid%nc;
+    unsigned char cur[MAX_OUTPUT_LEN],tmp[MAX_OUTPUT_LEN],rr[MAX_RULE_LEN];
+    char cb[MAX_CHAIN_STRING_LEN];int cp=0;
+    int wl=bl[wi];for(int i=0;i<wl;i++)cur[i]=bw[bo[wi]+i];cur[wl]='\0';
+    int cl_=wl,dep=cdep[ci];if(dep<1||dep>mcd)return;
+    __global const unsigned char *wp=bw+bo[wi];
+    for(int d=0;d<dep;d++){{
+        int ri=cseq[ci*mcd+d];if(ri<0)break;
+        int rlen=rl[ri];for(int i=0;i<rlen;i++)rr[i]=rs[ro[ri]+i];rr[rlen]='\0';
+        for(int i=0;i<rlen&&cp<MAX_CHAIN_STRING_LEN-2;i++)cb[cp++]=rr[i];
+        if(d<dep-1&&cp<MAX_CHAIN_STRING_LEN-1)cb[cp++]=' ';
+        int nl;apply(rr,rlen,cur,cl_,tmp,&nl);
+        if(nl==0)return;
+        for(int i=0;i<nl;i++)cur[i]=tmp[i];cur[nl]='\0';cl_=nl;
+    }}
+    cb[cp]='\0';
+    int same=(cl_==wl);for(int i=0;i<wl&&same;i++)if(cur[i]!=wp[i])same=0;
+    if(!same&&bloom(bf,cur,cl_)){{
+        int idx=atomic_inc(cnt);
+        if(idx<MAX_CHAINS_TO_FIND){{
+            __global char *p=found+idx*MAX_CHAIN_STRING_LEN;
+            for(int i=0;i<cp&&i<MAX_CHAIN_STRING_LEN-1;i++)p[i]=cb[i];p[cp]='\0';
+        }}
+    }}
+}}
+"""
+
+# --------------------------------------------------------------------
+# GPU Engine (from original)
+# --------------------------------------------------------------------
 class GPUEngine:
     def __init__(self, params):
-        self.params = params
-        self.context = None
-        self.queue = None
-        self.device = None
-        self.program = None
+        self.params              = params
+        self.context = self.queue = self.device = self.program = None
         self.max_work_group_size = 512
-        self.local_work_size = params.get('LOCAL_WORK_SIZE', 512)
+        self.local_work_size     = params.get('LOCAL_WORK_SIZE', 512)
+        self.bloom_buf           = None
+        self.rule_index          = {}
+        self.gpu_rules           = []
+        self.kernel_single       = None
+        self.kernel_chain        = None
 
-        self.bloom_buf = None
-        self.rule_index = {}
-        self.gpu_rules = []
-        self.kernel_single = None
-        self.kernel_chain = None
-
-    def get_free_vram(self):
-        return estimate_free_vram(self.device)
-
-    def get_max_allocation(self):
-        return get_max_allocation(self.device)
+    def get_free_vram(self):      return estimate_free_vram(self.device)
+    def get_max_allocation(self): return get_max_allocation(self.device)
 
     def safe_output_buffer_size(self, words_count, chains_count):
-        free_vram = self.get_free_vram()
-        max_alloc = self.get_max_allocation()
-
-        # Reserve some space for other buffers
-        available = min(free_vram, max_alloc)
-        # Leave 5MB for other buffers
-        available -= 5 * 1024**2
-        if available < 0:
-            available = 0
-
-        # Max number of result slots we can fit (each result is chain string + int + uint)
-        stride = MAX_CHAIN_STRING_LEN + 4 + 4
-        max_slots = available // stride
-        if max_slots < 1:
-            max_slots = 1
-
-        # Hard limit from user config
-        hard_limit = self.params['MAX_SAFE_RESULTS_PER_BATCH']
-        # Also limit to a reasonable number (e.g., 5000) to avoid huge buffers
-        final_limit = min(max_slots, hard_limit, words_count * chains_count, 5000)
-
-        return final_limit
+        avail = min(self.get_free_vram(), self.get_max_allocation()) - 5*1024**2
+        return min(max(avail, 0) // MAX_CHAIN_STRING_LEN,
+                   self.params['MAX_SAFE_RESULTS_PER_BATCH'],
+                   words_count * chains_count,
+                   5000) or 1
 
     def initialize_gpu(self, device_spec):
         try:
-            self.device = get_device_by_spec(device_spec)
-            self.context = cl.Context([self.device])
-            self.queue = cl.CommandQueue(self.context)
-
-            global_mem = self.device.global_mem_size
+            self.device          = get_device_by_spec(device_spec)
+            self.context         = cl.Context([self.device])
+            self.queue           = cl.CommandQueue(self.context)
             self.max_work_group_size = self.device.get_info(cl.device_info.MAX_WORK_GROUP_SIZE)
-            max_compute_units = self.device.get_info(cl.device_info.MAX_COMPUTE_UNITS)
-            free_vram = self.get_free_vram()
-
-            if VERBOSE:
-                print(f"{green('[GPU]')} {bold('GPU:')} {cyan(self.device.name.strip())}")
-                print(f"{blue('[INFO]')} {bold('Global Memory:')} {cyan(f'{global_mem // (1024**3)}GB')}")
-                print(f"{blue('[INFO]')} {bold('Max Work Group Size:')} {cyan(self.max_work_group_size)}")
-                print(f"{blue('[INFO]')} {bold('Compute Units:')} {cyan(max_compute_units)}")
-                print(f"{blue('[INFO]')} {bold('Free VRAM estimate:')} {cyan(f'{free_vram / 1024**3:.1f}GB')}")
-
             self.local_work_size = min(self.local_work_size, self.max_work_group_size)
             while self.max_work_group_size % self.local_work_size != 0 and self.local_work_size > 32:
                 self.local_work_size //= 2
-
-            if VERBOSE:
-                print(f"{blue('[INFO]')} {bold('Using Work Group Size:')} {cyan(self.local_work_size)}")
+            vram_gb = self.get_free_vram() / 1024**3
+            log_info(f"[GPU]  {bold(self.device.name.strip())}")
+            log_debug(f"       WGS={self.local_work_size}, VRAM~{vram_gb:.1f}GB, "
+                      f"CU={self.device.get_info(cl.device_info.MAX_COMPUTE_UNITS)}")
             return True
         except Exception as e:
-            print(f"{red('[ERROR]')} {bold('GPU initialization failed:')} {e}")
-            return False
+            log_error(f"GPU init failed: {e}"); return False
 
     def compile_kernel(self):
         try:
-            if VERBOSE:
-                print(f"{blue('[SETUP]')} {bold('Compiling GPU-compatible kernel...')}")
-            kernel_source = GPU_COMPATIBLE_KERNEL_TEMPLATE.format(
-                BLOOM_FILTER_SIZE=self.params['BLOOM_FILTER_SIZE'],
-                MAX_SAFE_RESULTS_PER_BATCH=self.params['MAX_SAFE_RESULTS_PER_BATCH'],
-                MAX_CHAIN_DEPTH=self.params['MAX_CHAIN_DEPTH'],
-                MAX_CHAIN_STRING_LEN=MAX_CHAIN_STRING_LEN,
-                MAX_WORD_LEN=MAX_WORD_LEN,
-                MAX_RULE_LEN=MAX_RULE_LEN,
-                MAX_OUTPUT_LEN=MAX_OUTPUT_LEN,
-                BLOOM_HASH_FUNCTIONS=BLOOM_HASH_FUNCTIONS
+            src = GPU_KERNEL_TEMPLATE.format(
+                BLOOM_FILTER_SIZE          = self.params['BLOOM_FILTER_SIZE'],
+                MAX_SAFE_RESULTS_PER_BATCH = self.params['MAX_SAFE_RESULTS_PER_BATCH'],
+                MAX_CHAIN_DEPTH            = self.params['MAX_CHAIN_DEPTH'],
+                MAX_CHAIN_STRING_LEN       = MAX_CHAIN_STRING_LEN,
+                MAX_WORD_LEN               = MAX_WORD_LEN,
+                MAX_RULE_LEN               = MAX_RULE_LEN,
+                MAX_OUTPUT_LEN             = MAX_OUTPUT_LEN,
+                BLOOM_HASH_FUNCTIONS       = BLOOM_HASH_FUNCTIONS,
             )
-            self.program = cl.Program(self.context, kernel_source).build()
+            self.program       = cl.Program(self.context, src).build()
             self.kernel_single = self.program.find_single_rules_gpu
-            self.kernel_chain = self.program.find_rule_chains_gpu
-            if VERBOSE:
-                print(f"{green('[OK]')} {bold('Kernel compiled successfully')}")
+            self.kernel_chain  = self.program.find_rule_chains_gpu
+            log_debug("OpenCL kernel compiled successfully")
             return self.program
         except Exception as e:
-            print(f"{red('[ERROR]')} {bold('Kernel compilation failed:')}")
-            print(f"  {str(e)}")
-            return None
+            log_error(f"Kernel compile failed: {e}"); return None
 
     def generate_bloom_filter(self, target_words):
-        if VERBOSE:
-            print(f"{blue('[SETUP]')} {bold('Generating comprehensive Bloom filter...')}")
-        bloom_size_bytes = self.params['BLOOM_FILTER_SIZE'] // 8
-        bloom_filter = np.zeros(bloom_size_bytes, dtype=np.uint8)
-        if VERBOSE:
-            print(f"  {cyan('[*]')} Bloom filter size: {bloom_size_bytes / 1024 / 1024:.1f} MB")
-            print(f"  {cyan('[*]')} Hashing ALL target words: {len(target_words):,}")
-        for word in tqdm(target_words, desc="Building bloom filter", leave=False, disable=False):
-            word_bytes = word.encode('latin-1')
-            h1 = fnv1a_32(word_bytes, FNV1A_SEED1)
-            h2 = fnv1a_32(word_bytes, FNV1A_SEED2)
+        bsz = self.params['BLOOM_FILTER_SIZE'] // 8
+        bf  = np.zeros(bsz, dtype=np.uint8)
+        log_debug(f"Building bloom filter: {bsz//1024//1024}MB for {len(target_words):,} words")
+        for w in tqdm(target_words,
+                      desc=green("  Bloom filter"),
+                      unit="word",
+                      ncols=88,
+                      leave=False,
+                      bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}]"):
+            wb = w.encode('latin-1')
+            h1 = fnv1a_32(wb, FNV1A_SEED1); h2 = fnv1a_32(wb, FNV1A_SEED2)
             for i in range(BLOOM_HASH_FUNCTIONS):
-                idx = (h1 + i * h2) % self.params['BLOOM_FILTER_SIZE']
-                byte_idx = idx // 8
-                bit_idx = idx % 8
-                bloom_filter[byte_idx] |= (1 << bit_idx)
-        bits_set = np.sum(np.unpackbits(bloom_filter))
-        fill_ratio = bits_set / self.params['BLOOM_FILTER_SIZE']
-        if VERBOSE:
-            print(f"  {cyan('[*]')} Bloom filter fill ratio: {fill_ratio:.3%}")
-            fpr = (fill_ratio ** BLOOM_HASH_FUNCTIONS) if fill_ratio < 0.5 else 1.0
-            print(f"  {cyan('[*]')} Approx false positive rate: {fpr:.6%}")
-        return bloom_filter
+                idx = (h1 + i*h2) % self.params['BLOOM_FILTER_SIZE']
+                bf[idx//8] |= 1 << (idx%8)
+        return bf
 
-    def upload_bloom_filter(self, bloom_filter):
+    def upload_bloom_filter(self, bf):
         mf = cl.mem_flags
-        if self.bloom_buf is not None:
-            self.bloom_buf.release()
-        self.bloom_buf = cl.Buffer(
-            self.context, mf.READ_ONLY | mf.COPY_HOST_PTR,
-            hostbuf=bloom_filter
-        )
-        return self.bloom_buf
+        if self.bloom_buf: self.bloom_buf.release()
+        self.bloom_buf = cl.Buffer(self.context, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=bf)
+
+    def _flatten(self, items):
+        flat = b''.join(x.encode('latin-1') for x in items)
+        offs = []; lens = []; off = 0
+        for x in items:
+            b = x.encode('latin-1')
+            offs.append(off); lens.append(len(b)); off += len(b)
+        return (np.frombuffer(flat, dtype=np.uint8),
+                np.array(offs, dtype=np.int32),
+                np.array(lens, dtype=np.int32))
 
     def prepare_batch_data(self, words, rules):
-        word_bytes_list = [w.encode('latin-1') for w in words]
-        words_flat = np.frombuffer(b''.join(word_bytes_list), dtype=np.uint8)
-        word_offsets = []
-        word_lengths = []
-        offset = 0
-        for wb in word_bytes_list:
-            word_offsets.append(offset)
-            word_lengths.append(len(wb))
-            offset += len(wb)
+        wf, wo, wl = self._flatten(words)
+        rf, ro, rl = self._flatten(rules)
+        return dict(words_flat=wf, word_offsets=wo, word_lengths=wl,
+                    rules_flat=rf, rule_offsets=ro, rule_lengths=rl,
+                    num_words=len(words), num_rules=len(rules))
 
-        rule_bytes_list = [r.encode('latin-1') for r in rules]
-        rules_flat = np.frombuffer(b''.join(rule_bytes_list), dtype=np.uint8)
-        rule_offsets = []
-        rule_lengths = []
-        offset = 0
-        for rb in rule_bytes_list:
-            rule_offsets.append(offset)
-            rule_lengths.append(len(rb))
-            offset += len(rb)
-
-        return {
-            'words_flat': words_flat,
-            'word_offsets': np.array(word_offsets, dtype=np.int32),
-            'word_lengths': np.array(word_lengths, dtype=np.int32),
-            'rules_flat': rules_flat,
-            'rule_offsets': np.array(rule_offsets, dtype=np.int32),
-            'rule_lengths': np.array(rule_lengths, dtype=np.int32),
-            'num_words': len(words),
-            'num_rules': len(rules)
-        }
-
+    # ---------------------------------------------------------------- Phase 1
     def process_all_words_single_rule(self, base_words, rules, bloom_filter):
-        if VERBOSE:
-            print(f"{blue('[GPU]')} {bold('Processing ALL words with single rules...')}")
         self.upload_bloom_filter(bloom_filter)
-        if not self.compile_kernel():
-            return Counter()
-        self.gpu_rules = HashcatRuleValidator.validate_rules_for_gpu(rules)
+        if not self.compile_kernel(): return Counter()
+        self.gpu_rules  = HashcatRuleValidator.validate_rules_for_gpu(rules)
         self.rule_index = {r: i for i, r in enumerate(self.gpu_rules)}
-        if VERBOSE:
-            print(f"{blue('[INFO]')} {bold('GPU-compatible rules:')} {len(self.gpu_rules):,}")
-        rule_counter = Counter()
-        batch_size = self.params['WORDS_PER_BATCH']
-        num_batches = (len(base_words) + batch_size - 1) // batch_size
-        if VERBOSE:
-            print(f"{blue('[INFO]')} {bold('Processing ALL')} {len(base_words):,} {bold('words in')} {num_batches} {bold('batches')}")
-            print(f"{blue('[INFO]')} {bold('Batch size:')} {batch_size:,} words")
-        with tqdm(total=num_batches, desc="Processing all words", unit="batch", disable=False) as pbar:
-            for batch_idx in range(num_batches):
-                start_idx = batch_idx * batch_size
-                end_idx = min((batch_idx + 1) * batch_size, len(base_words))
-                batch_words = base_words[start_idx:end_idx]
-                if not batch_words:
-                    pbar.update(1)
-                    continue
-                batch_data = self.prepare_batch_data(batch_words, self.gpu_rules)
-                batch_found = self.process_batch_single(batch_data)
-                if batch_found:
-                    rule_counter.update(batch_found)
-                if VERBOSE:
-                    pbar.set_postfix({'found': len(rule_counter), 'progress': f"{end_idx:,}/{len(base_words):,}"})
-                pbar.update(1)
-                self.queue.finish()
-                gc.collect()
-        if VERBOSE:
-            print(f"\n{green('[OK]')} {bold('Total unique single rules found:')} {cyan(len(rule_counter))}")
-        return rule_counter
+        log_debug(f"Phase 1: {len(base_words):,} words × {len(self.gpu_rules):,} rules")
 
-    def process_batch_single(self, batch_data):
-        mf = cl.mem_flags
+        counter = Counter()
+        bs      = self.params['WORDS_PER_BATCH']
+
+        with tqdm(total=len(base_words),
+                  desc=green("  Phase 1 "),
+                  unit="word",
+                  ncols=88,
+                  bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}",
+                  ) as pbar:
+
+            for i in range(0, len(base_words), bs):
+                batch = base_words[i:i+bs]
+                if batch:
+                    found = self._run_single_kernel(self.prepare_batch_data(batch, self.gpu_rules))
+                    if found:
+                        counter.update(found)
+                        pbar.set_postfix({"rules": cyan(str(len(counter)))}, refresh=False)
+                pbar.update(len(batch))
+                self.queue.finish(); gc.collect()
+
+        log_info(f"[P1]   {bold(green(str(len(counter))))} unique rules passed bloom filter")
+        log_debug(f"Phase 1 complete: {len(counter)} rules in counter")
+        return counter
+
+    def _run_single_kernel(self, bd):
+        mf = cl.mem_flags; bufs = []
         try:
-            base_buf = cl.Buffer(self.context, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=batch_data['words_flat'])
-            base_offsets_buf = cl.Buffer(self.context, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=batch_data['word_offsets'])
-            base_lengths_buf = cl.Buffer(self.context, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=batch_data['word_lengths'])
-            rules_buf = cl.Buffer(self.context, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=batch_data['rules_flat'])
-            rule_offsets_buf = cl.Buffer(self.context, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=batch_data['rule_offsets'])
-            rule_lengths_buf = cl.Buffer(self.context, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=batch_data['rule_lengths'])
-            bloom_buf = self.bloom_buf
+            def B(arr, f=mf.READ_ONLY):
+                b = cl.Buffer(self.context, f | mf.COPY_HOST_PTR, hostbuf=arr)
+                bufs.append(b); return b
 
-            max_output_size = self.safe_output_buffer_size(batch_data['num_words'], batch_data['num_rules'])
-            found_rules_buf = cl.Buffer(self.context, mf.WRITE_ONLY, max_output_size * MAX_CHAIN_STRING_LEN)
-            found_count_buf = cl.Buffer(self.context, mf.READ_WRITE, 4)
-            zero_count = np.array([0], dtype=np.int32)
-            cl.enqueue_copy(self.queue, found_count_buf, zero_count)
+            bb=B(bd['words_flat']); bbo=B(bd['word_offsets']); bbl=B(bd['word_lengths'])
+            rb=B(bd['rules_flat']); rbo=B(bd['rule_offsets']); rbl=B(bd['rule_lengths'])
+            outs = self.safe_output_buffer_size(bd['num_words'], bd['num_rules'])
+            fo = cl.Buffer(self.context, mf.WRITE_ONLY, outs*MAX_CHAIN_STRING_LEN); bufs.append(fo)
+            fc = cl.Buffer(self.context, mf.READ_WRITE, 4);                         bufs.append(fc)
+            cl.enqueue_copy(self.queue, fc, np.array([0], dtype=np.int32))
 
-            kernel = self.kernel_single
-            total_combinations = batch_data['num_words'] * batch_data['num_rules']
-            global_size = ((total_combinations + self.local_work_size - 1) // self.local_work_size) * self.local_work_size
-            kernel.set_args(
-                base_buf, base_offsets_buf, base_lengths_buf,
-                rules_buf, rule_offsets_buf, rule_lengths_buf,
-                bloom_buf,
-                np.int32(batch_data['num_words']),
-                np.int32(batch_data['num_rules']),
-                found_rules_buf,
-                found_count_buf
-            )
-            cl.enqueue_nd_range_kernel(self.queue, kernel, (global_size,), (self.local_work_size,))
+            tot = bd['num_words'] * bd['num_rules']
+            gs  = ((tot+self.local_work_size-1)//self.local_work_size)*self.local_work_size
+            self.kernel_single.set_args(bb,bbo,bbl,rb,rbo,rbl,self.bloom_buf,
+                                        np.int32(bd['num_words']),np.int32(bd['num_rules']),fo,fc)
+            cl.enqueue_nd_range_kernel(self.queue, self.kernel_single, (gs,), (self.local_work_size,))
             self.queue.finish()
 
-            found_count = np.zeros(1, dtype=np.int32)
-            cl.enqueue_copy(self.queue, found_count, found_count_buf)
-            num_found = min(found_count[0], max_output_size)
-            batch_found = []
-            if num_found > 0:
-                found_data = np.zeros(num_found * MAX_CHAIN_STRING_LEN, dtype=np.uint8)
-                cl.enqueue_copy(self.queue, found_data, found_rules_buf)
-                for i in range(num_found):
-                    start = i * MAX_CHAIN_STRING_LEN
-                    rule_bytes = bytes(found_data[start:start + MAX_CHAIN_STRING_LEN])
-                    rule_str = rule_bytes.split(b'\0')[0].decode('latin-1', errors='ignore')
-                    if rule_str:
-                        batch_found.append(rule_str)
-            return batch_found
+            cnt = np.zeros(1, dtype=np.int32)
+            cl.enqueue_copy(self.queue, cnt, fc)
+            n = min(cnt[0], outs); out = []
+            if n > 0:
+                data = np.zeros(n*MAX_CHAIN_STRING_LEN, dtype=np.uint8)
+                cl.enqueue_copy(self.queue, data, fo)
+                for i in range(n):
+                    r = bytes(data[i*MAX_CHAIN_STRING_LEN:(i+1)*MAX_CHAIN_STRING_LEN]
+                              ).split(b'\0')[0].decode('latin-1', errors='ignore')
+                    if r: out.append(r)
+            return out
         except Exception as e:
-            if VERBOSE:
-                print(f"{yellow('[WARN]')} GPU single‑rule processing failed: {e}")
-            self.queue = cl.CommandQueue(self.context)
-            return []
+            log_warn(f"Single-rule kernel error: {e}")
+            self.queue = cl.CommandQueue(self.context); return []
         finally:
-            for buf in (base_buf, base_offsets_buf, base_lengths_buf,
-                        rules_buf, rule_offsets_buf, rule_lengths_buf,
-                        found_rules_buf, found_count_buf):
-                try:
-                    buf.release()
-                except Exception:
-                    pass
+            for b in bufs:
+                try: b.release()
+                except: pass
 
-    def _generate_random_chains(self, depth, count, valid_rules, hot_rules, cold_rules, existing_chains, new_chains_set):
-        generated = set()
-        hot_attempts = 0
-        cold_attempts = 0
-        max_attempts = count * MAX_ATTEMPTS_MULTIPLIER
-        hot_budget = int(count * HOT_RULE_RATIO) if hot_rules else 0
-        cold_budget = count - hot_budget
-        if hot_rules and hot_budget > 0:
-            for _ in range(hot_budget):
-                hot_attempts += 1
-                if hot_attempts > max_attempts:
-                    break
-                hot_pos = random.randint(0, depth - 1)
-                parts = []
-                for i in range(depth):
-                    if i == hot_pos and hot_rules:
-                        parts.append(random.choice(hot_rules))
-                    else:
-                        parts.append(random.choice(valid_rules))
-                pattern_key = ' '.join(parts)
-                if pattern_key not in existing_chains and pattern_key not in generated and pattern_key not in new_chains_set:
-                    generated.add(pattern_key)
-        for _ in range(cold_budget):
-            cold_attempts += 1
-            if cold_attempts > max_attempts:
-                break
-            parts = [random.choice(valid_rules) for _ in range(depth)]
-            pattern_key = ' '.join(parts)
-            if pattern_key not in existing_chains and pattern_key not in generated and pattern_key not in new_chains_set:
-                generated.add(pattern_key)
-        return generated
+    # ---------------------------------------------------------------- Phase 2
+    def _gen_random_chains(self, depth, count, valid, hot, existing, new_set):
+        gen = set(); max_att = count * MAX_ATTEMPTS_MULTIPLIER
+        hot_budget = int(count * HOT_RULE_RATIO) if hot else 0
+        for budget, use_hot in [(hot_budget, True), (count-hot_budget, False)]:
+            att = 0
+            while len(gen) < budget and att < max_att:
+                att += 1
+                if use_hot and hot:
+                    hp    = random.randint(0, depth-1)
+                    parts = [random.choice(hot) if i==hp else random.choice(valid)
+                             for i in range(depth)]
+                else:
+                    parts = [random.choice(valid) for _ in range(depth)]
+                k = ' '.join(parts)
+                if k not in existing and k not in gen and k not in new_set:
+                    gen.add(k)
+        return gen
 
-    def generate_informed_chains(self, rules, single_rules_found, max_depth, seed_chains=None, max_total_chains=None):
-        if VERBOSE:
-            print(f"  {cyan('->')} Generating informed chains up to depth {max_depth}...")
-        valid_rules = [r for r in rules if HashcatRuleValidator.validate_rule_for_gpu(r)]
-        if not valid_rules:
-            if VERBOSE:
-                print(f"  {yellow('[WARN]')} No valid rules found")
-            return []
-        found_set = set(single_rules_found.keys()) if single_rules_found else set()
-        hot_rules = [r for r in valid_rules if r in found_set]
-        cold_rules = [r for r in valid_rules if r not in found_set]
-        if VERBOSE:
-            print(f"  {cyan('[*]')} Using all {len(valid_rules)} rules for chain generation")
-            print(f"  {cyan('[*]')} Hot rules (from Phase 1): {len(hot_rules)}")
-            print(f"  {cyan('[*]')} Cold rules: {len(cold_rules)}")
+    def generate_informed_chains(self, rules, single_found, max_depth, seed_chains=None):
+        # Cap max_depth to hashcat limit
+        max_depth = min(max_depth, MAX_HASHCAT_CHAIN)
+        valid   = [r for r in rules if HashcatRuleValidator.validate_rule_for_gpu(r)]
+        if not valid: return []
+        found_s = set(single_found.keys()) if single_found else set()
+        hot     = [r for r in valid if r in found_s]
+        chains  = set(valid)
+        sbd     = defaultdict(set)
+        digits  = '0123456789'
 
-        # --- Prepare seeds ---
-        # Depth 1: all valid rules are already in the set
-        chains = set(valid_rules)  # depth 1
-
-        # Seed chains by depth
-        seed_by_depth = defaultdict(set)
-
-        # ===== Pure and mixed prepend/append numeric seeds (0‑9999) =====
-        if VERBOSE:
-            print(f"  {cyan('[*]')} Adding numeric prepend/append seeds (0‑9999, mixed operators allowed)...")
-        digits = '0123456789'
-        # Build all sequences of ^d and $d for depths 1-4 (up to max_depth)
+        # Numeric seed families up to depth 4 (but not exceeding max_depth)
         max_seed_depth = min(max_depth, 4)
+
+        # Family A: pure prepend
+        a_cnt: Dict[int, int] = defaultdict(int)
+        for n in range(10 ** max_seed_depth):
+            s = str(n)
+            d = len(s)
+            sbd[d].add(' '.join(f'^{ch}' for ch in reversed(s)))
+            a_cnt[d] += 1
+
+        # Family B: pure append
+        b_cnt: Dict[int, int] = defaultdict(int)
+        for n in range(10 ** max_seed_depth):
+            s = str(n)
+            d = len(s)
+            sbd[d].add(' '.join(f'${ch}' for ch in s))
+            b_cnt[d] += 1
+
+        # Family C: mixed
         for depth in range(1, max_seed_depth + 1):
-            # All combinations of operators (^ or $) and digits
-            for combo in itertools.product(['^', '$'], repeat=depth):
-                # For each operator list, generate all digit combinations
-                for digit_combo in itertools.product(digits, repeat=depth):
-                    chain = ' '.join(f'{op}{d}' for op, d in zip(combo, digit_combo))
-                    seed_by_depth[depth].add(chain)
+            for ops in itertools.product(['^', '$'], repeat=depth):
+                for digs in itertools.product(digits, repeat=depth):
+                    sbd[depth].add(' '.join(f'{o}{d}' for o, d in zip(ops, digs)))
 
-        # Built‑in common operations (^d and $d) for seeding (already covered above)
-        common_ops = []
-        for d in '0123456789':
-            common_ops.append(f'^{d}')
-            common_ops.append(f'${d}')
-
-        # Built-in seeds for depth 2 and 3 (all combos of common_ops) – these are now a subset of the above
-        if max_depth >= 2:
-            for a in common_ops:
-                for b in common_ops:
-                    seed_by_depth[2].add(f"{a} {b}")
-        if max_depth >= 3:
-            for a in common_ops:
-                for b in common_ops:
-                    for c in common_ops:
-                        seed_by_depth[3].add(f"{a} {b} {c}")
-
-        # User seeds (if provided)
+        # User-supplied seed chains
         if seed_chains:
             for sc in seed_chains:
-                d = sc.count(' ') + 1
-                if d <= max_depth:
-                    seed_by_depth[d].add(sc)
-                else:
-                    seed_by_depth[d].add(sc)
-            if VERBOSE:
-                print(f"  {cyan('[*]')} Loaded {len(seed_chains)} user seed chains")
+                sbd[sc.count(' ') + 1].add(sc)
+            log_debug(f"Loaded {len(seed_chains):,} user seed chains")
 
-        # Add all seeds to chains set
-        for dset in seed_by_depth.values():
-            chains.update(dset)
+        # Debug report
+        c_total = sum(2**d * 10**d for d in range(1, max_seed_depth + 1))
+        log_debug(f"Numeric seeds  max_seed_depth={max_seed_depth}")
+        log_debug("  A (pure ^): " +
+                  ", ".join(f"d{d}={a_cnt[d]:,}" for d in sorted(a_cnt)) +
+                  f"  [{sum(a_cnt.values()):,} total]")
+        log_debug("  B (pure $): " +
+                  ", ".join(f"d{d}={b_cnt[d]:,}" for d in sorted(b_cnt)) +
+                  f"  [{sum(b_cnt.values()):,} total]")
+        log_debug(f"  C (mixed) : [{c_total:,} total]")
+        log_debug("  A∪B∪C     : " +
+                  ", ".join(f"d{d}={len(sbd[d]):,}" for d in sorted(sbd)) +
+                  f"  [{sum(len(v) for v in sbd.values()):,} total]")
 
-        # --- Generate chains for each depth ---
-        for depth in range(2, max_depth + 1):
-            if VERBOSE:
-                print(f"  {cyan('->')} Depth {depth} chains...")
-            budget_key = f'CHAIN_GEN_LIMIT_{depth}'
-            target_combinations = self.params.get(budget_key, 0)
-            if target_combinations <= 0:
-                if VERBOSE:
-                    print(f"  {yellow('[*]')} Budget for depth {depth} is 0, skipping.")
-                continue
-            max_combinations = len(valid_rules) ** depth
-            target_combinations = min(target_combinations, max_combinations)
-            if VERBOSE:
-                print(f"  {cyan('[*]')} Generating up to {target_combinations:,} chains...")
-            new_chains = set()
-            # Add existing seeds of this depth
-            if depth in seed_by_depth:
-                for sc in seed_by_depth[depth]:
-                    if sc not in chains:
-                        new_chains.add(sc)
+        for ds in sbd.values(): chains.update(ds)
 
-            # Extend seeds of depth depth-1 by appending a rule
-            if depth-1 in seed_by_depth and len(seed_by_depth[depth-1]) > 0:
-                seed_list = list(seed_by_depth[depth-1])
-                extension_target = int(target_combinations * EXTENSION_RATIO)
-                attempts = 0
-                max_attempts = extension_target * MAX_ATTEMPTS_MULTIPLIER
-                while len(new_chains) < extension_target and attempts < max_attempts:
-                    seed = random.choice(seed_list)
-                    rule = random.choice(valid_rules)
-                    new_chain = seed + ' ' + rule
-                    if new_chain not in chains and new_chain not in new_chains:
-                        new_chains.add(new_chain)
-                    attempts += 1
+        for depth in range(2, max_depth+1):
+            budget = self.params.get(f'CHAIN_GEN_LIMIT_{depth}', 0)
+            if budget <= 0: continue
+            budget   = min(budget, len(valid)**depth)
+            new      = set(sbd.get(depth, set())) - chains
+            prev     = list(sbd.get(depth-1, set()))
+            ext_tgt  = int(budget * EXTENSION_RATIO)
+            att = 0
+            while len(new) < ext_tgt and att < ext_tgt*MAX_ATTEMPTS_MULTIPLIER:
+                att += 1
+                if prev:
+                    nc = random.choice(prev) + ' ' + random.choice(valid)
+                    if nc not in chains and nc not in new: new.add(nc)
+            rem = budget - len(new)
+            if rem > 0:
+                new.update(self._gen_random_chains(depth, rem, valid, hot, chains, new))
+            chains.update(new); sbd[depth].update(new)
+            log_debug(f"Depth {depth}: budget={budget:,}, generated={len(new):,}")
 
-            # Fill remaining budget with random chains
-            remaining = target_combinations - len(new_chains)
-            if remaining > 0:
-                random_chains = self._generate_random_chains(
-                    depth, remaining, valid_rules, hot_rules, cold_rules,
-                    chains, new_chains
-                )
-                new_chains.update(random_chains)
+        log_debug(f"Total chains generated: {len(chains):,}")
+        return list(chains)
 
-            # Add to main set
-            chains.update(new_chains)
-            # Also update seed_by_depth for this depth so that deeper depths can extend from these new chains
-            seed_by_depth[depth].update(new_chains)
-
-        chains_list = list(chains)
-        # Apply global max chains limit if specified
-        if max_total_chains is not None and len(chains_list) > max_total_chains:
-            chains_list = random.sample(chains_list, max_total_chains)
-            if VERBOSE:
-                print(f"  {cyan('[*]')} Limited chains to {max_total_chains:,} (random sample)")
-        if VERBOSE:
-            print(f"  {cyan('[*]')} Final chain count: {len(chains_list):,}")
-        return chains_list
-
-    def process_all_words_chain_rules(self, base_words, rules, max_depth, bloom_filter, single_rules_counter, seed_chains=None, max_total_chains=None):
-        if VERBOSE:
-            print(f"{blue('[GPU]')} {bold('Processing ALL words with rule chains...')}")
-        if self.bloom_buf is None:
-            self.upload_bloom_filter(bloom_filter)
+    def process_all_words_chain_rules(self, base_words, rules, max_depth,
+                                      bloom_filter, single_counter, seed_chains=None):
+        if self.bloom_buf is None: self.upload_bloom_filter(bloom_filter)
         if not self.program:
-            if not self.compile_kernel():
-                return Counter()
+            if not self.compile_kernel(): return Counter()
         if not self.rule_index:
             self.rule_index = {r: i for i, r in enumerate(self.gpu_rules)}
-        if VERBOSE:
-            print(f"{blue('[SETUP]')} {bold('Generating rule chains...')}")
-        chains = self.generate_informed_chains(rules, single_rules_counter, max_depth, seed_chains, max_total_chains)
-        if not chains:
-            return Counter()
-        if VERBOSE:
-            print(f"{blue('[INFO]')} {bold('Total chains generated:')} {len(chains):,}")
-        chain_counter = Counter()
-        seen_mappings = set()  # (base_idx, output_hash) -> counted
-        chain_batch_size = self.params['CHAINS_PER_BATCH']
-        word_sub_batch = self.params['WORD_SUB_BATCH']
-        num_chain_batches = (len(chains) + chain_batch_size - 1) // chain_batch_size
-        if VERBOSE:
-            print(f"{blue('[INFO]')} {bold('Processing')} {len(chains):,} {bold('chains in')} {num_chain_batches} {bold('batches')}")
-            print(f"{blue('[INFO]')} {bold('Chain batch size:')} {chain_batch_size:,}")
-            print(f"{blue('[INFO]')} {bold('Word sub-batch size:')} {word_sub_batch:,}")
-        with tqdm(total=num_chain_batches, desc="Chain batches", unit="batch", disable=False) as chain_pbar:
-            for chain_batch_idx in range(0, len(chains), chain_batch_size):
-                chain_end = min(chain_batch_idx + chain_batch_size, len(chains))
-                chain_batch = chains[chain_batch_idx:chain_end]
-                for word_start in range(0, len(base_words), word_sub_batch):
-                    word_end = min(word_start + word_sub_batch, len(base_words))
-                    word_batch = base_words[word_start:word_end]
-                    if not word_batch:
-                        continue
-                    batch_results = self._process_chain_batch(word_batch, chain_batch)
-                    for chain_str, base_idx, out_hash in batch_results:
-                        key = (base_idx, out_hash)
-                        if key not in seen_mappings:
-                            seen_mappings.add(key)
-                            chain_counter[chain_str] += 1
+
+        chains = self.generate_informed_chains(rules, single_counter, max_depth, seed_chains)
+        if not chains: return Counter()
+
+        log_debug(f"Phase 2: {len(chains):,} chains × {len(base_words):,} words")
+
+        counter = Counter()
+        cbs     = self.params['CHAINS_PER_BATCH']
+        wsb     = self.params['WORD_SUB_BATCH']
+        n_batches = (len(chains)+cbs-1)//cbs
+
+        with tqdm(total=n_batches,
+                  desc=green("  Phase 2 "),
+                  unit="batch",
+                  ncols=88,
+                  bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}",
+                  ) as pbar:
+
+            for ci in range(0, len(chains), cbs):
+                cb = chains[ci:ci+cbs]
+                for wi in range(0, len(base_words), wsb):
+                    wb = base_words[wi:wi+wsb]
+                    if wb:
+                        found = self._run_chain_kernel(wb, cb)
+                        if found:
+                            counter.update(found)
                     self.queue.finish()
-                if VERBOSE:
-                    chain_pbar.update(1)
-                    chain_pbar.set_postfix({'found': len(chain_counter), 'progress': f"{chain_end}/{len(chains)}"})
-                else:
-                    chain_pbar.update(1)
+
+                pbar.update(1)
+                pbar.set_postfix({"rules": cyan(str(len(counter)))}, refresh=False)
                 gc.collect()
-        if VERBOSE:
-            print(f"\n{green('[OK]')} {bold('Total unique chains found:')} {cyan(len(chain_counter))}")
-        return chain_counter
 
-    def _process_chain_batch(self, words, chains):
-        chain_sequences = []
-        chain_depths = []
+        log_info(f"[P2]   {bold(green(str(len(counter))))} unique chain rules passed bloom filter")
+        log_debug(f"Phase 2 complete: {len(counter)} chain rules in counter")
+        return counter
+
+    def _run_chain_kernel(self, words, chains):
+        seqs = []; depths = []
         for chain in chains:
-            chain_rules = chain.split()
-            depth = len(chain_rules)
-            chain_depths.append(depth)
-            rule_indices = []
-            for rule in chain_rules:
-                idx = self.rule_index.get(rule, -1)
-                rule_indices.append(idx)
-            while len(rule_indices) < self.params['MAX_CHAIN_DEPTH']:
-                rule_indices.append(-1)
-            chain_sequences.extend(rule_indices)
+            parts = chain.split(); depths.append(len(parts))
+            idxs  = [self.rule_index.get(r,-1) for r in parts]
+            while len(idxs) < self.params['MAX_CHAIN_DEPTH']: idxs.append(-1)
+            seqs.extend(idxs)
 
-        batch_data = self.prepare_batch_data(words, self.gpu_rules)
-        mf = cl.mem_flags
-
-        # Initialize buffers to None
-        base_buf = None
-        base_offsets_buf = None
-        base_lengths_buf = None
-        rules_buf = None
-        rule_offsets_buf = None
-        rule_lengths_buf = None
-        chain_seq_buf = None
-        chain_depth_buf = None
-        found_chains_buf = None
-        found_count_buf = None
-
+        bd = self.prepare_batch_data(words, self.gpu_rules)
+        mf = cl.mem_flags; bufs = []
         try:
-            base_buf = cl.Buffer(self.context, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=batch_data['words_flat'])
-            base_offsets_buf = cl.Buffer(self.context, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=batch_data['word_offsets'])
-            base_lengths_buf = cl.Buffer(self.context, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=batch_data['word_lengths'])
-            rules_buf = cl.Buffer(self.context, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=batch_data['rules_flat'])
-            rule_offsets_buf = cl.Buffer(self.context, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=batch_data['rule_offsets'])
-            rule_lengths_buf = cl.Buffer(self.context, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=batch_data['rule_lengths'])
-            chain_seq_buf = cl.Buffer(self.context, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=np.array(chain_sequences, dtype=np.int32))
-            chain_depth_buf = cl.Buffer(self.context, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=np.array(chain_depths, dtype=np.int32))
-            bloom_buf = self.bloom_buf
+            def B(arr, f=mf.READ_ONLY):
+                b = cl.Buffer(self.context, f | mf.COPY_HOST_PTR, hostbuf=arr)
+                bufs.append(b); return b
 
-            max_output_size = self.safe_output_buffer_size(len(words), len(chains))
-            # Ensure max_output_size is not zero
-            if max_output_size == 0:
-                max_output_size = 1
-            stride = MAX_CHAIN_STRING_LEN + 4 + 4  # chain string + int + uint
-            found_chains_buf = cl.Buffer(self.context, mf.WRITE_ONLY, max_output_size * stride)
-            found_count_buf = cl.Buffer(self.context, mf.READ_WRITE, 4)
-            zero_count = np.array([0], dtype=np.int32)
-            cl.enqueue_copy(self.queue, found_count_buf, zero_count)
+            bb=B(bd['words_flat']); bbo=B(bd['word_offsets']); bbl=B(bd['word_lengths'])
+            rb=B(bd['rules_flat']); rbo=B(bd['rule_offsets']); rbl=B(bd['rule_lengths'])
+            csb=B(np.array(seqs,   dtype=np.int32))
+            cdb=B(np.array(depths, dtype=np.int32))
+            outs = self.safe_output_buffer_size(len(words), len(chains))
+            fo = cl.Buffer(self.context, mf.WRITE_ONLY, outs*MAX_CHAIN_STRING_LEN); bufs.append(fo)
+            fc = cl.Buffer(self.context, mf.READ_WRITE, 4);                         bufs.append(fc)
+            cl.enqueue_copy(self.queue, fc, np.array([0], dtype=np.int32))
 
-            kernel = self.kernel_chain
-            total_items = len(words) * len(chains)
-            global_size = ((total_items + self.local_work_size - 1) // self.local_work_size) * self.local_work_size
-            kernel.set_args(
-                base_buf, base_offsets_buf, base_lengths_buf,
-                rules_buf, rule_offsets_buf, rule_lengths_buf,
-                chain_seq_buf, chain_depth_buf,
-                bloom_buf,
-                np.int32(len(words)),
-                np.int32(len(chains)),
-                np.int32(self.params['MAX_CHAIN_DEPTH']),
-                found_chains_buf,
-                found_count_buf
-            )
-            cl.enqueue_nd_range_kernel(self.queue, kernel, (global_size,), (self.local_work_size,))
+            tot = len(words)*len(chains)
+            gs  = ((tot+self.local_work_size-1)//self.local_work_size)*self.local_work_size
+            self.kernel_chain.set_args(bb,bbo,bbl,rb,rbo,rbl,csb,cdb,self.bloom_buf,
+                                       np.int32(len(words)),np.int32(len(chains)),
+                                       np.int32(self.params['MAX_CHAIN_DEPTH']),fo,fc)
+            cl.enqueue_nd_range_kernel(self.queue, self.kernel_chain, (gs,), (self.local_work_size,))
             self.queue.finish()
 
-            found_count = np.zeros(1, dtype=np.int32)
-            cl.enqueue_copy(self.queue, found_count, found_count_buf)
-            num_found = min(found_count[0], max_output_size)
-            batch_results = []
-            if num_found > 0:
-                found_data = np.zeros(num_found * stride, dtype=np.uint8)
-                cl.enqueue_copy(self.queue, found_data, found_chains_buf)
-                for i in range(num_found):
-                    offset = i * stride
-                    # Chain string
-                    chain_bytes = bytes(found_data[offset:offset + MAX_CHAIN_STRING_LEN])
-                    chain_str = chain_bytes.split(b'\0')[0].decode('latin-1', errors='ignore')
-                    if not chain_str:
-                        continue
-                    # Base index
-                    base_idx = np.frombuffer(found_data[offset+MAX_CHAIN_STRING_LEN:offset+MAX_CHAIN_STRING_LEN+4],
-                                             dtype=np.int32)[0]
-                    # Output hash
-                    out_hash = np.frombuffer(found_data[offset+MAX_CHAIN_STRING_LEN+4:offset+MAX_CHAIN_STRING_LEN+8],
-                                             dtype=np.uint32)[0]
-                    batch_results.append((chain_str, base_idx, out_hash))
-            return batch_results
-
+            cnt = np.zeros(1, dtype=np.int32)
+            cl.enqueue_copy(self.queue, cnt, fc)
+            n = min(cnt[0], outs); out = []
+            if n > 0:
+                data = np.zeros(n*MAX_CHAIN_STRING_LEN, dtype=np.uint8)
+                cl.enqueue_copy(self.queue, data, fo)
+                for i in range(n):
+                    r = bytes(data[i*MAX_CHAIN_STRING_LEN:(i+1)*MAX_CHAIN_STRING_LEN]
+                              ).split(b'\0')[0].decode('latin-1', errors='ignore')
+                    if r: out.append(r)
+            return out
         except Exception as e:
-            if VERBOSE:
-                print(f"{yellow('[WARN]')} GPU chain processing failed: {e}")
-            self.queue = cl.CommandQueue(self.context)
-            return []
+            log_warn(f"Chain kernel error: {e}")
+            self.queue = cl.CommandQueue(self.context); return []
         finally:
-            for buf in (base_buf, base_offsets_buf, base_lengths_buf,
-                        rules_buf, rule_offsets_buf, rule_lengths_buf,
-                        chain_seq_buf, chain_depth_buf,
-                        found_chains_buf, found_count_buf):
-                if buf is not None:
-                    try:
-                        buf.release()
-                    except Exception:
-                        pass
+            for b in bufs:
+                try: b.release()
+                except: pass
 
-# ====================================================================
-# --- GPU EXTRACTOR ---
-# ====================================================================
+# --------------------------------------------------------------------
+# GPU Extractor (from original)
+# --------------------------------------------------------------------
 class GPUExtractor:
-    def __init__(self, base_count, target_count, max_depth, device_spec=None, target_hours=0.5,
-                 max_chains=None, seed_rules_file=None, bloom_size_mb=None):
-        self.base_count = base_count
-        self.target_count = target_count
-        self.max_depth = max_depth
-        self.device_spec = device_spec
-        self.max_chains = max_chains
+    def __init__(self, base_count, target_count, max_depth, device_spec=None,
+                 target_hours=0.5, max_chains=None, seed_rules_file=None, bloom_mb=None):
+        self.base_count      = base_count
+        self.target_count    = target_count
+        self.max_depth       = max_depth
+        self.device_spec     = device_spec
+        self.max_chains      = max_chains
         self.seed_rules_file = seed_rules_file
-        self.bloom_size_mb = bloom_size_mb
-        self.params = calculate_dynamic_parameters(base_count, target_count, None, target_hours, bloom_size_mb)
+        self.bloom_mb        = bloom_mb
+        self.params          = calculate_dynamic_parameters(
+            base_count, target_count, None, target_hours, bloom_mb_override=bloom_mb)
         self.params['MAX_CHAIN_DEPTH'] = max_depth
-        if VERBOSE:
-            print(f"{blue('[CONFIG]')} {bold('GPU-Optimized Configuration:')}")
-            for k, v in self.params.items():
-                if isinstance(v, (int, float)) and k not in ('bloom_scale', 'vram_scale', 'free_vram'):
-                    print(f"  {cyan('[*]')} {k}: {v:,}" if isinstance(v, int) else f"  {cyan('[*]')} {k}: {v}")
-        self.rules_generator = GPUCompatibleRulesGenerator()
-        self.gpu_engine = GPUEngine(self.params)
-        self.validator = HashcatRuleValidator()
+        self.rules_gen       = GPUCompatibleRulesGenerator()
+        self.gpu_engine      = GPUEngine(self.params)
+        self.validator       = HashcatRuleValidator()
 
     def load_seed_rules(self):
-        if not self.seed_rules_file:
-            return []
-        if VERBOSE:
-            print(f"{blue('[SEED]')} {bold('Loading seed rules from:')} {self.seed_rules_file}")
+        if not self.seed_rules_file: return []
         seeds = []
         try:
             with open(self.seed_rules_file, 'r', encoding='latin-1') as f:
@@ -1313,952 +1273,301 @@ class GPUExtractor:
                     if line and not line.startswith('#'):
                         if self.validator.validate_rule_for_gpu(line):
                             seeds.append(line)
+            log_info(f"[SEED] Loaded {bold(str(len(seeds)))} seed rules from {self.seed_rules_file}")
+            log_debug(f"Seed rules file: {self.seed_rules_file}, valid={len(seeds)}")
         except Exception as e:
-            if VERBOSE:
-                print(f"{yellow('[WARN]')} Could not load seed rules: {e}")
-            return []
-        if VERBOSE:
-            print(f"{green('[OK]')} {bold('Loaded')} {len(seeds)} {bold('GPU-compatible seed rules')}")
+            log_warn(f"Seed rules load failed: {e}")
         return seeds
 
-    def extract_rules(self, base_words, target_words,
-                      depth2_override=None, depth3_override=None,
-                      depth4_override=None, depth5_override=None,
-                      depth6_override=None, depth7_override=None,
-                      depth8_override=None, depth9_override=None,
-                      depth10_override=None):
-        if VERBOSE:
-            print(f"{blue('[MAIN]')} {bold('Starting GPU-optimized rule extraction...')}")
+    def extract_rules(self, base_words, target_words, **depth_overrides):
         all_counts = Counter()
-        rules = self.rules_generator.generate_gpu_compatible_rules()
+        rules      = self.rules_gen.generate_gpu_compatible_rules()
+
         if not self.gpu_engine.initialize_gpu(self.device_spec):
-            if VERBOSE:
-                print(f"{yellow('[WARN]')} {bold('GPU not available')}")
             return all_counts
-        # Recalculate parameters now that we have a device, but keep the user's bloom size if given
-        self.params = calculate_dynamic_parameters(self.base_count, self.target_count, self.gpu_engine.device,
-                                                   self.params['TARGET_SECONDS']/3600, self.bloom_size_mb)
+
+        self.params = calculate_dynamic_parameters(
+            self.base_count, self.target_count,
+            self.gpu_engine.device,
+            self.params['TARGET_SECONDS'] / 3600,
+            bloom_mb_override=self.bloom_mb)
         self.params['MAX_CHAIN_DEPTH'] = self.max_depth
         self.gpu_engine.params = self.params
-        seed_chains = self.load_seed_rules()
+
+        seed_chains  = self.load_seed_rules()
         bloom_filter = self.gpu_engine.generate_bloom_filter(target_words)
 
-        if VERBOSE:
-            print(f"\n{blue('=' * 60)}")
-            print(f"{bold('PHASE 1: SINGLE RULE SEARCH (ALL WORDS)')}")
-            print(f"{blue('=' * 60)}")
-        phase1_start = time.time()
-        single_counts = self.gpu_engine.process_all_words_single_rule(base_words, rules, bloom_filter)
-        phase1_time = time.time() - phase1_start
-        all_counts.update(single_counts)
-        if VERBOSE:
-            print(f"{green('[OK]')} {bold('Single rules found:')} {cyan(len(single_counts))}")
+        # --- Phase 1: single rules ---
+        log_section("PHASE 1 — Single Rule Search")
+        log_info(f"[P1]   {len(base_words):,} base words × {len(rules):,} atomic rules")
+        t0     = time.time()
+        single = self.gpu_engine.process_all_words_single_rule(base_words, rules, bloom_filter)
+        t1     = time.time()
+        all_counts.update(single)
+        log_debug(f"Phase 1 elapsed: {t1-t0:.1f}s")
 
+        # --- Phase 2: rule chains ---
         if self.max_depth > 1:
-            if VERBOSE:
-                print(f"\n{blue('=' * 60)}")
-                print(f"{bold('PHASE 2: RULE CHAIN SEARCH (ALL WORDS)')}")
-                print(f"{blue('=' * 60)}")
-            remaining_time = max(0, self.params['TARGET_SECONDS'] - phase1_time)
-            total_work_budget = remaining_time * self.params['EST_COMBOS_PER_SEC'] * TIME_SAFETY_FACTOR
-            base_words_len = len(base_words)
-            depths = list(range(2, self.max_depth + 1))
-            if total_work_budget > 0 and base_words_len > 0 and depths:
-                W = total_work_budget / len(depths)
-                depth_budgets = {}
-                for d in depths:
-                    raw_budget = int(W / (base_words_len * d))
-                    depth_budgets[d] = raw_budget
-            else:
-                depth_budgets = {d: 0 for d in depths}
-            overrides = {2: depth2_override, 3: depth3_override, 4: depth4_override,
-                         5: depth5_override, 6: depth6_override, 7: depth7_override,
-                         8: depth8_override, 9: depth9_override, 10: depth10_override}
-            for d, val in overrides.items():
-                if val is not None and d in depth_budgets:
-                    depth_budgets[d] = val
-                    if VERBOSE:
-                        print(f"{blue('[OVERRIDE]')} {bold(f'Depth {d} chains set to:')} {cyan(val)}")
-            for d in depth_budgets:
+            log_section("PHASE 2 — Rule Chain Search")
+            remaining = max(0, self.params['TARGET_SECONDS'] - (t1-t0))
+            budget    = remaining * self.params['EST_COMBOS_PER_SEC'] * TIME_SAFETY_FACTOR
+            depths    = list(range(2, self.max_depth+1))
+            depth_budgets = ({d: int(budget/len(depths)/(len(base_words)*d)) for d in depths}
+                             if budget > 0 and base_words and depths
+                             else {d: 0 for d in depths})
+
+            for d in depths:
+                key = f'depth{d}_override'
+                if key in depth_overrides and depth_overrides[key] is not None:
+                    depth_budgets[d] = depth_overrides[key]
+                    log_debug(f"Depth {d} chain budget overridden to {depth_overrides[key]:,}")
                 depth_budgets[d] = max(0, depth_budgets[d])
-            if self.max_chains is not None:
-                total_budget = sum(depth_budgets.values())
-                if total_budget > self.max_chains:
-                    scale = self.max_chains / total_budget
-                    for d in depth_budgets:
-                        old = depth_budgets[d]
-                        depth_budgets[d] = int(old * scale)
-                        # Ensure we keep at least one chain for depths that originally had a budget
-                        if old > 0 and depth_budgets[d] == 0:
-                            depth_budgets[d] = 1
-                    if VERBOSE:
-                        print(f"{blue('[OVERRIDE]')} {bold('Scaled chain budgets to fit --max-chains:')} {cyan(self.max_chains)}")
-            for d, budget in depth_budgets.items():
-                self.params[f'CHAIN_GEN_LIMIT_{d}'] = budget
-            if VERBOSE:
-                print(f"{blue('[DYNAMIC]')} {bold('Phase 1 time:')} {phase1_time:.2f}s, {bold('Remaining:')} {remaining_time:.2f}s")
-                for d in depths:
-                    print(f"{blue('[DYNAMIC]')} {bold(f'Depth {d} chain limit:')} {cyan(f'{depth_budgets[d]:,}')}")
-            chain_counts = self.gpu_engine.process_all_words_chain_rules(
-                base_words, rules, self.max_depth, bloom_filter, single_counts, seed_chains, self.max_chains)
-            all_counts.update(chain_counts)
-            if VERBOSE:
-                print(f"{green('[OK]')} {bold('Rule chains found:')} {cyan(len(chain_counts))}")
 
-        if VERBOSE:
-            print(f"\n{blue('=' * 60)}")
-            print(f"{bold('FINAL CLEANUP')}")
-            print(f"{blue('=' * 60)}")
-        validated_counts = Counter()
-        for rule, cnt in all_counts.items():
-            if HashcatRuleValidator.validate_rule_for_gpu(rule):
-                validated_counts[rule] = cnt
-        return validated_counts
+            if self.max_chains:
+                total = sum(depth_budgets.values())
+                if total > self.max_chains:
+                    scale = self.max_chains / total
+                    depth_budgets = {d: int(v*scale) for d,v in depth_budgets.items()}
+                    log_debug(f"Budgets scaled by {scale:.3f} to fit --max-chains={self.max_chains}")
 
-# ====================================================================
-# --- GPU KERNEL TEMPLATE (FULL) ---
-# ====================================================================
-GPU_COMPATIBLE_KERNEL_TEMPLATE = """
-#define MAX_WORD_LEN {MAX_WORD_LEN}
-#define MAX_RULE_LEN {MAX_RULE_LEN}
-#define MAX_OUTPUT_LEN {MAX_OUTPUT_LEN}
-#define MAX_CHAIN_STRING_LEN {MAX_CHAIN_STRING_LEN}
-#define MAX_CHAINS_TO_FIND {MAX_SAFE_RESULTS_PER_BATCH}
-#define MAX_CHAIN_DEPTH {MAX_CHAIN_DEPTH}
-#define BLOOM_FILTER_SIZE {BLOOM_FILTER_SIZE}
-#define BLOOM_HASH_FUNCTIONS {BLOOM_HASH_FUNCTIONS}
+            for d, bgt in depth_budgets.items():
+                self.params[f'CHAIN_GEN_LIMIT_{d}'] = bgt
 
-// Result structure stride
-#define CHAIN_RESULT_STR_OFFSET 0
-#define CHAIN_RESULT_IDX_OFFSET MAX_CHAIN_STRING_LEN
-#define CHAIN_RESULT_HASH_OFFSET (MAX_CHAIN_STRING_LEN + sizeof(int))
-#define CHAIN_RESULT_STRIDE (MAX_CHAIN_STRING_LEN + sizeof(int) + sizeof(uint))
+            log_info(f"[P2]   depth 2–{self.max_depth} | "
+                     + " | ".join(f"d{d}:{v:,}" for d,v in depth_budgets.items()))
+            log_debug(f"Remaining time budget: {remaining:.1f}s")
 
-// ============================================================================
-// FNV-1a HASH FUNCTION (GPU VERSION)
-// ============================================================================
+            chains = self.gpu_engine.process_all_words_chain_rules(
+                base_words, rules, self.max_depth, bloom_filter, single, seed_chains)
+            all_counts.update(chains)
+            log_debug(f"Phase 2 elapsed: {time.time()-t1:.1f}s")
 
-uint fnv1a_32_local(const unsigned char *data, int len, uint seed) {{
-    uint hash = seed ^ 2166136261U;
-    for (int i = 0; i < len; i++) {{
-        hash ^= data[i];
-        hash *= 16777619U;
-    }}
-    return hash;
-}}
+        validated = Counter({r: c for r,c in all_counts.items()
+                             if HashcatRuleValidator.validate_rule_for_gpu(r)})
+        log_debug(f"Post-validation: {len(validated)} rules from {len(all_counts)} raw")
+        return validated
 
-// ============================================================================
-// UTILITY FUNCTIONS
-// ============================================================================
-
-inline int is_lower(unsigned char c) {{
-    return (c >= 'a' && c <= 'z');
-}}
-
-inline int is_upper(unsigned char c) {{
-    return (c >= 'A' && c <= 'Z');
-}}
-
-inline int is_digit(unsigned char c) {{
-    return (c >= '0' && c <= '9');
-}}
-
-inline unsigned char to_lower(unsigned char c) {{
-    if (is_upper(c)) return c + 32;
-    return c;
-}}
-
-inline unsigned char to_upper(unsigned char c) {{
-    if (is_lower(c)) return c - 32;
-    return c;
-}}
-
-inline unsigned char toggle_case(unsigned char c) {{
-    if (is_lower(c)) return c - 32;
-    if (is_upper(c)) return c + 32;
-    return c;
-}}
-
-// ============================================================================
-// BLOOM FILTER CHECK
-// ============================================================================
-
-int bloom_check(__global const uchar *bloom_filter, const unsigned char *word, int len) {{
-    uint h1 = fnv1a_32_local(word, len, 0xDEADBEEF);
-    uint h2 = fnv1a_32_local(word, len, 0xCAFEBABE);
-
-    for (int i = 0; i < BLOOM_HASH_FUNCTIONS; i++) {{
-        uint hash_val = (h1 + i * h2) % BLOOM_FILTER_SIZE;
-        uint byte_idx = hash_val / 8;
-        uint bit_idx = hash_val % 8;
-
-        if (!(bloom_filter[byte_idx] & (1 << bit_idx))) {{
-            return 0;
-        }}
-    }}
-    return 1;
-}}
-
-// ============================================================================
-// GPU-COMPATIBLE RULE APPLICATION (SAFE FOR OPENCL)
-// ============================================================================
-
-int apply_gpu_rule(
-    const unsigned char *rule_str, int rule_len,
-    const unsigned char *input_word, int input_len,
-    unsigned char *output_word, int *output_len
-) {{
-    // Initialize with input
-    *output_len = input_len;
-    for (int i = 0; i < input_len; i++) {{
-        output_word[i] = input_word[i];
-    }}
-    output_word[input_len] = '\\0';
-
-    if (rule_len == 0 || input_len == 0) return 1;
-
-    unsigned char cmd = rule_str[0];
-    int changed = 0;
-
-    // ------------------------------------------------------------------------
-    // SINGLE CHARACTER RULES
-    // ------------------------------------------------------------------------
-    if (rule_len == 1) {{
-        switch (cmd) {{
-            case 'l': // Lowercase all
-                for (int i = 0; i < *output_len; i++) {{
-                    output_word[i] = to_lower(output_word[i]);
-                }}
-                changed = 1;
-                break;
-            case 'u': // Uppercase all
-                for (int i = 0; i < *output_len; i++) {{
-                    output_word[i] = to_upper(output_word[i]);
-                }}
-                changed = 1;
-                break;
-            case 'c': // Capitalize first, lowercase rest
-                if (*output_len > 0) {{
-                    output_word[0] = to_upper(output_word[0]);
-                    for (int i = 1; i < *output_len; i++) {{
-                        output_word[i] = to_lower(output_word[i]);
-                    }}
-                }}
-                changed = 1;
-                break;
-            case 'C': // Lowercase first, uppercase rest
-                if (*output_len > 0) {{
-                    output_word[0] = to_lower(output_word[0]);
-                    for (int i = 1; i < *output_len; i++) {{
-                        output_word[i] = to_upper(output_word[i]);
-                    }}
-                }}
-                changed = 1;
-                break;
-            case 't': // Toggle case
-                for (int i = 0; i < *output_len; i++) {{
-                    output_word[i] = toggle_case(output_word[i]);
-                }}
-                changed = 1;
-                break;
-            case 'r': // Reverse
-                for (int i = 0; i < *output_len / 2; i++) {{
-                    unsigned char temp = output_word[i];
-                    output_word[i] = output_word[*output_len - 1 - i];
-                    output_word[*output_len - 1 - i] = temp;
-                }}
-                changed = 1;
-                break;
-            case 'd': // Duplicate
-                if (*output_len * 2 <= MAX_OUTPUT_LEN) {{
-                    for (int i = 0; i < *output_len; i++) {{
-                        output_word[*output_len + i] = output_word[i];
-                    }}
-                    *output_len *= 2;
-                }}
-                changed = 1;
-                break;
-            case 'f': // Reflect
-                if (*output_len * 2 <= MAX_OUTPUT_LEN) {{
-                    for (int i = 0; i < *output_len; i++) {{
-                        output_word[*output_len + i] = output_word[*output_len - 1 - i];
-                    }}
-                    *output_len *= 2;
-                }}
-                changed = 1;
-                break;
-            case '{{': // Rotate left
-                if (*output_len > 1) {{
-                    unsigned char first = output_word[0];
-                    for (int i = 0; i < *output_len - 1; i++) {{
-                        output_word[i] = output_word[i + 1];
-                    }}
-                    output_word[*output_len - 1] = first;
-                }}
-                changed = 1;
-                break;
-            case '}}': // Rotate right
-                if (*output_len > 1) {{
-                    unsigned char last = output_word[*output_len - 1];
-                    for (int i = *output_len - 1; i > 0; i--) {{
-                        output_word[i] = output_word[i - 1];
-                    }}
-                    output_word[0] = last;
-                }}
-                changed = 1;
-                break;
-            case '[': // Delete first char
-                if (*output_len > 0) {{
-                    for (int i = 0; i < *output_len - 1; i++) {{
-                        output_word[i] = output_word[i + 1];
-                    }}
-                    (*output_len)--;
-                }}
-                changed = 1;
-                break;
-            case ']': // Delete last char
-                if (*output_len > 0) {{
-                    (*output_len)--;
-                }}
-                changed = 1;
-                break;
-            case 'k': // Swap first two
-                if (*output_len >= 2) {{
-                    unsigned char temp = output_word[0];
-                    output_word[0] = output_word[1];
-                    output_word[1] = temp;
-                }}
-                changed = 1;
-                break;
-            case 'K': // Swap last two
-                if (*output_len >= 2) {{
-                    unsigned char temp = output_word[*output_len - 2];
-                    output_word[*output_len - 2] = output_word[*output_len - 1];
-                    output_word[*output_len - 1] = temp;
-                }}
-                changed = 1;
-                break;
-            case ':': // No operation
-                changed = 0;
-                break;
-            case 'q': // Duplicate all chars
-                if (*output_len * 2 <= MAX_OUTPUT_LEN) {{
-                    unsigned char temp[MAX_OUTPUT_LEN];
-                    for (int i = 0; i < *output_len; i++) temp[i] = output_word[i];
-                    int idx = 0;
-                    for (int i = 0; i < *output_len; i++) {{
-                        output_word[idx++] = temp[i];
-                        output_word[idx++] = temp[i];
-                    }}
-                    *output_len *= 2;
-                }}
-                changed = 1;
-                break;
-            case 'E': // Title case
-                if (*output_len > 0) {{
-                    int capitalize = 1;
-                    for (int i = 0; i < *output_len; i++) {{
-                        if (capitalize && is_lower(output_word[i])) {{
-                            output_word[i] = to_upper(output_word[i]);
-                            capitalize = 0;
-                        }}
-                        if (output_word[i] == ' ' || output_word[i] == '-' || output_word[i] == '_') {{
-                            capitalize = 1;
-                        }}
-                    }}
-                }}
-                changed = 1;
-                break;
-        }}
-    }}
-    // ------------------------------------------------------------------------
-    // TWO CHARACTER RULES (cmd + one parameter)
-    // ------------------------------------------------------------------------
-    else if (rule_len == 2) {{
-        unsigned char param = rule_str[1];
-
-        if (cmd == '^') {{ // Prepend
-            if (*output_len + 1 <= MAX_OUTPUT_LEN) {{
-                for (int i = *output_len; i > 0; i--) {{
-                    output_word[i] = output_word[i - 1];
-                }}
-                output_word[0] = param;
-                (*output_len)++;
-                changed = 1;
-            }}
-        }}
-        else if (cmd == '$') {{ // Append
-            if (*output_len + 1 <= MAX_OUTPUT_LEN) {{
-                output_word[*output_len] = param;
-                (*output_len)++;
-                changed = 1;
-            }}
-        }}
-        else if (cmd == '@') {{ // Delete all instances of char
-            int new_len = 0;
-            for (int i = 0; i < *output_len; i++) {{
-                if (output_word[i] != param) {{
-                    output_word[new_len++] = output_word[i];
-                }} else {{
-                    changed = 1;
-                }}
-            }}
-            *output_len = new_len;
-        }}
-        else if (cmd == 'p') {{ // Duplicate word times (pN)
-            int n = param - '0';
-            if (n > 0 && *output_len * (n + 1) <= MAX_OUTPUT_LEN) {{
-                int original_len = *output_len;
-                for (int rep = 0; rep < n; rep++) {{
-                    for (int i = 0; i < original_len; i++) {{
-                        output_word[*output_len + i] = output_word[i];
-                    }}
-                    *output_len += original_len;
-                }}
-                changed = 1;
-            }}
-        }}
-        else if (cmd == 'T' && is_digit(param)) {{ // Toggle at position
-            int pos = param - '0';
-            if (pos < *output_len) {{
-                output_word[pos] = toggle_case(output_word[pos]);
-                changed = 1;
-            }}
-        }}
-        else if (cmd == 'D' && is_digit(param)) {{ // Delete at position
-            int pos = param - '0';
-            if (pos < *output_len) {{
-                for (int i = pos; i < *output_len - 1; i++) {{
-                    output_word[i] = output_word[i + 1];
-                }}
-                (*output_len)--;
-                changed = 1;
-            }}
-        }}
-        else if (cmd == 'L' && is_digit(param)) {{ // Bitwise shift left
-            int pos = param - '0';
-            if (pos < *output_len) {{
-                output_word[pos] = output_word[pos] << 1;
-                changed = 1;
-            }}
-        }}
-        else if (cmd == 'R' && is_digit(param)) {{ // Bitwise shift right
-            int pos = param - '0';
-            if (pos < *output_len) {{
-                output_word[pos] = output_word[pos] >> 1;
-                changed = 1;
-            }}
-        }}
-        else if (cmd == '+' && is_digit(param)) {{ // Increment at position
-            int pos = param - '0';
-            if (pos < *output_len && output_word[pos] < 255) {{
-                output_word[pos]++;
-                changed = 1;
-            }}
-        }}
-        else if (cmd == '-' && is_digit(param)) {{ // Decrement at position
-            int pos = param - '0';
-            if (pos < *output_len && output_word[pos] > 0) {{
-                output_word[pos]--;
-                changed = 1;
-            }}
-        }}
-        else if (cmd == '.' && is_digit(param)) {{ // Replace with char+1
-            int pos = param - '0';
-            if (pos < *output_len) {{
-                output_word[pos] = output_word[pos] + 1;
-                changed = 1;
-            }}
-        }}
-        else if (cmd == ',' && is_digit(param)) {{ // Replace with char-1
-            int pos = param - '0';
-            if (pos < *output_len) {{
-                output_word[pos] = output_word[pos] - 1;
-                changed = 1;
-            }}
-        }}
-        else if (cmd == '\\'' && is_digit(param)) {{ // Truncate at position
-            int pos = param - '0';
-            if (pos < *output_len) {{
-                *output_len = pos + 1;
-                changed = 1;
-            }}
-        }}
-        else if (cmd == 'z' && is_digit(param)) {{ // Duplicate first character N times
-            int n = param - '0';
-            if (*output_len + n <= MAX_OUTPUT_LEN) {{
-                unsigned char first = output_word[0];
-                for (int i = *output_len + n - 1; i >= n; i--) {{
-                    output_word[i] = output_word[i - n];
-                }}
-                for (int i = 0; i < n; i++) {{
-                    output_word[i] = first;
-                }}
-                *output_len += n;
-                changed = 1;
-            }}
-        }}
-        else if (cmd == 'Z' && is_digit(param)) {{ // Duplicate last character N times
-            int n = param - '0';
-            if (*output_len + n <= MAX_OUTPUT_LEN) {{
-                unsigned char last = output_word[*output_len - 1];
-                for (int i = 0; i < n; i++) {{
-                    output_word[*output_len + i] = last;
-                }}
-                *output_len += n;
-                changed = 1;
-            }}
-        }}
-        else if (cmd == 'y' && is_digit(param)) {{ // Duplicate first block of length N
-            int n = param - '0';
-            if (*output_len + n <= MAX_OUTPUT_LEN) {{
-                for (int i = 0; i < n; i++) {{
-                    output_word[*output_len + i] = output_word[i];
-                }}
-                *output_len += n;
-                changed = 1;
-            }}
-        }}
-        else if (cmd == 'Y' && is_digit(param)) {{ // Duplicate last block of length N
-            int n = param - '0';
-            if (*output_len + n <= MAX_OUTPUT_LEN) {{
-                for (int i = 0; i < n; i++) {{
-                    output_word[*output_len + i] = output_word[*output_len - n + i];
-                }}
-                *output_len += n;
-                changed = 1;
-            }}
-        }}
-    }}
-    // ------------------------------------------------------------------------
-    // THREE CHARACTER RULES
-    // ------------------------------------------------------------------------
-    else if (rule_len == 3) {{
-        unsigned char param1 = rule_str[1];
-        unsigned char param2 = rule_str[2];
-
-        if (cmd == 's') {{ // Substitute
-            for (int i = 0; i < *output_len; i++) {{
-                if (output_word[i] == param1) {{
-                    output_word[i] = param2;
-                    changed = 1;
-                }}
-            }}
-        }}
-        else if (cmd == 'i' && is_digit(param1)) {{ // Insert at position
-            int pos = param1 - '0';
-            if (pos <= *output_len && *output_len + 1 <= MAX_OUTPUT_LEN) {{
-                for (int i = *output_len; i > pos; i--) {{
-                    output_word[i] = output_word[i - 1];
-                }}
-                output_word[pos] = param2;
-                (*output_len)++;
-                changed = 1;
-            }}
-        }}
-        else if (cmd == 'o' && is_digit(param1)) {{ // Overwrite at position
-            int pos = param1 - '0';
-            if (pos < *output_len) {{
-                output_word[pos] = param2;
-                changed = 1;
-            }}
-        }}
-        else if (cmd == 'e') {{ // Title case with separator
-            unsigned char separator = param1;
-            if (*output_len > 0) {{
-                int capitalize = 1;
-                for (int i = 0; i < *output_len; i++) {{
-                    if (capitalize && is_lower(output_word[i])) {{
-                        output_word[i] = to_upper(output_word[i]);
-                        capitalize = 0;
-                    }}
-                    if (output_word[i] == separator) {{
-                        capitalize = 1;
-                    }}
-                }}
-                changed = 1;
-            }}
-        }}
-        else if (cmd == 'x' && is_digit(param1) && is_digit(param2)) {{ // Extract
-            int n = param1 - '0';
-            int m = param2 - '0';
-            if (n > m) {{ int temp = n; n = m; m = temp; }}
-            if (n < *output_len) {{
-                int new_len = 0;
-                for (int i = n; i <= m && i < *output_len; i++) {{
-                    output_word[new_len++] = output_word[i];
-                }}
-                *output_len = new_len;
-                changed = 1;
-            }}
-        }}
-        else if (cmd == 'O' && is_digit(param1) && is_digit(param2)) {{ // Omit range (delete M chars from N)
-            int n = param1 - '0';
-            int m = param2 - '0';
-            if (n < *output_len && m > 0) {{
-                int end = n + m;
-                if (end > *output_len) end = *output_len;
-                int shift = end - n;
-                for (int i = end; i < *output_len; i++) {{
-                    output_word[i - shift] = output_word[i];
-                }}
-                *output_len -= shift;
-                changed = 1;
-            }}
-        }}
-        else if (cmd == '*' && is_digit(param1) && is_digit(param2)) {{ // Swap positions
-            int n = param1 - '0';
-            int m = param2 - '0';
-            if (n < *output_len && m < *output_len && n != m) {{
-                unsigned char temp = output_word[n];
-                output_word[n] = output_word[m];
-                output_word[m] = temp;
-                changed = 1;
-            }}
-        }}
-        else if (cmd == '3' && is_digit(param1)) {{ // Toggle after Nth separator
-            int n = param1 - '0';
-            unsigned char separator = param2;
-            int count = 0;
-            int found = -1;
-            for (int i = 0; i < *output_len; i++) {{
-                if (output_word[i] == separator) {{
-                    count++;
-                    if (count == n) {{
-                        found = i;
-                        break;
-                    }}
-                }}
-            }}
-            if (found != -1 && found + 1 < *output_len) {{
-                output_word[found + 1] = toggle_case(output_word[found + 1]);
-                changed = 1;
-            }}
-        }}
-    }}
-
-    output_word[*output_len] = '\\0';
-    return changed ? 1 : 0;
-}}
-
-// ============================================================================
-// KERNEL: FIND SINGLE RULES
-// ============================================================================
-
-__kernel void find_single_rules_gpu(
-    __global const unsigned char *base_words,
-    __global const int *base_offsets,
-    __global const int *base_lengths,
-    __global const unsigned char *rules,
-    __global const int *rule_offsets,
-    __global const int *rule_lengths,
-    __global const uchar *bloom_filter,
-    const int num_base_words,
-    const int num_rules,
-    __global char *found_rules,
-    __global volatile int *found_count
-) {{
-    int gid = get_global_id(0);
-    int total_items = num_base_words * num_rules;
-
-    if (gid >= total_items) return;
-
-    int word_idx = gid / num_rules;
-    int rule_idx = gid % num_rules;
-
-    // Get base word
-    __global const unsigned char *word_ptr = base_words + base_offsets[word_idx];
-    int word_len = base_lengths[word_idx];
-
-    unsigned char input_word[MAX_WORD_LEN];
-    for (int i = 0; i < word_len; i++) {{
-        input_word[i] = word_ptr[i];
-    }}
-    input_word[word_len] = '\\0';
-
-    // Get rule
-    __global const unsigned char *rule_ptr = rules + rule_offsets[rule_idx];
-    int rule_len = rule_lengths[rule_idx];
-
-    unsigned char rule_str[MAX_RULE_LEN];
-    for (int i = 0; i < rule_len; i++) {{
-        rule_str[i] = rule_ptr[i];
-    }}
-    rule_str[rule_len] = '\\0';
-
-    // Apply rule
-    unsigned char output_word[MAX_OUTPUT_LEN];
-    int output_len;
-    int result = apply_gpu_rule(rule_str, rule_len, input_word, word_len, output_word, &output_len);
-
-    if (result > 0 && output_len > 0) {{
-        if (bloom_check(bloom_filter, output_word, output_len)) {{
-            int idx = atomic_inc(found_count);
-            if (idx < MAX_CHAINS_TO_FIND) {{
-                __global char *output_ptr = found_rules + idx * MAX_CHAIN_STRING_LEN;
-                for (int i = 0; i < rule_len && i < MAX_CHAIN_STRING_LEN - 1; i++) {{
-                    output_ptr[i] = rule_str[i];
-                }}
-                output_ptr[rule_len] = '\\0';
-            }}
-        }}
-    }}
-}}
-
-// ============================================================================
-// KERNEL: FIND RULE CHAINS
-// ============================================================================
-
-__kernel void find_rule_chains_gpu(
-    __global const unsigned char *base_words,
-    __global const int *base_offsets,
-    __global const int *base_lengths,
-    __global const unsigned char *rules,
-    __global const int *rule_offsets,
-    __global const int *rule_lengths,
-    __global const int *chain_sequences,
-    __global const int *chain_depths,
-    __global const uchar *bloom_filter,
-    const int num_base_words,
-    const int num_chains,
-    const int max_chain_depth,
-    __global char *found_chains,
-    __global volatile int *found_count
-) {{
-    int gid = get_global_id(0);
-    int total_items = num_base_words * num_chains;
-
-    if (gid >= total_items) return;
-
-    int word_idx = gid / num_chains;
-    int chain_idx = gid % num_chains;
-
-    // Get base word
-    __global const unsigned char *word_ptr = base_words + base_offsets[word_idx];
-    int word_len = base_lengths[word_idx];
-
-    unsigned char current_word[MAX_OUTPUT_LEN];
-    for (int i = 0; i < word_len; i++) {{
-        current_word[i] = word_ptr[i];
-    }}
-    current_word[word_len] = '\\0';
-    int current_len = word_len;
-
-    int depth = chain_depths[chain_idx];
-    if (depth < 1 || depth > max_chain_depth) return;
-
-    unsigned char temp_word[MAX_OUTPUT_LEN];
-    char chain_buffer[MAX_CHAIN_STRING_LEN];
-    int chain_pos = 0;
-
-    for (int d = 0; d < depth; d++) {{
-        int rule_idx = chain_sequences[chain_idx * max_chain_depth + d];
-        if (rule_idx < 0) break;
-
-        __global const unsigned char *rule_ptr = rules + rule_offsets[rule_idx];
-        int rule_len = rule_lengths[rule_idx];
-
-        unsigned char rule_str[MAX_RULE_LEN];
-        for (int i = 0; i < rule_len; i++) {{
-            rule_str[i] = rule_ptr[i];
-        }}
-        rule_str[rule_len] = '\\0';
-
-        for (int i = 0; i < rule_len && chain_pos < MAX_CHAIN_STRING_LEN - 2; i++) {{
-            chain_buffer[chain_pos++] = rule_str[i];
-        }}
-        if (d < depth - 1 && chain_pos < MAX_CHAIN_STRING_LEN - 1) {{
-            chain_buffer[chain_pos++] = ' ';
-        }}
-
-        int new_len;
-        int result = apply_gpu_rule(rule_str, rule_len, current_word, current_len, temp_word, &new_len);
-
-        if (result <= 0 || new_len == 0) {{
-            return;
-        }}
-
-        for (int i = 0; i < new_len; i++) {{
-            current_word[i] = temp_word[i];
-        }}
-        current_word[new_len] = '\\0';
-        current_len = new_len;
-    }}
-
-    chain_buffer[chain_pos] = '\\0';
-
-    if (bloom_check(bloom_filter, current_word, current_len)) {{
-        int idx = atomic_inc(found_count);
-        if (idx < MAX_CHAINS_TO_FIND) {{
-            __global char *output_ptr = found_chains + idx * CHAIN_RESULT_STRIDE;
-
-            // Chain string
-            for (int i = 0; i < chain_pos && i < MAX_CHAIN_STRING_LEN - 1; i++) {{
-                output_ptr[CHAIN_RESULT_STR_OFFSET + i] = chain_buffer[i];
-            }}
-            output_ptr[CHAIN_RESULT_STR_OFFSET + chain_pos] = '\\0';
-
-            // Base word index
-            *((__global int *)(output_ptr + CHAIN_RESULT_IDX_OFFSET)) = word_idx;
-
-            // Output hash
-            uint out_hash = fnv1a_32_local(current_word, current_len, 0xDEADBEEF);
-            *((__global uint *)(output_ptr + CHAIN_RESULT_HASH_OFFSET)) = out_hash;
-        }}
-    }}
-}}
-"""
-
-# ====================================================================
-# --- UTILITY FUNCTIONS ---
-# ====================================================================
-def load_wordlist_fast(filename):
+# --------------------------------------------------------------------
+# Wordlist loader (from original)
+# --------------------------------------------------------------------
+def load_wordlist(filename: str) -> list:
     words = set()
-    if VERBOSE:
-        print(f"{blue('[LOAD]')} {bold('Loading:')} {filename}")
     try:
         with open(filename, 'r', encoding='latin-1', errors='ignore') as f:
-            for line in tqdm(f, desc="Loading words", disable=False):
-                word = line.strip()
-                if word and len(word) <= MAX_WORD_LEN:
-                    words.add(word)
+            for line in tqdm(f,
+                             desc=green(f"  Loading  "),
+                             unit="line",
+                             ncols=88,
+                             leave=False,
+                             bar_format="{l_bar}{bar}| {n_fmt} [{elapsed}] {postfix}"):
+                w = line.strip()
+                if w and len(w) <= MAX_WORD_LEN: words.add(w)
     except FileNotFoundError:
-        print(f"{red('[ERROR]')} {bold('FATAL ERROR:')} Wordlist not found: {filename}")
-        sys.exit(1)
-    words_list = list(words)
-    if words_list:
-        avg_len = sum(len(w) for w in words_list) / len(words_list)
-        max_len = max(len(w) for w in words_list)
-    else:
-        avg_len = max_len = 0
-    if VERBOSE:
-        print(f"{green('[OK]')} {bold('Loaded:')} {cyan(f'{len(words_list):,}')} {bold('words')}")
-        print(f"{blue('[INFO]')} {bold('Average length:')} {cyan(f'{avg_len:.1f}')}")
-        print(f"{blue('[INFO]')} {bold('Max length:')} {cyan(f'{max_len}')}")
-    return words_list
+        log_error(f"File not found: {filename}"); sys.exit(1)
+    result = list(words)
+    log_info(f"[LOAD] {bold(os.path.basename(filename))}: "
+             f"{bold(cyan(f'{len(result):,}'))} unique words")
+    return result
 
 # ====================================================================
-# --- MAIN ---
+# --- ENTRY POINT ---
 # ====================================================================
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser(
-        description=f"{bold('GPU-COMPATIBLE Hashcat Rules Engine with Hit Counting and Seed Support')}",
-        formatter_class=argparse.RawTextHelpFormatter
+def main() -> None:
+    global VERBOSE, ALLOW_REJECT_RULES
+
+    ap = argparse.ArgumentParser(
+        prog='rulest',
+        description='GPU-Compatible Hashcat Rules Engine',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument('base_wordlist', nargs='?', help='Base wordlist path')
-    parser.add_argument('target_wordlist', nargs='?', help='Target wordlist path')
-    parser.add_argument('-d', '--max-depth', type=int, default=3, help='Max chain depth (>=1, default: 3)')
-    parser.add_argument('-o', '--output', type=str, default='found_chains.txt', help='Output file')
-    parser.add_argument('--max-chains', type=int, default=None, help='Maximum TOTAL chains to generate')
-    parser.add_argument('--target-hours', type=float, default=0.5, help='Target completion time in hours')
-    parser.add_argument('--seed-rules', type=str, default=None, help='File containing seed rules/chains')
-    parser.add_argument('--bloom-size-mb', type=int, default=None, help='Manual Bloom filter size in MB (auto if not set)')
-    parser.add_argument('--list-devices', action='store_true', help='List OpenCL devices and exit')
-    parser.add_argument('--device', type=str, default=None, help='Device index or substring')
-    parser.add_argument('--allow-reject-rules', action='store_true', help='Include reject rules (e.g. !X, ?NX, vNX) in generation (GPU will ignore them)')
-    parser.add_argument('--debug', action='store_true', help='Enable verbose output (detailed generation info, validation messages)')
-    for i in range(2, 11):
-        parser.add_argument(f'--depth{i}-chains', type=int, default=None, help=f'Override depth {i} chain limit')
-    args = parser.parse_args()
 
-    # Set global flags
+    # ---- Positional / core ----------------------------------------
+    ap.add_argument('base_wordlist',   nargs='?', default=None,
+                    help='Base wordlist (input words to transform)')
+    ap.add_argument('target_wordlist', nargs='?', default=None,
+                    help='Target wordlist (desired transformation outputs)')
+
+    # ---- Output ---------------------------------------------------
+    ap.add_argument('-o', '--output', default='rulest_output.txt',
+                    help='Output file for the minimized rule set (default: rulest_output.txt)')
+
+    # ---- GPU / extraction ----------------------------------------
+    ap.add_argument('--device',       default=None,
+                    help='OpenCL device index or name substring')
+    ap.add_argument('--list-devices', action='store_true',
+                    help='List available OpenCL devices and exit')
+    ap.add_argument('--max-depth',    type=int, default=2,
+                    help='Maximum rule chain depth (default: 2, max: 31)')
+    ap.add_argument('--target-hours', type=float, default=0.5,
+                    help='Target GPU runtime in hours (default: 0.5)')
+    ap.add_argument('--max-chains',   type=int, default=0,
+                    help='Hard cap on total chain candidates (0 = auto)')
+    ap.add_argument('--bloom-mb',     type=int, default=0,
+                    help=f'Bloom filter size in MB (default: {BLOOM_FILTER_MAX_MB})')
+    ap.add_argument('--seed-rules',   default=None,
+                    help='Path to a file of seed rules to prioritise')
+
+    # ---- Depth overrides -----------------------------------------
+    for i in range(2, 11):
+        ap.add_argument(f'--depth{i}-chains', type=int, default=None,   # ← changed from 0 to None
+                        dest=f'depth{i}_chains',
+                        help=f'Override chain count for depth {i} (default: auto)')
+
+    # ---- Signature-based minimization ----------------------------
+    ap.add_argument('--sig-words',    type=int, default=DEFAULT_SIG_WORDS,
+                    help=f'Number of probe words for signature computation '
+                         f'(default: {DEFAULT_SIG_WORDS})')
+    ap.add_argument('--min-word-len', type=int, default=DEFAULT_MIN_WORD_LEN,
+                    help=f'Minimum word length for probe words '
+                         f'(default: {DEFAULT_MIN_WORD_LEN})')
+
+    # ---- Misc ----------------------------------------------------
+    ap.add_argument('--allow-reject-rules', action='store_true',
+                    help='Allow rules that hashcat would reject (reject-class opcodes)')
+    ap.add_argument('--debug',        action='store_true',
+                    help='Enable verbose/debug output')
+
+    args = ap.parse_args()
+
+    # ---- Apply globals -------------------------------------------
     ALLOW_REJECT_RULES = args.allow_reject_rules
-    VERBOSE = args.debug          # verbose mode enabled by --debug
+    VERBOSE            = args.debug
+
+    # ---- Banner --------------------------------------------------
+    print_banner()
 
     if args.list_devices:
-        list_devices()
-        sys.exit(0)
+        list_devices(); sys.exit(0)
 
-    if args.base_wordlist is None or args.target_wordlist is None:
-        parser.print_help()
-        print(f"\n{red('[ERROR]')} Both base_wordlist and target_wordlist are required.")
+    if not args.base_wordlist or not args.target_wordlist:
+        ap.print_help(); print()
+        log_error("Both BASE and TARGET wordlists are required.")
         sys.exit(1)
 
-    if args.max_depth < 1:
-        print(f"{red('[ERROR]')} max-depth must be at least 1.")
-        sys.exit(1)
-    if args.max_depth > 12:
-        print(f"{yellow('[WARN]')} Very high depth may exhaust memory/time. Proceed with caution.")
+    # Cap depth to hashcat limit
+    if args.max_depth > MAX_HASHCAT_CHAIN:
+        log_warn(f"Depth {args.max_depth} exceeds hashcat's maximum chain length "
+                 f"({MAX_HASHCAT_CHAIN}). Limiting to {MAX_HASHCAT_CHAIN}.")
+        args.max_depth = MAX_HASHCAT_CHAIN
+    elif args.max_depth < 1:
+        log_error("--max-depth must be >= 1"); sys.exit(1)
 
-    if VERBOSE:
-        print(f"\n{bold(green('=' * 80))}")
-        print(f"{bold('GPU-COMPATIBLE HASHCAT RULES ENGINE WITH HIT COUNTING & SEEDING')}")
-        print(f"{bold(green('=' * 80))}{Colors.END}\n")
+    # ---- Summary line --------------------------------------------
+    log_info(f"  base      : {bold(args.base_wordlist)}")
+    log_info(f"  target    : {bold(args.target_wordlist)}")
+    log_info(f"  depth     : {bold(str(args.max_depth))}  |  "
+             f"hours: {bold(str(args.target_hours))}  |  "
+             f"bloom: {bold(str(args.bloom_mb or BLOOM_FILTER_MAX_MB))}MB  |  "
+             f"sig_words: {bold(str(args.sig_words))}  "
+             f"min_len: {bold(str(args.min_word_len))}")
+    log_debug(f"Full args: {vars(args)}")
+    print()
 
-    if VERBOSE:
-        print(f"{blue('[INIT]')} {bold('Loading data...')}")
-    base_words = load_wordlist_fast(args.base_wordlist)
-    target_words = load_wordlist_fast(args.target_wordlist)
+    # ---- Load ----------------------------------------------------
+    base_words   = load_wordlist(args.base_wordlist)
+    target_words = load_wordlist(args.target_wordlist)
+    print()
 
-    if VERBOSE:
-        print(f"\n{blue('[ANALYSIS]')} {bold('Dataset Analysis:')}")
-        print(f"  {cyan('[*]')} Base words: {len(base_words):,}")
-        print(f"  {cyan('[*]')} Target words: {len(target_words):,}")
-        print(f"  {cyan('[*]')} Processing ALL words")
-        print(f"  {cyan('[*]')} Target completion: {args.target_hours} hours")
-
-    start_time = time.time()
+    # ---- GPU extraction ------------------------------------------
+    t_start   = time.time()
     extractor = GPUExtractor(
-        len(base_words), len(target_words),
-        args.max_depth, args.device,
-        args.target_hours, args.max_chains,
-        args.seed_rules, args.bloom_size_mb
+        len(base_words), len(target_words), args.max_depth,
+        args.device, args.target_hours, args.max_chains,
+        args.seed_rules, args.bloom_mb)
+
+    depth_overrides = {f'depth{i}_override': getattr(args, f'depth{i}_chains')
+                       for i in range(2, 11)}
+
+    raw_counts = extractor.extract_rules(base_words, target_words, **depth_overrides)
+    log_info(f"\n[GPU]  Raw bloom-filter candidates: {bold(cyan(str(len(raw_counts))))}")
+    log_debug(f"Raw counts: {len(raw_counts)} rules total")
+    print()
+
+    # ---- Signature-based functional minimization -----------------
+    final_counts = minimize_by_signature(
+        raw_counts,
+        base_words,
+        sig_words    = args.sig_words,
+        min_word_len = args.min_word_len,
     )
 
-    if VERBOSE:
-        if args.max_chains:
-            print(f"{blue('[OVERRIDE]')} {bold('Max chains set to:')} {cyan(args.max_chains)}")
-        else:
-            print(f"{blue('[OVERRIDE]')} {bold('Max chains:')} {cyan('unlimited')}")
+    # Always include the identity rule
+    if ':' not in final_counts:
+        final_counts[':'] = 0
 
-        print(f"\n{blue('=' * 60)}")
-        print(f"{bold('STARTING GPU-COMPATIBLE RULE EXTRACTION')}")
-        print(f"{blue('=' * 60)}")
+    # ---- Depth distribution for header ---------------------------
+    depth_dist: Dict[int, int] = defaultdict(int)
+    for rule in final_counts:
+        if rule != ':':
+            depth_dist[len(rule.split())] += 1
+    depth_summary = '  '.join(f"d{d}:{depth_dist[d]:,}" for d in sorted(depth_dist))
 
-    depth_overrides = {}
-    for i in range(2, 11):
-        val = getattr(args, f'depth{i}_chains')
-        if val is not None:
-            depth_overrides[f'depth{i}_override'] = val
+    final_rules = len(final_counts) - (1 if ':' in final_counts else 0)
+    removed     = len(raw_counts)   - len(final_counts)
 
-    rule_counts = extractor.extract_rules(base_words, target_words, **depth_overrides)
+    # ---- Write single output file — sorted by frequency (GPU hits desc) --
+    sorted_items = sorted(
+        final_counts.items(),
+        key=lambda kv: (-kv[1], len(kv[0].split()), kv[0])
+    )
 
-    end_time = time.time()
-    elapsed_hours = (end_time - start_time) / 3600
-
-    if VERBOSE:
-        print(f"\n{blue('[SAVE]')} {bold('Saving results...')}")
-    if ":" not in rule_counts:
-        rule_counts[":"] = 0
-    sorted_items = sorted(rule_counts.items(), key=lambda x: (-x[1], x[0]))
-
-    with open(args.output, 'w', encoding='latin-1') as f:
-        f.write(f"# Generated by GPU rules engine (full kernel)\n")
-        f.write(f"# Total unique rules: {len(rule_counts)}\n")
-        f.write(f"# Total hits: {sum(rule_counts.values())}\n")
+    with open(args.output, 'w', encoding='utf-8') as f:
+        f.write("# rulest — GPU-Compatible Hashcat Rules Engine\n")
+        f.write(f"# Generated      : {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"# Base           : {os.path.basename(args.base_wordlist)}\n")
+        f.write(f"# Target         : {os.path.basename(args.target_wordlist)}\n")
+        f.write(f"# Depth          : 1–{args.max_depth}\n")
+        f.write(f"# Bloom          : {args.bloom_mb or BLOOM_FILTER_MAX_MB} MB\n")
+        f.write("#\n")
+        f.write(f"# GPU raw candidates      : {len(raw_counts):,}  "
+                f"(bloom hits, includes false positives)\n")
+        f.write(f"# Post-processing         : signature-based minimization\n")
+        f.write(f"#   Probe words           : {args.sig_words}  "
+                f"(min length {args.min_word_len})\n")
+        f.write(f"#   Equiv. rules removed  : {removed:,}\n")
+        f.write("#\n")
+        f.write(f"# Rules kept     : {final_rules:,}  ({depth_summary})\n")
+        f.write(f"# Sorted by      : GPU frequency (descending, UTF-8)\n")
         f.write(":\n")
-        for rule, count in sorted_items:
-            if rule != ":":
+        for rule, _ in sorted_items:
+            if rule != ':':
                 f.write(f"{rule}\n")
 
-    if VERBOSE:
-        print(f"\n{bold(green('=' * 80))}")
-        print(f"{bold('FINAL RESULTS')}")
-        print(f"{bold(green('=' * 80))}")
-        print(f"{blue('[INFO]')} {bold('Base words:')} {cyan(f'{len(base_words):,}')}")
-        print(f"{blue('[INFO]')} {bold('Target words:')} {cyan(f'{len(target_words):,}')}")
-        print(f"{blue('[INFO]')} {bold('Max depth:')} {cyan(f'{args.max_depth}')}")
-        print(f"{blue('[INFO]')} {bold('Total time:')} {cyan(f'{elapsed_hours:.2f} hours ({end_time - start_time:.2f}s)')}")
-        print(f"{blue('[INFO]')} {bold('Target time:')} {cyan(f'{args.target_hours} hours')}")
-        print(f"{green('[RESULT]')} {bold('GPU-compatible rules found:')} {cyan(f'{len(rule_counts)}')}")
-        print(f"{green('[RESULT]')} {bold('Total hits:')} {cyan(f'{sum(rule_counts.values()):,}')}")
+    log_info(f"[OUT]  Minimized rules written to: {bold(args.output)}")
 
-        if sorted_items:
-            print(f"{blue('[SAMPLE]')} {bold('Top 20 most frequent rules:')}")
-            for i, (rule, count) in enumerate(sorted_items[:20]):
-                depth = len(rule.split())
-                print(f"  {cyan(f'{i+1:2d}.')} [{depth}] {rule} (hits: {count})")
+    # ---- Final report --------------------------------------------
+    elapsed = time.time() - t_start
+    sep     = '─' * 56
 
-        print(f"{blue('[OUTPUT]')} {bold('Output saved to:')} {bold(args.output)}")
-        print(f"{blue('[NOTE]')} {bold('All rules are GPU-compatible and syntactically valid for Hashcat')}")
-        print(f"{bold(green('=' * 80))}{Colors.END}")
+    print()
+    log_info(cyan(sep))
+    log_info(f"  {bold('DONE')}  rulest finished in {bold(f'{elapsed:.1f}s')} "
+             f"({elapsed/3600:.3f}h)")
+    log_info(cyan(sep))
+    log_info(f"  GPU raw candidates : {bold(str(len(raw_counts)))}")
+    log_info(f"  Rules kept         : {bold(green(str(final_rules)))}  "
+             f"{dim('('+depth_summary+')')}")
+    log_info(f"  Rules removed      : {bold(red(str(removed)))}")
+    log_info(f"  Output file        : {bold(args.output)}")
+    log_info(cyan(sep))
+
+    # Top-20 by GPU frequency
+    top_sorted = sorted(
+        [(r, s) for r, s in final_counts.items() if r != ':'],
+        key=lambda kv: (-kv[1], len(kv[0].split()), kv[0])
+    )[:20]
+    if top_sorted:
+        print()
+        log_info(f"  Top {len(top_sorted)} rules by GPU frequency:")
+        for i, (rule, score) in enumerate(top_sorted, 1):
+            depth = len(rule.split())
+            log_info(f"  {dim(str(i).rjust(3)+'.')} "
+                     f"{dim(f'd={depth}')}  "
+                     f"{rule:<42s}  "
+                     f"{cyan(str(score))}")
+    print()
+
+
+if __name__ == '__main__':
+    main()
+
