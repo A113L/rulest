@@ -16,6 +16,9 @@
 - [Usage](#-usage)
   - [rulest\_v2.py — Full Reference](#rulest_v2py--full-reference)
 - [Architecture (v2)](#-architecture-v2)
+- [Rule Categories](#-rule-categories)
+- [GPU Command Support](#-gpu-command-support)
+- [Configuration Constants](#-configuration-constants)
 - [Output Format](#-output-format)
 - [Performance Tuning](#-performance-tuning)
 - [Examples](#-examples)
@@ -57,14 +60,15 @@ A complete redesign built around GPU efficiency, Hashcat compatibility, and inte
 - ✅ Full **Hashcat GPU rule validation** (max 255 ops, correct argument types)
 - ✅ **Bloom filter** on-GPU for fast membership testing with configurable false-positive rate
 - ✅ **Two-phase extraction**: single-rule sweep → informed chain generation
-- ✅ **Dynamic VRAM-aware** batch and budget sizing
-- ✅ **Hot-rule biased** chain generation using Phase 1 results
-- ✅ **Seed rules** support to guide chain exploration
+- ✅ **Dynamic VRAM-aware** batch and budget sizing (scales with available VRAM; baseline 8 GB)
+- ✅ **Hot-rule biased** chain generation using Phase 1 results (60% hot-rule bias, configurable via `HOT_RULE_RATIO`)
+- ✅ **Seed rules** support to guide chain exploration (30% budget allocated to extending seeds)
 - ✅ Per-depth chain budget overrides (depths 2–10)
 - ✅ Unlimited result cap (no global ceiling)
 - ✅ Full **hit counting** and frequency-ranked output
-- ✅ Multi-device listing and explicit device selection
+- ✅ Multi-device listing and explicit device selection by index or name substring
 - ✅ Color-coded terminal output with live progress bars
+- ✅ Configurable verbosity via `VERBOSE` flag
 
 ---
 
@@ -73,11 +77,11 @@ A complete redesign built around GPU efficiency, Hashcat compatibility, and inte
 | Aspect | v1 (`rulest.py`) | v2 (`rulest_v2.py`) |
 |---|---|---|
 | **Rule validation** | None — invalid rules passed to Hashcat | Full `HashcatRuleValidator` against GPU spec (max 255 ops) |
-| **Rule set size** | ~2,700 static rules | 5,645 GPU-validated Hashcat single rules across 9 categories |
+| **Rule set size** | ~2,700 static rules | 5000+ GPU-validated Hashcat single rules across 9 categories |
 | **Search strategy** | Naive BFS — every rule applied blindly | Phase 1 single-rule sweep → Phase 2 hot-biased chain generation |
-| **Target lookup** | Python `set` (host RAM, per-result) | 64 MB Bloom filter uploaded once to GPU VRAM (FNV-1a, 4 hash functions) |
+| **Target lookup** | Python `set` (host RAM, per-result) | 16–64 MB Bloom filter uploaded once to GPU VRAM (FNV-1a, 4 hash functions) |
 | **Chain state** | Temp `.tmp` files on disk per depth | In-memory, GPU buffer-based with proper release and `gc.collect()` |
-| **Memory management** | Halve batch on OOM, no VRAM awareness | Dynamic sizing based on actual free VRAM estimate + safety factor |
+| **Memory management** | Halve batch on OOM, no VRAM awareness | Dynamic sizing based on actual free VRAM estimate + 55% usage safety factor |
 | **Hit counting** | ❌ Not implemented | ✅ Full `Counter`-based frequency tracking, sorted output |
 | **Device selection** | First platform, first device | `--list-devices`, `--device` by index or name substring |
 | **Seed rules** | ❌ Not supported | ✅ `--seed-rules` file; seeds used to extend chains to deeper depths |
@@ -145,19 +149,21 @@ usage: rulest_v2.py [options] base_wordlist target_wordlist
 
 | Flag | Default | Description |
 |---|---|---|
-| `-d`, `--max-depth` | `3` | Maximum rule chain depth (1–12; depths >12 warned) |
-| `-o`, `--output` | `found_chains.txt` | Output file path |
+| `-d`, `--max-depth` | `2` | Maximum rule chain depth (1–12; depths >12 warned) |
+| `-o`, `--output` | `rulest_output.txt` | Output file path |
 | `--max-chains` | unlimited | Hard cap on total chains generated |
 | `--target-hours` | `0.5` | Time budget in hours; controls chain generation budget |
-| `--seed-rules` | None | File with known-good rules/chains to use as generation seeds
-| `--allow-reject-rules` | False |  Include reject rules (e.g. !X, ?NX) in generation (GPU will ignore them, provide in `--seed-rules` if desired in output) |
-| `--bloom-size-mb` |  256 | Set mannually size of Bloom filter |
-| `--debug` | False | Enable verbose output (detailed generation info, validation messages) |
+| `--seed-rules` | None | File with known-good rules/chains to use as generation seeds |
 | `--list-devices` | — | Print all available OpenCL devices and exit |
 | `--device` | best GPU | Device index (e.g. `0`) or name substring (e.g. `NVIDIA`) |
 | `--depth2-chains` | dynamic | Override chain generation limit for depth 2 |
 | `--depth3-chains` | dynamic | Override chain generation limit for depth 3 |
 | `--depth4-chains` through `--depth10-chains` | dynamic | Per-depth overrides up to depth 10 |
+| `--bloom-mb` | dynamic | Override Bloom filter size (MB); 0 = auto-scale |
+| `--sig-words` | `21` | Number of probe words used for rule deduplication via signature |
+| `--min-word-len` | `10` | Minimum word length for probe words used in signature computation |
+| `--allow-reject-rules` | off | Include rejection rules (normally excluded as GPU-incompatible) |
+| `--debug` | off | Enable verbose output (sets `VERBOSE = True` at runtime) |
 
 #### Legacy v1 Reference
 
@@ -183,12 +189,13 @@ usage: rulest.py -w WORDLIST [-b BASE_WORDLIST] [-d CHAIN_DEPTH]
 │  │                                               │  │
 │  │  ┌─────────────┐    ┌───────────────────────┐ │  │
 │  │  │ Bloom Filter│    │  OpenCL Kernel        │ │  │
-│  │  │ (64MB VRAM) │    │  ┌─────────────────┐  │ │  │
-│  │  └─────────────┘    │  │find_single_rules│  │ │  │
-│  │                     │  ├─────────────────┤  │ │  │
-│  │  Phase 1 ────────▶  │  │find_rule_chains │  │ │  │
-│  │  (all words ×       │  └─────────────────┘  │ │  │
-│  │   single rules)     └───────────────────────┘ │  │
+│  │  │ (16–64 MB   │    │  ┌─────────────────┐  │ │  │
+│  │  │  VRAM)      │    │  │find_single_rules│  │ │  │
+│  │  └─────────────┘    │  ├─────────────────┤  │ │  │
+│  │                     │  │find_rule_chains │  │ │  │
+│  │  Phase 1 ────────▶  │  └─────────────────┘  │ │  │
+│  │  (all words ×       └───────────────────────┘ │  │
+│  │   single rules)                               │  │
 │  │                                               │  │
 │  │  Phase 2 ────────▶  Informed chain generation │  │
 │  │  (hot-biased,        + seed extension         │  │
@@ -203,21 +210,94 @@ usage: rulest.py -w WORDLIST [-b BASE_WORDLIST] [-d CHAIN_DEPTH]
 ### Two-Phase Processing
 
 **Phase 1 — Single Rule Sweep**
-All base words are processed against every GPU-compatible single rule in parallel. The Bloom filter (built from the entire target wordlist and uploaded once) allows near-zero-cost hit detection on-device. Results feed a `Counter` of rule → hit frequency.
+All base words are processed against every GPU-compatible single rule in parallel. The Bloom filter (built from the entire target wordlist and uploaded once) allows near-zero-cost hit detection on-device using FNV-1a hashing with 4 independent hash functions. Results feed a `Counter` of rule → hit frequency.
 
 **Phase 2 — Informed Chain Generation**
-Using Phase 1 hit data, chains are generated with a bias toward rules that already demonstrated effectiveness. The remaining time budget (total `--target-hours` minus Phase 1 duration) is split evenly across requested depths, with each depth's per-chain work scaled by word count and depth length. Seed rules from `--seed-rules` are extended to deeper depths automatically.
+Using Phase 1 hit data, chains are generated with a bias toward rules that already demonstrated effectiveness:
+- **60%** of generated chains use hot rules from Phase 1 (`HOT_RULE_RATIO = 0.6`)
+- **30%** of the budget extends known-good seed chains (`EXTENSION_RATIO = 0.3`)
+- **10%** is allocated to random exploration
+
+The remaining time budget (total `--target-hours` minus Phase 1 duration) is split evenly across requested depths. Seed rules from `--seed-rules` are extended to deeper depths automatically.
+
+### Bloom Filter
+
+The on-GPU Bloom filter uses FNV-1a hashing with two seeds (`0xDEADBEEF` and `0xCAFEBABE`) and 4 hash functions, sized between **16 MB** (low-VRAM devices < 4 GB) and **64 MB** (default max). Size scales logarithmically with combined wordlist size.
+
+### VRAM Management
+
+Free VRAM is estimated as **55%** of total global memory (`VRAM_USAGE_FACTOR = 0.55`). All batch sizes, Bloom filter allocation, and chain budgets scale proportionally based on this estimate relative to an 8 GB baseline. Devices with fewer than 4 GB cap the Bloom filter at 32 MB; the batch floor prevents starvation on very constrained hardware.
+
+---
+
+## 📚 Rule Categories
+
+`GPUCompatibleRulesGenerator` generates rules across 9 categories, all pre-validated by `HashcatRuleValidator`:
+
+| # | Category | Commands | Notes |
+|---|---|---|---|
+| 1 | **Simple rules** | `l u c C t r d f p z Z q E { } [ ] k K :` | No arguments |
+| 2 | **Position-based (single digit)** | `T D L R + - . , ' z Z y Y` | Digit 0–9 |
+| 3 | **Position-based (two digits)** | `x * O` | Two digits 0–9 each |
+| 4 | **Prefix / Suffix / Delete-char** | `^ $ @` | Full printable ASCII (chars 32–126) |
+| 5 | **Substitutions** | `s` | Leet-speak + alpha→digit/punctuation cross-product |
+| 6 | **Insertion / Overwrite** | `i o` | Positions 0–9 × printable character set |
+| 7 | **Extraction / Swap** | `x *` (non-equal positions) + `O` | Two-digit combos |
+| 8 | **Duplication** | `p y Y z Z` + digit 1–9 | Word/char repetition variants |
+| 9 | **Title case with separator** | `e` | Separator-triggered title casing |
+
+> The identity rule (`:`) is always included and written first in the output for Hashcat compatibility.
+
+---
+
+## 🚫 GPU Command Support
+
+The following commands are **not supported** on Hashcat's GPU engine and are automatically excluded during validation:
+
+| Command(s) | Reason |
+|---|---|
+| `X` `4` `6` `M` | Memory operations — not available on GPU |
+| `v` (three-char) | Not supported on GPU |
+| `Q` | Quit rule — not GPU-compatible |
+| `< > ! / ( ) = % ?` | Rejection rules — not GPU-compatible |
+| `_` | Reject-if-length — not GPU-compatible |
+
+Any rule exceeding **255 operations** is also rejected regardless of individual command validity.
+
+---
+
+## ⚙️ Configuration Constants
+
+These constants are defined at the top of `rulest_v2.py` and can be tuned for advanced use:
+
+| Constant | Default | Description |
+|---|---|---|
+| `VERBOSE` | `False` | Print per-rule validation messages and category counts; set at runtime via `--debug` |
+| `VRAM_USAGE_FACTOR` | `0.55` | Fraction of device global memory to treat as free VRAM |
+| `BLOOM_HASH_FUNCTIONS` | `4` | Number of FNV-1a hash functions in Bloom filter |
+| `BLOOM_FILTER_MAX_MB` | `256` | Maximum Bloom filter allocation (MB); override at runtime with `--bloom-mb` |
+| `HOT_RULE_RATIO` | `0.6` | Fraction of Phase 2 chains biased toward hot rules |
+| `EXTENSION_RATIO` | `0.3` | Fraction of Phase 2 budget allocated to seed extension |
+| `TIME_SAFETY_FACTOR` | `0.9` | Multiplier applied to time-budget combo estimates |
+| `MAX_GPU_RULES` | `255` | Maximum operations allowed per rule chain |
+| `BASELINE_COMBOS_PER_SEC` | `120,000,000` | Estimated throughput on a capable GPU |
+| `LOW_END_COMBOS_PER_SEC` | `40,000,000` | Throughput fallback for devices with < 20 compute units |
+| `MAX_WORD_LEN` | `256` | Maximum word length accepted from wordlists |
+| `MAX_RULE_LEN` | `16` | Maximum single rule string length in GPU buffers |
+| `MAX_OUTPUT_LEN` | `512` | Maximum transformed word output length in GPU buffers |
+| `MAX_CHAIN_STRING_LEN` | `128` | Maximum chained rule string length in GPU buffers |
+| `MAX_HASHCAT_CHAIN` | `31` | Maximum number of rules in a single Hashcat chain |
 
 ---
 
 ## 📄 Output Format
 
-`found_chains.txt` (or your specified `-o` path):
+`rulest_output.txt` (or your specified `-o` path):
 
 ```
-# Generated by rulest_v2.0.py (seeded)
+# Generated by GPU rules engine (full kernel)
 # Total unique rules: 4821
-# Total hits (sum of frequencies): 2193047
+# Total hits: 2193047
 :
 c
 $1
@@ -231,6 +311,7 @@ sa@ $0
 - The identity rule (`:`) is always written first for Hashcat compatibility
 - Rules are sorted by hit frequency (descending), then alphabetically
 - All rules are guaranteed GPU-valid (max 255 ops, correct argument syntax)
+- Encoding is `latin-1` to preserve byte-level fidelity with Hashcat's expected input
 
 ---
 
@@ -244,10 +325,16 @@ sa@ $0
 | Use a specific GPU | `--device 1` or `--device "RTX 4090"` |
 | Bootstrap from prior results | Pass previous output to `--seed-rules` for iterative refinement |
 | Limit total combinations | `--max-chains 500000` to cap generation before scaling |
+| Reduce terminal noise | Set `VERBOSE = False` in the script header or omit `--debug` |
+| Increase hot-rule aggressiveness | Raise `HOT_RULE_RATIO` toward `1.0` (reduces random exploration) |
 
-### VRAM Scaling
+### VRAM Scaling Reference
 
-v2 automatically scales batch sizes, Bloom filter allocation, and chain budgets based on detected free VRAM. Baseline targets 8 GB; systems with less VRAM will receive proportionally smaller batches while maintaining correctness. The Bloom filter floor is 16 MB (32 MB on <4 GB VRAM), and the batch floor prevents starvation on very constrained devices.
+| Available VRAM | Scale Factor | Bloom Filter Cap |
+|---|---|---|
+| < 4 GB | 0.25–0.5× | 32 MB |
+| 4–8 GB | 0.5–1.0× | 64 MB |
+| 8 GB+ | 1.0× (full) | 64 MB |
 
 ---
 
@@ -285,6 +372,20 @@ python rulest_v2.py base.txt target.txt -d 5 \
   --depth4-chains 30000 \
   --depth5-chains 5000 \
   -o custom_budget.txt
+```
+
+**Iterative refinement workflow:**
+```bash
+# Pass 1 — fast sweep for single rules
+python rulest_v2.py rockyou.txt target.txt -d 1 --target-hours 0.25 -o pass1.txt
+
+# Pass 2 — chain from pass 1 results
+python rulest_v2.py rockyou.txt target.txt -d 3 --target-hours 1.0 \
+  --seed-rules pass1.txt -o pass2.txt
+
+# Pass 3 — deep dive seeded from pass 2
+python rulest_v2.py rockyou.txt target.txt -d 5 --target-hours 4.0 \
+  --seed-rules pass2.txt -o pass3_final.txt
 ```
 
 ---
