@@ -78,7 +78,7 @@ A complete redesign built around GPU efficiency, Hashcat compatibility, and inte
 
 | Aspect | v1 (`rulest.py`) | v2 (`rulest_v2.py`) |
 |---|---|---|
-| **Rule validation** | None — invalid rules passed to Hashcat | Full `HashcatRuleValidator` against GPU spec (max 255 ops) |
+| **Rule validation** | None — invalid rules passed to Hashcat | Full `HashcatRuleValidator` against GPU spec (max 31 ops) |
 | **Functional minimization** | ❌ Not implemented | ✅ Signature-based deduplication via `minimize_by_signature`; removes 20–60% of raw candidates |
 | **Rule set size** | ~2,700 static rules | 5,000+ GPU-validated Hashcat single rules across 9 categories |
 | **Search strategy** | Naive BFS — every rule applied blindly | Phase 1 single-rule sweep → Phase 2 hot-biased chain generation |
