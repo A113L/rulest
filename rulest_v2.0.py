@@ -1069,49 +1069,47 @@ class GPUEngine:
                     gen.add(k)
         return gen
 
-    def generate_informed_chains(self, rules, single_found, max_depth, seed_chains=None):
-        # Cap max_depth to hashcat limit
-        max_depth = min(max_depth, MAX_HASHCAT_CHAIN)
-        valid   = [r for r in rules if HashcatRuleValidator.validate_rule_for_gpu(r)]
-        if not valid: return []
-        found_s = set(single_found.keys()) if single_found else set()
-        hot     = [r for r in valid if r in found_s]
-        chains  = set(valid)
-        sbd     = defaultdict(set)
-        digits  = '0123456789'
+    def build_numeric_seed_families(self, max_depth: int = 4) -> dict:
+        """
+        Build the three built-in numeric seed families, independent of the
+        random chain generation pipeline.
 
-        # Numeric seed families up to depth 4 (but not exceeding max_depth)
+        Family A  pure-prepend  : ^9 ^8 ^7 …  (prepend multi-digit numbers)
+        Family B  pure-append   : $1 $2 $3 …  (append multi-digit numbers)
+        Family C  mixed         : all combinations of ^ and $ with digits
+
+        Seeds are generated for depths 1 .. min(max_depth, 4) so they can be
+        run as *direct extraction candidates* via the chain kernel — not only
+        as scaffolding for random chain generation.
+
+        Returns
+        -------
+        dict  depth -> set[str chain]
+        """
         max_seed_depth = min(max_depth, 4)
-
-        # Family A: pure prepend
+        digits = '0123456789'
+        sbd: Dict[int, set] = defaultdict(set)
         a_cnt: Dict[int, int] = defaultdict(int)
+        b_cnt: Dict[int, int] = defaultdict(int)
+
+        # Family A: pure prepend  (e.g. n=12  →  "^2 ^1"  →  prepend "12")
         for n in range(10 ** max_seed_depth):
-            s = str(n)
-            d = len(s)
+            s = str(n); d = len(s)
             sbd[d].add(' '.join(f'^{ch}' for ch in reversed(s)))
             a_cnt[d] += 1
 
-        # Family B: pure append
-        b_cnt: Dict[int, int] = defaultdict(int)
+        # Family B: pure append  (e.g. n=12  →  "$1 $2"  →  append "12")
         for n in range(10 ** max_seed_depth):
-            s = str(n)
-            d = len(s)
+            s = str(n); d = len(s)
             sbd[d].add(' '.join(f'${ch}' for ch in s))
             b_cnt[d] += 1
 
-        # Family C: mixed
+        # Family C: mixed prepend/append combinations
         for depth in range(1, max_seed_depth + 1):
             for ops in itertools.product(['^', '$'], repeat=depth):
                 for digs in itertools.product(digits, repeat=depth):
                     sbd[depth].add(' '.join(f'{o}{d}' for o, d in zip(ops, digs)))
 
-        # User-supplied seed chains
-        if seed_chains:
-            for sc in seed_chains:
-                sbd[sc.count(' ') + 1].add(sc)
-            log_debug(f"Loaded {len(seed_chains):,} user seed chains")
-
-        # Debug report
         c_total = sum(2**d * 10**d for d in range(1, max_seed_depth + 1))
         log_debug(f"Numeric seeds  max_seed_depth={max_seed_depth}")
         log_debug("  A (pure ^): " +
@@ -1124,6 +1122,146 @@ class GPUEngine:
         log_debug("  A∪B∪C     : " +
                   ", ".join(f"d{d}={len(sbd[d]):,}" for d in sorted(sbd)) +
                   f"  [{sum(len(v) for v in sbd.values()):,} total]")
+        return dict(sbd)
+
+    def run_seed_extraction_pass(self, base_words: list, sbd: dict,
+                                  bloom_filter, phase1_rules: list) -> Counter:
+        """
+        Run the numeric seed families as a *dedicated direct extraction pass*.
+
+        Every seed chain is tested against the bloom filter individually via
+        the GPU chain kernel — they are extraction candidates first, not only
+        chain-building atoms.
+
+        Depth-1 seeds are single rules (e.g. "^5") that are already covered
+        by Phase 1; they are skipped here to avoid double-counting.
+        Depth >= 2 seeds (e.g. "^1 ^2", "$3 $1 $4") are always run here,
+        independent of --max-depth and the random-chain time budget.
+
+        The method ensures self.rule_index is populated (reuses Phase 1's
+        index) and runs the chain kernel in the same batches used by Phase 2.
+        """
+        # Ensure kernel + bloom filter are ready (Phase 1 sets these up)
+        if self.bloom_buf is None:
+            self.upload_bloom_filter(bloom_filter)
+        if not self.program:
+            if not self.compile_kernel(): return Counter()
+        if not self.rule_index:
+            self.gpu_rules  = HashcatRuleValidator.validate_rules_for_gpu(phase1_rules)
+            self.rule_index = {r: i for i, r in enumerate(self.gpu_rules)}
+
+        # Collect only depth >= 2 seeds (depth-1 already done in Phase 1)
+        multi_seeds: List[str] = []
+        for depth, chains in sorted(sbd.items()):
+            if depth >= 2:
+                multi_seeds.extend(chains)
+
+        if not multi_seeds:
+            log_info("[PS]   No multi-depth seeds to test (max_seed_depth=1 or none generated)")
+            return Counter()
+
+        total = sum(len(v) for d, v in sbd.items() if d >= 2)
+        log_info(f"[PS]   Numeric seed pass: {total:,} chains across "
+                 f"{sum(1 for d in sbd if d >= 2)} depth(s)")
+
+        counter = Counter()
+        cbs = self.params['CHAINS_PER_BATCH']
+        wsb = self.params['WORD_SUB_BATCH']
+        n_batches = (len(multi_seeds) + cbs - 1) // cbs
+
+        with tqdm(total=n_batches,
+                  desc=green("  SeedPass"),
+                  unit="batch",
+                  ncols=88,
+                  bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}",
+                  ) as pbar:
+            for ci in range(0, len(multi_seeds), cbs):
+                cb = multi_seeds[ci:ci + cbs]
+                for wi in range(0, len(base_words), wsb):
+                    wb = base_words[wi:wi + wsb]
+                    if wb:
+                        found = self._run_chain_kernel(wb, cb)
+                        if found:
+                            counter.update(found)
+                    self.queue.finish()
+                pbar.update(1)
+                pbar.set_postfix({"hits": cyan(str(len(counter)))}, refresh=False)
+
+        log_info(f"[PS]   {bold(green(str(len(counter))))} unique seed chains passed bloom filter")
+        log_debug(f"Seed extraction pass complete: {len(counter)} hits")
+        return counter
+
+    def generate_informed_chains(self, rules, single_found, max_depth,
+                                   seed_chains=None, prebuilt_sbd=None):
+        """
+        Generate random chain candidates for Phase 2.
+
+        When *prebuilt_sbd* is supplied (produced by build_numeric_seed_families
+        and already tested in the dedicated seed extraction pass), the numeric
+        seed families are NOT regenerated here — they are used only as the
+        basis for random chain extensions, avoiding redundant GPU work.
+
+        If *prebuilt_sbd* is None (e.g. direct callers that do not run the
+        seed pass), the families are built in-place as before.
+        """
+        # Cap max_depth to hashcat limit
+        max_depth = min(max_depth, MAX_HASHCAT_CHAIN)
+        valid   = [r for r in rules if HashcatRuleValidator.validate_rule_for_gpu(r)]
+        if not valid: return []
+        found_s = set(single_found.keys()) if single_found else set()
+        hot     = [r for r in valid if r in found_s]
+        chains  = set(valid)
+
+        if prebuilt_sbd is not None:
+            # Reuse already-tested seed families — no need to rebuild or retest.
+            sbd = defaultdict(set, {d: set(v) for d, v in prebuilt_sbd.items()})
+            log_debug(f"generate_informed_chains: using prebuilt sbd "
+                      f"({sum(len(v) for v in sbd.values()):,} seeds, "
+                      f"skipping direct re-test)")
+        else:
+            # Legacy path: build seed families in-place (no prior seed pass).
+            sbd     = defaultdict(set)
+            digits  = '0123456789'
+            max_seed_depth = min(max_depth, 4)
+
+            a_cnt: Dict[int, int] = defaultdict(int)
+            for n in range(10 ** max_seed_depth):
+                s = str(n); d = len(s)
+                sbd[d].add(' '.join(f'^{ch}' for ch in reversed(s)))
+                a_cnt[d] += 1
+
+            b_cnt: Dict[int, int] = defaultdict(int)
+            for n in range(10 ** max_seed_depth):
+                s = str(n); d = len(s)
+                sbd[d].add(' '.join(f'${ch}' for ch in s))
+                b_cnt[d] += 1
+
+            for depth in range(1, max_seed_depth + 1):
+                for ops in itertools.product(['^', '$'], repeat=depth):
+                    for digs in itertools.product(digits, repeat=depth):
+                        sbd[depth].add(' '.join(f'{o}{d}' for o, d in zip(ops, digs)))
+
+            c_total = sum(2**d * 10**d for d in range(1, max_seed_depth + 1))
+            log_debug(f"Numeric seeds  max_seed_depth={max_seed_depth}")
+            log_debug("  A (pure ^): " +
+                      ", ".join(f"d{d}={a_cnt[d]:,}" for d in sorted(a_cnt)) +
+                      f"  [{sum(a_cnt.values()):,} total]")
+            log_debug("  B (pure $): " +
+                      ", ".join(f"d{d}={b_cnt[d]:,}" for d in sorted(b_cnt)) +
+                      f"  [{sum(b_cnt.values()):,} total]")
+            log_debug(f"  C (mixed) : [{c_total:,} total]")
+            log_debug("  A∪B∪C     : " +
+                      ", ".join(f"d{d}={len(sbd[d]):,}" for d in sorted(sbd)) +
+                      f"  [{sum(len(v) for v in sbd.values()):,} total]")
+
+        # User-supplied seeds are added as direct candidates and chain atoms.
+        if seed_chains:
+            for sc in seed_chains:
+                sbd[sc.count(' ') + 1].add(sc)
+            n_singles_as_atoms = sum(1 for sc in seed_chains if ' ' not in sc.strip())
+            n_direct           = len(seed_chains) - n_singles_as_atoms
+            log_debug(f"User seeds in Phase 2: {n_singles_as_atoms} atoms "
+                      f"+ {n_direct} direct chain candidates")
 
         for ds in sbd.values(): chains.update(ds)
 
@@ -1150,14 +1288,16 @@ class GPUEngine:
         return list(chains)
 
     def process_all_words_chain_rules(self, base_words, rules, max_depth,
-                                      bloom_filter, single_counter, seed_chains=None):
+                                      bloom_filter, single_counter, seed_chains=None,
+                                      prebuilt_sbd=None):
         if self.bloom_buf is None: self.upload_bloom_filter(bloom_filter)
         if not self.program:
             if not self.compile_kernel(): return Counter()
         if not self.rule_index:
             self.rule_index = {r: i for i, r in enumerate(self.gpu_rules)}
 
-        chains = self.generate_informed_chains(rules, single_counter, max_depth, seed_chains)
+        chains = self.generate_informed_chains(rules, single_counter, max_depth, seed_chains,
+                                                    prebuilt_sbd=prebuilt_sbd)
         if not chains: return Counter()
 
         log_debug(f"Phase 2: {len(chains):,} chains × {len(base_words):,} words")
@@ -1294,22 +1434,65 @@ class GPUExtractor:
         self.params['MAX_CHAIN_DEPTH'] = self.max_depth
         self.gpu_engine.params = self.params
 
-        seed_chains  = self.load_seed_rules()
+        # ── Seed rules: split by depth ──────────────────────────────────────
+        # Single-rule seeds (no spaces) are injected into Phase 1 so they are
+        # tested as standalone extraction candidates — not only as chain
+        # building blocks.  Multi-rule chain seeds are forwarded to Phase 2
+        # unchanged (they are already run directly there via generate_informed_chains).
+        all_seeds    = self.load_seed_rules()
+        seed_singles = [s for s in all_seeds if ' ' not in s.strip()]
+        seed_chains  = [s for s in all_seeds if ' ' in  s.strip()]
+
+        # Merge seed singles into Phase 1 rule set (dedup while preserving order)
+        builtin_set  = set(rules)
+        extra_seeds  = [s for s in seed_singles if s not in builtin_set]
+        rules_phase1 = rules + extra_seeds          # Phase 1 rule list
+        if extra_seeds:
+            log_info(f"[SEED] {len(extra_seeds)} seed single-rule(s) added to Phase 1 "
+                     f"({len(seed_singles) - len(extra_seeds)} already in built-in set)")
+        if seed_chains and self.max_depth < 2:
+            log_warn(f"[SEED] {len(seed_chains)} chain seed(s) ignored — "
+                     f"requires --max-depth >= 2 to run Phase 2")
+        log_debug(f"Seed split: {len(seed_singles)} singles → Phase 1, "
+                  f"{len(seed_chains)} chains → Phase 2")
+        # ────────────────────────────────────────────────────────────────────
+
         bloom_filter = self.gpu_engine.generate_bloom_filter(target_words)
 
-        # --- Phase 1: single rules ---
+        # --- Phase 1: single rules + seed singles ---
         log_section("PHASE 1 — Single Rule Search")
-        log_info(f"[P1]   {len(base_words):,} base words × {len(rules):,} atomic rules")
+        seed_note = f"  ({len(extra_seeds)} from seeds)" if extra_seeds else ""
+        log_info(f"[P1]   {len(base_words):,} base words × "
+                 f"{len(rules_phase1):,} atomic rules{seed_note}")
         t0     = time.time()
-        single = self.gpu_engine.process_all_words_single_rule(base_words, rules, bloom_filter)
+        single = self.gpu_engine.process_all_words_single_rule(
+            base_words, rules_phase1, bloom_filter)
         t1     = time.time()
         all_counts.update(single)
         log_debug(f"Phase 1 elapsed: {t1-t0:.1f}s")
 
-        # --- Phase 2: rule chains ---
+        # --- Phase S: Numeric Seed Extraction (always runs) ---
+        # Build the numeric seed families and run them as a *dedicated direct
+        # extraction pass* — independent of --max-depth and the random-chain
+        # time budget.  Seeds up to depth 4 are always tested (depth-1 seeds
+        # are skipped here since Phase 1 already covered them).
+        # The prebuilt sbd is forwarded to Phase 2 to avoid regenerating the
+        # families and re-running them through the chain kernel.
+        log_section("PHASE S — Numeric Seed Extraction")
+        sbd = self.gpu_engine.build_numeric_seed_families(max_depth=4)
+        seed_hits = self.gpu_engine.run_seed_extraction_pass(
+            base_words, sbd, bloom_filter, rules_phase1)
+        all_counts.update(seed_hits)
+        ts     = time.time()
+        log_debug(f"Seed pass elapsed: {ts-t1:.1f}s")
+
+        # --- Phase 2: random rule chains ---
+        # all_seeds (user singles + chains) are forwarded so generate_informed_chains
+        # can use them as prioritised building blocks.  The numeric seed families
+        # (prebuilt_sbd) are passed so they are NOT regenerated or re-run.
         if self.max_depth > 1:
             log_section("PHASE 2 — Rule Chain Search")
-            remaining = max(0, self.params['TARGET_SECONDS'] - (t1-t0))
+            remaining = max(0, self.params['TARGET_SECONDS'] - (ts-t0))
             budget    = remaining * self.params['EST_COMBOS_PER_SEC'] * TIME_SAFETY_FACTOR
             depths    = list(range(2, self.max_depth+1))
             depth_budgets = ({d: int(budget/len(depths)/(len(base_words)*d)) for d in depths}
@@ -1338,9 +1521,10 @@ class GPUExtractor:
             log_debug(f"Remaining time budget: {remaining:.1f}s")
 
             chains = self.gpu_engine.process_all_words_chain_rules(
-                base_words, rules, self.max_depth, bloom_filter, single, seed_chains)
+                base_words, rules_phase1, self.max_depth, bloom_filter, single,
+                seed_chains=all_seeds, prebuilt_sbd=sbd)
             all_counts.update(chains)
-            log_debug(f"Phase 2 elapsed: {time.time()-t1:.1f}s")
+            log_debug(f"Phase 2 elapsed: {time.time()-ts:.1f}s")
 
         validated = Counter({r: c for r,c in all_counts.items()
                              if HashcatRuleValidator.validate_rule_for_gpu(r)})
@@ -1405,11 +1589,15 @@ def main() -> None:
     ap.add_argument('--bloom-mb',     type=int, default=0,
                     help=f'Bloom filter size in MB (default: {BLOOM_FILTER_MAX_MB})')
     ap.add_argument('--seed-rules',   default=None,
-                    help='Path to a file of seed rules to prioritise')
+                    help='Path to a file of seed rules. Single-rule seeds are '
+                         'injected into Phase 1 as standalone extraction candidates '
+                         'AND used as prioritised chain atoms in Phase 2. '
+                         'Multi-rule chain seeds are tested directly against the '
+                         'bloom filter in Phase 2 (not only as chain building blocks).')
 
     # ---- Depth overrides -----------------------------------------
     for i in range(2, 11):
-        ap.add_argument(f'--depth{i}-chains', type=int, default=None,   # ← changed from 0 to None
+        ap.add_argument(f'--depth{i}-chains', type=int, default=None,
                         dest=f'depth{i}_chains',
                         help=f'Override chain count for depth {i} (default: auto)')
 
@@ -1460,6 +1648,9 @@ def main() -> None:
              f"bloom: {bold(str(args.bloom_mb or BLOOM_FILTER_MAX_MB))}MB  |  "
              f"sig_words: {bold(str(args.sig_words))}  "
              f"min_len: {bold(str(args.min_word_len))}")
+    if args.seed_rules:
+        log_info(f"  seeds     : {bold(args.seed_rules)}  "
+                 f"{dim('(singles -> Phase 1 + Phase 2 atoms | chains -> Phase 2 direct)')}")
     log_debug(f"Full args: {vars(args)}")
     print()
 
@@ -1570,4 +1761,3 @@ def main() -> None:
 
 if __name__ == '__main__':
     main()
-
