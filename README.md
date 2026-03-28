@@ -362,7 +362,7 @@ sa@ $0
 - The identity rule (`:`) is always written first for Hashcat compatibility
 - Rules are sorted by hit frequency (descending), then by chain depth, then alphabetically
 - The header records both the raw Bloom candidate count and the post-minimization count, so you can see exactly how many equivalent rules were removed
-- All rules are guaranteed GPU-valid (max 255 ops, correct argument syntax)
+- All rules are guaranteed GPU-valid (max 31 ops, correct argument syntax)
 - Encoding is `utf-8`
 
 ---
