@@ -80,7 +80,7 @@ A complete redesign built around GPU efficiency, Hashcat compatibility, and inte
 |---|---|---|
 | **Rule validation** | None — invalid rules passed to Hashcat | Full `HashcatRuleValidator` against GPU spec (max 255 ops) |
 | **Functional minimization** | ❌ Not implemented | ✅ Signature-based deduplication via `minimize_by_signature`; removes 20–60% of raw candidates |
-| **Rule set size** | ~2,700 static rules | 13,000+ GPU-validated Hashcat single rules across 9 categories |
+| **Rule set size** | ~2,700 static rules | 5,000+ GPU-validated Hashcat single rules across 9 categories |
 | **Search strategy** | Naive BFS — every rule applied blindly | Phase 1 single-rule sweep → Phase 2 hot-biased chain generation |
 | **Target lookup** | Python `set` (host RAM, per-result) | 16–64 MB Bloom filter uploaded once to GPU VRAM (FNV-1a, 4 hash functions) |
 | **Chain state** | Temp `.tmp` files on disk per depth | In-memory, GPU buffer-based with proper release and `gc.collect()` |
