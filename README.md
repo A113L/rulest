@@ -300,7 +300,7 @@ The following commands are **not supported** on Hashcat's GPU engine and are aut
 | `< > ! / ( ) = % ?` | Rejection rules — not GPU-compatible |
 | `_` | Reject-if-length — not GPU-compatible |
 
-Any rule exceeding **255 operations** is also rejected regardless of individual command validity.
+Any rule exceeding **31 operations** is also rejected regardless of individual command validity.
 
 ---
 
