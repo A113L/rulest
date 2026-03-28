@@ -58,7 +58,7 @@ A first-generation implementation using a **Breadth-First Search (BFS)** chainin
 A complete redesign built around GPU efficiency, Hashcat compatibility, and intelligent search strategy.
 
 **Key capabilities:**
-- ✅ Full **Hashcat GPU rule validation** (max 255 ops, correct argument types)
+- ✅ Full **Hashcat GPU rule validation** (max 31 ops, correct argument types)
 - ✅ **Bloom filter** on-GPU for fast membership testing with configurable false-positive rate
 - ✅ **Two-phase extraction**: single-rule sweep → informed chain generation
 - ✅ **Signature-based functional minimization**: removes functionally equivalent rules post-GPU using a deterministic probe set, keeping only the highest-frequency representative per equivalence class
