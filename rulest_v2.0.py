@@ -1161,6 +1161,71 @@ class GPUEngine:
                                 sbd[4].add(seed)
                                 d_cnt[4] += 1
 
+        # Family E: date-pattern seeds
+        # Covers the most common numeric date formats found in real passwords.
+        # Generated independently of max_seed_depth — specific date patterns
+        # are always worthwhile direct-extraction candidates.
+        #
+        # Both append ($d …) and prepend (^d … reversed) orientations are built.
+        # Transform variants (transform_op at position 1) are added only for
+        # 4-digit dates to keep the depth-5 seed count manageable.
+        #
+        # Formats and chain depths:
+        #   depth 4:  DDMM, MMDD, YYYY                 → append/prepend
+        #   depth 5:  transform + 4-digit date          → transform variants
+        #   depth 6:  DDMMYY, MMDDYY                   → append/prepend
+        #   depth 8:  DDMMYYYY, MMDDYYYY               → append/prepend
+
+        _days   = [f"{d:02d}" for d in range(1, 32)]
+        _months = [f"{m:02d}" for m in range(1, 13)]
+        _years2 = ([f"{y:02d}" for y in range(60, 100)] +
+                   [f"{y:02d}" for y in range(0,  31)])
+        _years4 = [str(y) for y in range(1960, 2031)]
+
+        # Build date string sets per format length
+        _date4: set = set()
+        _date6: set = set()
+        _date8: set = set()
+
+        for _d in _days:
+            for _m in _months:
+                _date4.add(_d + _m)   # DDMM
+                _date4.add(_m + _d)   # MMDD
+        for _y in _years4:
+            _date4.add(_y)            # YYYY
+
+        for _d in _days:
+            for _m in _months:
+                for _y in _years2:
+                    _date6.add(_d + _m + _y)   # DDMMYY
+                    _date6.add(_m + _d + _y)   # MMDDYY
+
+        for _d in _days:
+            for _m in _months:
+                for _y in _years4:
+                    _date8.add(_d + _m + _y)   # DDMMYYYY
+                    _date8.add(_m + _d + _y)   # MMDDYYYY
+
+        e_cnt: Dict[int, int] = defaultdict(int)
+
+        for _ds_set, _depth in ((_date4, 4), (_date6, 6), (_date8, 8)):
+            for _ds in _ds_set:
+                # Append variant: "1990" → "$1 $9 $9 $0"
+                _app = ' '.join(f'${c}' for c in _ds)
+                sbd[_depth].add(_app); e_cnt[_depth] += 1
+                # Prepend variant (reversed for hashcat): "1990" → "^0 ^9 ^9 ^1"
+                _pre = ' '.join(f'^{c}' for c in reversed(_ds))
+                sbd[_depth].add(_pre); e_cnt[_depth] += 1
+                # Transform+date: only for 4-digit dates (depth 4 → depth 5)
+                if _depth == 4:
+                    for t_op in transform_ops:
+                        _ta = f"{t_op} {_app}"
+                        if HashcatRuleValidator.validate_rule_for_gpu(_ta):
+                            sbd[5].add(_ta); e_cnt[5] += 1
+                        _tp = f"{t_op} {_pre}"
+                        if HashcatRuleValidator.validate_rule_for_gpu(_tp):
+                            sbd[5].add(_tp); e_cnt[5] += 1
+
         c_total = sum(2**d * 10**d for d in range(1, max_seed_depth + 1))
         log_debug(f"Numeric seeds  max_seed_depth={max_seed_depth}")
         log_debug("  A (pure ^): " +
@@ -1173,7 +1238,10 @@ class GPUEngine:
         log_debug("  D (transform+digit 0-3): " +
                   ", ".join(f"d{d}={d_cnt[d]:,}" for d in sorted(d_cnt)) +
                   f"  [{sum(d_cnt.values()):,} total]")
-        log_debug("  A∪B∪C∪D   : " +
+        log_debug("  E (dates DDMM/MMDD/YYYY/…): " +
+                  ", ".join(f"d{d}={e_cnt[d]:,}" for d in sorted(e_cnt)) +
+                  f"  [{sum(e_cnt.values()):,} total]")
+        log_debug("  A∪…∪E     : " +
                   ", ".join(f"d{d}={len(sbd[d]):,}" for d in sorted(sbd)) +
                   f"  [{sum(len(v) for v in sbd.values()):,} total]")
         return dict(sbd)
@@ -1339,7 +1407,55 @@ class GPUEngine:
                       ", ".join(f"d{d}={len([s for s in sbd[d] if s.split()[0] in _transform_ops]):,}"
                                 for d in sorted(sbd) if d >= 2) +
                       f"  [{sum(len([s for s in sbd[d] if s.split()[0] in _transform_ops]) for d in sbd if d >= 2):,} total]")
-            log_debug("  A∪B∪C∪D   : " +
+
+            # Family E: date-pattern seeds (legacy path mirror)
+            _days_l   = [f"{d:02d}" for d in range(1, 32)]
+            _months_l = [f"{m:02d}" for m in range(1, 13)]
+            _years2_l = ([f"{y:02d}" for y in range(60, 100)] +
+                         [f"{y:02d}" for y in range(0,  31)])
+            _years4_l = [str(y) for y in range(1960, 2031)]
+
+            _date4_l: set = set()
+            _date6_l: set = set()
+            _date8_l: set = set()
+
+            for _d in _days_l:
+                for _m in _months_l:
+                    _date4_l.add(_d + _m)   # DDMM
+                    _date4_l.add(_m + _d)   # MMDD
+            for _y in _years4_l:
+                _date4_l.add(_y)            # YYYY
+            for _d in _days_l:
+                for _m in _months_l:
+                    for _y in _years2_l:
+                        _date6_l.add(_d + _m + _y)   # DDMMYY
+                        _date6_l.add(_m + _d + _y)   # MMDDYY
+            for _d in _days_l:
+                for _m in _months_l:
+                    for _y in _years4_l:
+                        _date8_l.add(_d + _m + _y)   # DDMMYYYY
+                        _date8_l.add(_m + _d + _y)   # MMDDYYYY
+
+            _e_cnt_l: Dict[int, int] = defaultdict(int)
+            for _ds_set_l, _depth_l in ((_date4_l, 4), (_date6_l, 6), (_date8_l, 8)):
+                for _ds_l in _ds_set_l:
+                    _app_l = ' '.join(f'${c}' for c in _ds_l)
+                    sbd[_depth_l].add(_app_l); _e_cnt_l[_depth_l] += 1
+                    _pre_l = ' '.join(f'^{c}' for c in reversed(_ds_l))
+                    sbd[_depth_l].add(_pre_l); _e_cnt_l[_depth_l] += 1
+                    if _depth_l == 4:
+                        for _t_op_l in _transform_ops:
+                            _ta_l = f"{_t_op_l} {_app_l}"
+                            if HashcatRuleValidator.validate_rule_for_gpu(_ta_l):
+                                sbd[5].add(_ta_l); _e_cnt_l[5] += 1
+                            _tp_l = f"{_t_op_l} {_pre_l}"
+                            if HashcatRuleValidator.validate_rule_for_gpu(_tp_l):
+                                sbd[5].add(_tp_l); _e_cnt_l[5] += 1
+
+            log_debug("  E (dates DDMM/MMDD/YYYY/…): " +
+                      ", ".join(f"d{d}={_e_cnt_l[d]:,}" for d in sorted(_e_cnt_l)) +
+                      f"  [{sum(_e_cnt_l.values()):,} total]")
+            log_debug("  A∪…∪E     : " +
                       ", ".join(f"d{d}={len(sbd[d]):,}" for d in sorted(sbd)) +
                       f"  [{sum(len(v) for v in sbd.values()):,} total]")
 
