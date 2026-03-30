@@ -1110,6 +1110,57 @@ class GPUEngine:
                 for digs in itertools.product(digits, repeat=depth):
                     sbd[depth].add(' '.join(f'{o}{d}' for o, d in zip(ops, digs)))
 
+        # Family D: single transformation operator at position 1, followed by
+        # digit operators (^d / $d) at positions 2+.
+        #
+        # Rules:
+        #   • transform_op is always first (no positional arguments required).
+        #   • Digit range is restricted to 0-3 to keep the seed count manageable
+        #     while covering the most common numeric patterns in real passwords.
+        #   • depth 2: transform + one digit-op
+        #       e.g.  u $1,  l ^2,  c $0,  C ^3
+        #   • depth 3: transform + two digit-ops — all four combos covered:
+        #       non-mixed ^^:  u ^1 ^2
+        #       non-mixed $$:  l $0 $3
+        #       mixed   ^$:    c ^2 $1
+        #       mixed   $^:    C $0 ^3
+        TRANSFORM_SEED_DIGITS = '0123'
+        transform_ops = [
+            'l', 'u', 'c', 'C', 't', 'r', 'd', 'f',
+            'E', 'k', 'K', '{', '}', '[', ']',
+        ]
+        t_digit_ops = [f'^{d}' for d in TRANSFORM_SEED_DIGITS] + \
+                      [f'${d}' for d in TRANSFORM_SEED_DIGITS]
+
+        d_cnt: Dict[int, int] = defaultdict(int)
+        # depth 2: transform + 1 digit-op  e.g.  u $1,  l ^2
+        if max_seed_depth >= 2:
+            for t_op in transform_ops:
+                for dop in t_digit_ops:
+                    seed = f"{t_op} {dop}"
+                    if HashcatRuleValidator.validate_rule_for_gpu(seed):
+                        sbd[2].add(seed)
+                        d_cnt[2] += 1
+        # depth 3: transform + 2 digit-ops  e.g.  u ^1 $2,  l $0 $3
+        if max_seed_depth >= 3:
+            for t_op in transform_ops:
+                for a in t_digit_ops:
+                    for b in t_digit_ops:
+                        seed = f"{t_op} {a} {b}"
+                        if HashcatRuleValidator.validate_rule_for_gpu(seed):
+                            sbd[3].add(seed)
+                            d_cnt[3] += 1
+        # depth 4: transform + 3 digit-ops  e.g.  u ^1 $2 ^3,  c $0 $1 $2
+        if max_seed_depth >= 4:
+            for t_op in transform_ops:
+                for a in t_digit_ops:
+                    for b in t_digit_ops:
+                        for c in t_digit_ops:
+                            seed = f"{t_op} {a} {b} {c}"
+                            if HashcatRuleValidator.validate_rule_for_gpu(seed):
+                                sbd[4].add(seed)
+                                d_cnt[4] += 1
+
         c_total = sum(2**d * 10**d for d in range(1, max_seed_depth + 1))
         log_debug(f"Numeric seeds  max_seed_depth={max_seed_depth}")
         log_debug("  A (pure ^): " +
@@ -1119,7 +1170,10 @@ class GPUEngine:
                   ", ".join(f"d{d}={b_cnt[d]:,}" for d in sorted(b_cnt)) +
                   f"  [{sum(b_cnt.values()):,} total]")
         log_debug(f"  C (mixed) : [{c_total:,} total]")
-        log_debug("  A∪B∪C     : " +
+        log_debug("  D (transform+digit 0-3): " +
+                  ", ".join(f"d{d}={d_cnt[d]:,}" for d in sorted(d_cnt)) +
+                  f"  [{sum(d_cnt.values()):,} total]")
+        log_debug("  A∪B∪C∪D   : " +
                   ", ".join(f"d{d}={len(sbd[d]):,}" for d in sorted(sbd)) +
                   f"  [{sum(len(v) for v in sbd.values()):,} total]")
         return dict(sbd)
@@ -1241,6 +1295,37 @@ class GPUEngine:
                     for digs in itertools.product(digits, repeat=depth):
                         sbd[depth].add(' '.join(f'{o}{d}' for o, d in zip(ops, digs)))
 
+            # Family D: single transformation operator at position 1,
+            # followed by digit operators (^d / $d), digits restricted to 0-3.
+            _TRANSFORM_SEED_DIGITS = '0123'
+            _transform_ops = [
+                'l', 'u', 'c', 'C', 't', 'r', 'd', 'f',
+                'E', 'k', 'K', '{', '}', '[', ']',
+            ]
+            _t_digit_ops = ([f'^{d}' for d in _TRANSFORM_SEED_DIGITS] +
+                            [f'${d}' for d in _TRANSFORM_SEED_DIGITS])
+            if max_seed_depth >= 2:
+                for t_op in _transform_ops:
+                    for dop in _t_digit_ops:
+                        seed = f"{t_op} {dop}"
+                        if HashcatRuleValidator.validate_rule_for_gpu(seed):
+                            sbd[2].add(seed)
+            if max_seed_depth >= 3:
+                for t_op in _transform_ops:
+                    for a in _t_digit_ops:
+                        for b in _t_digit_ops:
+                            seed = f"{t_op} {a} {b}"
+                            if HashcatRuleValidator.validate_rule_for_gpu(seed):
+                                sbd[3].add(seed)
+            if max_seed_depth >= 4:
+                for t_op in _transform_ops:
+                    for a in _t_digit_ops:
+                        for b in _t_digit_ops:
+                            for c in _t_digit_ops:
+                                seed = f"{t_op} {a} {b} {c}"
+                                if HashcatRuleValidator.validate_rule_for_gpu(seed):
+                                    sbd[4].add(seed)
+
             c_total = sum(2**d * 10**d for d in range(1, max_seed_depth + 1))
             log_debug(f"Numeric seeds  max_seed_depth={max_seed_depth}")
             log_debug("  A (pure ^): " +
@@ -1250,7 +1335,11 @@ class GPUEngine:
                       ", ".join(f"d{d}={b_cnt[d]:,}" for d in sorted(b_cnt)) +
                       f"  [{sum(b_cnt.values()):,} total]")
             log_debug(f"  C (mixed) : [{c_total:,} total]")
-            log_debug("  A∪B∪C     : " +
+            log_debug("  D (transform+digit 0-3): " +
+                      ", ".join(f"d{d}={len([s for s in sbd[d] if s.split()[0] in _transform_ops]):,}"
+                                for d in sorted(sbd) if d >= 2) +
+                      f"  [{sum(len([s for s in sbd[d] if s.split()[0] in _transform_ops]) for d in sbd if d >= 2):,} total]")
+            log_debug("  A∪B∪C∪D   : " +
                       ", ".join(f"d{d}={len(sbd[d]):,}" for d in sorted(sbd)) +
                       f"  [{sum(len(v) for v in sbd.values()):,} total]")
 
