@@ -1111,38 +1111,46 @@ class GPUEngine:
                     sbd[depth].add(' '.join(f'{o}{d}' for o, d in zip(ops, digs)))
 
         # Family D: single transformation operator at position 1, followed by
-        # digit operators (^d / $d) at positions 2+.
+        # digit operators (^d / $d) and bracket operators ([ / ]) at positions 2+.
         #
         # Rules:
         #   • transform_op is always first (no positional arguments required).
         #   • Digit range is restricted to 0-3 to keep the seed count manageable
         #     while covering the most common numeric patterns in real passwords.
-        #   • depth 2: transform + one digit-op
-        #       e.g.  u $1,  l ^2,  c $0,  C ^3
-        #   • depth 3: transform + two digit-ops — all four combos covered:
-        #       non-mixed ^^:  u ^1 ^2
-        #       non-mixed $$:  l $0 $3
-        #       mixed   ^$:    c ^2 $1
-        #       mixed   $^:    C $0 ^3
+        #   • [ and ] (delete-first / delete-last) are included as suffix ops,
+        #     supporting up to 4 [ / ] operators at positions 2+.
+        #   • depth 2: transform + one op
+        #       e.g.  u $1,  l ^2,  c [,  C ]
+        #   • depth 3: transform + two ops — all combos covered:
+        #       e.g.  u ^1 ^2,  l $0 $3,  c ^2 $1,  C [ ],  t [ [
+        #   • depth 4: transform + three ops
+        #       e.g.  u ^1 $2 ^3,  c [ ] [,  l $0 $1 $2
+        #   • depth 5: transform + four ops (supports up to 4 [ / ] operators)
+        #       e.g.  u [ [ [ [,  l ] ] ] ],  c [ ] [ ],  r ^1 $2 [ ]
         TRANSFORM_SEED_DIGITS = '0123'
         transform_ops = [
             'l', 'u', 'c', 'C', 't', 'r', 'd', 'f',
             'E', 'k', 'K', '{', '}', '[', ']',
         ]
-        t_digit_ops = [f'^{d}' for d in TRANSFORM_SEED_DIGITS] + \
-                      [f'${d}' for d in TRANSFORM_SEED_DIGITS]
+        # Include [ and ] alongside digit-ops so Family D can use up to 4 of them
+        t_digit_ops = ([f'^{d}' for d in TRANSFORM_SEED_DIGITS] +
+                       [f'${d}' for d in TRANSFORM_SEED_DIGITS] +
+                       ['[', ']'])
+
+        # Allow depth 5 for Family D so we can fit transform + four [ / ] ops
+        max_seed_depth_d = min(max_depth, 5)
 
         d_cnt: Dict[int, int] = defaultdict(int)
-        # depth 2: transform + 1 digit-op  e.g.  u $1,  l ^2
-        if max_seed_depth >= 2:
+        # depth 2: transform + 1 op  e.g.  u $1,  l ^2,  c [,  t ]
+        if max_seed_depth_d >= 2:
             for t_op in transform_ops:
                 for dop in t_digit_ops:
                     seed = f"{t_op} {dop}"
                     if HashcatRuleValidator.validate_rule_for_gpu(seed):
                         sbd[2].add(seed)
                         d_cnt[2] += 1
-        # depth 3: transform + 2 digit-ops  e.g.  u ^1 $2,  l $0 $3
-        if max_seed_depth >= 3:
+        # depth 3: transform + 2 ops  e.g.  u ^1 $2,  l $0 $3,  c [ ],  t [ [
+        if max_seed_depth_d >= 3:
             for t_op in transform_ops:
                 for a in t_digit_ops:
                     for b in t_digit_ops:
@@ -1150,8 +1158,8 @@ class GPUEngine:
                         if HashcatRuleValidator.validate_rule_for_gpu(seed):
                             sbd[3].add(seed)
                             d_cnt[3] += 1
-        # depth 4: transform + 3 digit-ops  e.g.  u ^1 $2 ^3,  c $0 $1 $2
-        if max_seed_depth >= 4:
+        # depth 4: transform + 3 ops  e.g.  u ^1 $2 ^3,  c $0 $1 $2,  l [ ] [
+        if max_seed_depth_d >= 4:
             for t_op in transform_ops:
                 for a in t_digit_ops:
                     for b in t_digit_ops:
@@ -1160,6 +1168,18 @@ class GPUEngine:
                             if HashcatRuleValidator.validate_rule_for_gpu(seed):
                                 sbd[4].add(seed)
                                 d_cnt[4] += 1
+        # depth 5: transform + 4 ops — supports up to 4 [ / ] operators
+        #   e.g.  u [ [ [ [,  l ] ] ] ],  c [ ] [ ],  r ^1 $2 [ ]
+        if max_seed_depth_d >= 5:
+            for t_op in transform_ops:
+                for a in t_digit_ops:
+                    for b in t_digit_ops:
+                        for c in t_digit_ops:
+                            for e in t_digit_ops:
+                                seed = f"{t_op} {a} {b} {c} {e}"
+                                if HashcatRuleValidator.validate_rule_for_gpu(seed):
+                                    sbd[5].add(seed)
+                                    d_cnt[5] += 1
 
         # Family E: date-pattern seeds
         # Covers the most common numeric date formats found in real passwords.
@@ -1217,6 +1237,7 @@ class GPUEngine:
                 _pre = ' '.join(f'^{c}' for c in reversed(_ds))
                 sbd[_depth].add(_pre); e_cnt[_depth] += 1
                 # Transform+date: only for 4-digit dates (depth 4 → depth 5)
+                # Includes single [ / ] since they are in transform_ops already.
                 if _depth == 4:
                     for t_op in transform_ops:
                         _ta = f"{t_op} {_app}"
@@ -1226,8 +1247,39 @@ class GPUEngine:
                         if HashcatRuleValidator.validate_rule_for_gpu(_tp):
                             sbd[5].add(_tp); e_cnt[5] += 1
 
+        # Bracket-prefix date variants: 2–4 [ / ] operators before the date chain,
+        # supporting up to 4 [ / ] operators total (1 bracket is already covered
+        # by transform_ops above for 4-digit dates).
+        #
+        # Generated per format depth:
+        #   4-digit dates  (depth 4):  prefix 2-4 brackets → new depths 6, 7, 8
+        #   6-digit dates  (depth 6):  prefix 1-2 brackets → new depths 7, 8
+        #   8-digit dates  (depth 8):  prefix 1   bracket  → new depth  9
+        #     (deeper chains get very long; cap at 4 bracket ops total)
+        _bracket_ops = ['[', ']']
+        _bracket_date_schedule = [
+            (_date4, 4, range(2, 5)),   # 2, 3, 4 brackets before 4-char date
+            (_date6, 6, range(1, 3)),   # 1, 2 brackets before 6-char date
+            (_date8, 8, range(1, 2)),   # 1 bracket before 8-char date
+        ]
+        for _bds, _bdepth, _brange in _bracket_date_schedule:
+            for _num_b in _brange:
+                for _brackets in itertools.product(_bracket_ops, repeat=_num_b):
+                    _bpfx = ' '.join(_brackets)
+                    _new_depth = _bdepth + _num_b
+                    for _ds in _bds:
+                        _app = ' '.join(f'${c}' for c in _ds)
+                        _pre = ' '.join(f'^{c}' for c in reversed(_ds))
+                        _ba = f"{_bpfx} {_app}"
+                        _bp = f"{_bpfx} {_pre}"
+                        if HashcatRuleValidator.validate_rule_for_gpu(_ba):
+                            sbd[_new_depth].add(_ba); e_cnt[_new_depth] += 1
+                        if HashcatRuleValidator.validate_rule_for_gpu(_bp):
+                            sbd[_new_depth].add(_bp); e_cnt[_new_depth] += 1
+
         c_total = sum(2**d * 10**d for d in range(1, max_seed_depth + 1))
-        log_debug(f"Numeric seeds  max_seed_depth={max_seed_depth}")
+        log_debug(f"Numeric seeds  max_seed_depth={max_seed_depth}  "
+                  f"max_seed_depth_d={max_seed_depth_d}")
         log_debug("  A (pure ^): " +
                   ", ".join(f"d{d}={a_cnt[d]:,}" for d in sorted(a_cnt)) +
                   f"  [{sum(a_cnt.values()):,} total]")
@@ -1235,10 +1287,10 @@ class GPUEngine:
                   ", ".join(f"d{d}={b_cnt[d]:,}" for d in sorted(b_cnt)) +
                   f"  [{sum(b_cnt.values()):,} total]")
         log_debug(f"  C (mixed) : [{c_total:,} total]")
-        log_debug("  D (transform+digit 0-3): " +
+        log_debug("  D (transform+digit/bracket 0-3+[+]): " +
                   ", ".join(f"d{d}={d_cnt[d]:,}" for d in sorted(d_cnt)) +
                   f"  [{sum(d_cnt.values()):,} total]")
-        log_debug("  E (dates DDMM/MMDD/YYYY/…): " +
+        log_debug("  E (dates DDMM/MMDD/YYYY/… + bracket prefixes): " +
                   ", ".join(f"d{d}={e_cnt[d]:,}" for d in sorted(e_cnt)) +
                   f"  [{sum(e_cnt.values()):,} total]")
         log_debug("  A∪…∪E     : " +
@@ -1318,13 +1370,14 @@ class GPUEngine:
         """
         Generate random chain candidates for Phase 2.
 
-        When *prebuilt_sbd* is supplied (produced by build_numeric_seed_families
-        and already tested in the dedicated seed extraction pass), the numeric
-        seed families are NOT regenerated here — they are used only as the
-        basis for random chain extensions, avoiding redundant GPU work.
+        Built-in seed families (A–E) are built ONCE in Phase S
+        (build_numeric_seed_families → run_seed_extraction_pass) and must NOT
+        be re-submitted as GPU candidates here.  *prebuilt_sbd* carries those
+        families in; they are used exclusively as scaffolding atoms for random
+        chain extension — never added to the Phase 2 candidate list.
 
-        If *prebuilt_sbd* is None (e.g. direct callers that do not run the
-        seed pass), the families are built in-place as before.
+        User-supplied seed chains (*seed_chains*) that were not tested in
+        Phase S are still injected as direct Phase 2 candidates.
         """
         # Cap max_depth to hashcat limit
         max_depth = min(max_depth, MAX_HASHCAT_CHAIN)
@@ -1332,164 +1385,79 @@ class GPUEngine:
         if not valid: return []
         found_s = set(single_found.keys()) if single_found else set()
         hot     = [r for r in valid if r in found_s]
+        # Phase 2 candidate set — starts with atomic rules only.
         chains  = set(valid)
 
+        # ── Built-in seed families ────────────────────────────────────────────
+        # Load prebuilt_sbd (always provided by extract_rules via Phase S).
+        # If somehow absent, use an empty scaffold and warn — seeds are not
+        # regenerated here; that would duplicate Phase S work.
         if prebuilt_sbd is not None:
-            # Reuse already-tested seed families — no need to rebuild or retest.
             sbd = defaultdict(set, {d: set(v) for d, v in prebuilt_sbd.items()})
-            log_debug(f"generate_informed_chains: using prebuilt sbd "
-                      f"({sum(len(v) for v in sbd.values()):,} seeds, "
-                      f"skipping direct re-test)")
+            n_seeds = sum(len(v) for v in sbd.values())
+            log_debug(f"generate_informed_chains: prebuilt sbd loaded — "
+                      f"{n_seeds:,} seeds across {len(sbd)} depth(s), "
+                      f"used as scaffolding atoms only (not re-tested)")
         else:
-            # Legacy path: build seed families in-place (no prior seed pass).
-            sbd     = defaultdict(set)
-            digits  = '0123456789'
-            max_seed_depth = min(max_depth, 4)
+            log_warn("generate_informed_chains: no prebuilt_sbd supplied — "
+                     "built-in seed families absent from scaffolding. "
+                     "Ensure Phase S ran before Phase 2.")
+            sbd = defaultdict(set)
 
-            a_cnt: Dict[int, int] = defaultdict(int)
-            for n in range(10 ** max_seed_depth):
-                s = str(n); d = len(s)
-                sbd[d].add(' '.join(f'^{ch}' for ch in reversed(s)))
-                a_cnt[d] += 1
+        # Freeze the entire built-in seed set so it can never be added back to
+        # the Phase 2 candidate list through the extension loops below.
+        builtin_seed_set: set = set()
+        for _ds in sbd.values():
+            builtin_seed_set.update(_ds)
 
-            b_cnt: Dict[int, int] = defaultdict(int)
-            for n in range(10 ** max_seed_depth):
-                s = str(n); d = len(s)
-                sbd[d].add(' '.join(f'${ch}' for ch in s))
-                b_cnt[d] += 1
-
-            for depth in range(1, max_seed_depth + 1):
-                for ops in itertools.product(['^', '$'], repeat=depth):
-                    for digs in itertools.product(digits, repeat=depth):
-                        sbd[depth].add(' '.join(f'{o}{d}' for o, d in zip(ops, digs)))
-
-            # Family D: single transformation operator at position 1,
-            # followed by digit operators (^d / $d), digits restricted to 0-3.
-            _TRANSFORM_SEED_DIGITS = '0123'
-            _transform_ops = [
-                'l', 'u', 'c', 'C', 't', 'r', 'd', 'f',
-                'E', 'k', 'K', '{', '}', '[', ']',
-            ]
-            _t_digit_ops = ([f'^{d}' for d in _TRANSFORM_SEED_DIGITS] +
-                            [f'${d}' for d in _TRANSFORM_SEED_DIGITS])
-            if max_seed_depth >= 2:
-                for t_op in _transform_ops:
-                    for dop in _t_digit_ops:
-                        seed = f"{t_op} {dop}"
-                        if HashcatRuleValidator.validate_rule_for_gpu(seed):
-                            sbd[2].add(seed)
-            if max_seed_depth >= 3:
-                for t_op in _transform_ops:
-                    for a in _t_digit_ops:
-                        for b in _t_digit_ops:
-                            seed = f"{t_op} {a} {b}"
-                            if HashcatRuleValidator.validate_rule_for_gpu(seed):
-                                sbd[3].add(seed)
-            if max_seed_depth >= 4:
-                for t_op in _transform_ops:
-                    for a in _t_digit_ops:
-                        for b in _t_digit_ops:
-                            for c in _t_digit_ops:
-                                seed = f"{t_op} {a} {b} {c}"
-                                if HashcatRuleValidator.validate_rule_for_gpu(seed):
-                                    sbd[4].add(seed)
-
-            c_total = sum(2**d * 10**d for d in range(1, max_seed_depth + 1))
-            log_debug(f"Numeric seeds  max_seed_depth={max_seed_depth}")
-            log_debug("  A (pure ^): " +
-                      ", ".join(f"d{d}={a_cnt[d]:,}" for d in sorted(a_cnt)) +
-                      f"  [{sum(a_cnt.values()):,} total]")
-            log_debug("  B (pure $): " +
-                      ", ".join(f"d{d}={b_cnt[d]:,}" for d in sorted(b_cnt)) +
-                      f"  [{sum(b_cnt.values()):,} total]")
-            log_debug(f"  C (mixed) : [{c_total:,} total]")
-            log_debug("  D (transform+digit 0-3): " +
-                      ", ".join(f"d{d}={len([s for s in sbd[d] if s.split()[0] in _transform_ops]):,}"
-                                for d in sorted(sbd) if d >= 2) +
-                      f"  [{sum(len([s for s in sbd[d] if s.split()[0] in _transform_ops]) for d in sbd if d >= 2):,} total]")
-
-            # Family E: date-pattern seeds (legacy path mirror)
-            _days_l   = [f"{d:02d}" for d in range(1, 32)]
-            _months_l = [f"{m:02d}" for m in range(1, 13)]
-            _years2_l = ([f"{y:02d}" for y in range(60, 100)] +
-                         [f"{y:02d}" for y in range(0,  31)])
-            _years4_l = [str(y) for y in range(1960, 2031)]
-
-            _date4_l: set = set()
-            _date6_l: set = set()
-            _date8_l: set = set()
-
-            for _d in _days_l:
-                for _m in _months_l:
-                    _date4_l.add(_d + _m)   # DDMM
-                    _date4_l.add(_m + _d)   # MMDD
-            for _y in _years4_l:
-                _date4_l.add(_y)            # YYYY
-            for _d in _days_l:
-                for _m in _months_l:
-                    for _y in _years2_l:
-                        _date6_l.add(_d + _m + _y)   # DDMMYY
-                        _date6_l.add(_m + _d + _y)   # MMDDYY
-            for _d in _days_l:
-                for _m in _months_l:
-                    for _y in _years4_l:
-                        _date8_l.add(_d + _m + _y)   # DDMMYYYY
-                        _date8_l.add(_m + _d + _y)   # MMDDYYYY
-
-            _e_cnt_l: Dict[int, int] = defaultdict(int)
-            for _ds_set_l, _depth_l in ((_date4_l, 4), (_date6_l, 6), (_date8_l, 8)):
-                for _ds_l in _ds_set_l:
-                    _app_l = ' '.join(f'${c}' for c in _ds_l)
-                    sbd[_depth_l].add(_app_l); _e_cnt_l[_depth_l] += 1
-                    _pre_l = ' '.join(f'^{c}' for c in reversed(_ds_l))
-                    sbd[_depth_l].add(_pre_l); _e_cnt_l[_depth_l] += 1
-                    if _depth_l == 4:
-                        for _t_op_l in _transform_ops:
-                            _ta_l = f"{_t_op_l} {_app_l}"
-                            if HashcatRuleValidator.validate_rule_for_gpu(_ta_l):
-                                sbd[5].add(_ta_l); _e_cnt_l[5] += 1
-                            _tp_l = f"{_t_op_l} {_pre_l}"
-                            if HashcatRuleValidator.validate_rule_for_gpu(_tp_l):
-                                sbd[5].add(_tp_l); _e_cnt_l[5] += 1
-
-            log_debug("  E (dates DDMM/MMDD/YYYY/…): " +
-                      ", ".join(f"d{d}={_e_cnt_l[d]:,}" for d in sorted(_e_cnt_l)) +
-                      f"  [{sum(_e_cnt_l.values()):,} total]")
-            log_debug("  A∪…∪E     : " +
-                      ", ".join(f"d{d}={len(sbd[d]):,}" for d in sorted(sbd)) +
-                      f"  [{sum(len(v) for v in sbd.values()):,} total]")
-
-        # User-supplied seeds are added as direct candidates and chain atoms.
+        # ── User-supplied seeds ───────────────────────────────────────────────
+        # Single-rule user seeds are already in *valid* (Phase 1 atoms).
+        # Multi-rule user seed chains were NOT tested in Phase S, so they ARE
+        # direct Phase 2 candidates.  All user seeds also serve as sbd atoms.
+        n_user_atoms   = 0
+        n_user_direct  = 0
         if seed_chains:
             for sc in seed_chains:
-                sbd[sc.count(' ') + 1].add(sc)
-            n_singles_as_atoms = sum(1 for sc in seed_chains if ' ' not in sc.strip())
-            n_direct           = len(seed_chains) - n_singles_as_atoms
-            log_debug(f"User seeds in Phase 2: {n_singles_as_atoms} atoms "
-                      f"+ {n_direct} direct chain candidates")
+                depth = sc.count(' ') + 1
+                sbd[depth].add(sc)
+                if depth >= 2:
+                    # multi-rule chain — direct Phase 2 candidate
+                    chains.add(sc)
+                    n_user_direct += 1
+                else:
+                    n_user_atoms += 1
+            log_debug(f"User seeds in Phase 2: {n_user_atoms} atom(s) "
+                      f"+ {n_user_direct} direct chain candidate(s)")
 
-        for ds in sbd.values(): chains.update(ds)
-
-        for depth in range(2, max_depth+1):
+        # ── Random chain extension ────────────────────────────────────────────
+        # Use sbd entries as *prev* atoms when extending to a new depth.
+        # Built-in seeds are excluded from entering chains via builtin_seed_set.
+        for depth in range(2, max_depth + 1):
             budget = self.params.get(f'CHAIN_GEN_LIMIT_{depth}', 0)
             if budget <= 0: continue
-            budget   = min(budget, len(valid)**depth)
-            new      = set(sbd.get(depth, set())) - chains
-            prev     = list(sbd.get(depth-1, set()))
-            ext_tgt  = int(budget * EXTENSION_RATIO)
+            budget  = min(budget, len(valid) ** depth)
+            # new: seed-derived extensions that are not already in chains and
+            #      are not built-in seeds (those belong to Phase S only).
+            new     = set(sbd.get(depth, set())) - chains - builtin_seed_set
+            prev    = list(sbd.get(depth - 1, set()))
+            ext_tgt = int(budget * EXTENSION_RATIO)
             att = 0
-            while len(new) < ext_tgt and att < ext_tgt*MAX_ATTEMPTS_MULTIPLIER:
+            while len(new) < ext_tgt and att < ext_tgt * MAX_ATTEMPTS_MULTIPLIER:
                 att += 1
                 if prev:
                     nc = random.choice(prev) + ' ' + random.choice(valid)
-                    if nc not in chains and nc not in new: new.add(nc)
+                    if nc not in chains and nc not in new and nc not in builtin_seed_set:
+                        new.add(nc)
             rem = budget - len(new)
             if rem > 0:
                 new.update(self._gen_random_chains(depth, rem, valid, hot, chains, new))
-            chains.update(new); sbd[depth].update(new)
+            chains.update(new)
+            sbd[depth].update(new)
             log_debug(f"Depth {depth}: budget={budget:,}, generated={len(new):,}")
 
-        log_debug(f"Total chains generated: {len(chains):,}")
+        log_debug(f"Total Phase 2 candidates: {len(chains):,}  "
+                  f"(atomic rules + user chains + random extensions; "
+                  f"built-in seeds excluded)")
         return list(chains)
 
     def process_all_words_chain_rules(self, base_words, rules, max_depth,
