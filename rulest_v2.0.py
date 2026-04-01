@@ -1071,228 +1071,205 @@ class GPUEngine:
 
     def build_numeric_seed_families(self, max_depth: int = 4) -> dict:
         """
-        Build the three built-in numeric seed families, independent of the
-        random chain generation pipeline.
+        Build five numeric seed families for Phase S direct extraction.
 
-        Family A  pure-prepend  : ^9 ^8 ^7 …  (prepend multi-digit numbers)
-        Family B  pure-append   : $1 $2 $3 …  (append multi-digit numbers)
-        Family C  mixed         : all combinations of ^ and $ with digits
+        Every family produces chains that are tested against the bloom filter
+        individually via the GPU chain kernel — they are extraction candidates
+        first, not only scaffolding for random chain generation.
 
-        Seeds are generated for depths 1 .. min(max_depth, 4) so they can be
-        run as *direct extraction candidates* via the chain kernel — not only
-        as scaffolding for random chain generation.
+        Family A — Pure Prepend (depths 1–4)
+            One ^digit op per digit, right-to-left so the number reads
+            correctly.  e.g. prepend 12 → "^2 ^1".
+            Counts per depth: 10, 100, 1 000, 10 000.
+
+        Family B — Pure Append (depths 1–4)
+            One $digit op per digit, left-to-right.
+            e.g. append 1990 → "$1 $9 $9 $0".
+            Counts per depth: same as Family A.
+
+        Family C — Mixed Prepend/Append (depths 1–4)
+            All {^d, $d}^depth × digits^depth combinations, covering numeric
+            bookends and interleaved prefix/suffix patterns.
+            Counts per depth: 20^depth (20, 400, 8 000, 160 000).
+
+        Family D — Transform + Digit/Bracket (depths 2–4)
+            A single case-/position-transformation op at position 1
+            (l u c C t r d f E k K { } [ ]), followed by 1–3 digit ops
+            (^d, $d) or bracket ops ([ ]).  Depth 4 is the maximum now.
+            depth 2: transform + 1 op   e.g. "u $1", "l ^7", "c ["
+            depth 3: transform + 2 ops  e.g. "u ^1 $9", "c [ ]", "t [ ["
+            depth 4: transform + 3 ops  e.g. "u ^1 $2 ^9", "c [ ] ["
+
+        Family E — Date Patterns (depths 4–9)
+            Append and prepend orientations for the most common numeric date
+            formats found in real passwords.  Date ranges:
+              days 01–31, months 01–12,
+              2-digit years 60–99 ∪ 00–30,
+              4-digit years 1960–2030.
+            depth 4:  DDMM, MMDD, YYYY          → append / prepend
+            depth 5:  transform + 4-digit date   → all transform variants
+            depth 6:  DDMMYY, MMDDYY            → append / prepend
+            depth 6–8: 2–4 brackets + 4-digit date → bracket-prefix a/p
+            depth 7–8: 1–2 brackets + 6-digit date → bracket-prefix a/p
+            depth 8:  DDMMYYYY, MMDDYYYY        → append / prepend
+            depth 9:  1 bracket  + 8-digit date  → bracket-prefix a/p
+            (at most 4 bracket ops total)
+
+        Parameters
+        ----------
+        max_depth : int
+            Upper bound on chain depth.  Seeds deeper than max_depth are
+            skipped — the chain kernel cannot handle them anyway.
 
         Returns
         -------
         dict  depth -> set[str chain]
         """
-        max_seed_depth = min(max_depth, 4)
         digits = '0123456789'
         sbd: Dict[int, set] = defaultdict(set)
+
+        # ── Family A: Pure Prepend ────────────────────────────────────────
+        # depths 1–4  (capped by max_depth so we never exceed the kernel limit)
+        # Each depth d produces 10^d chains.
         a_cnt: Dict[int, int] = defaultdict(int)
+        for depth in range(1, min(4, max_depth) + 1):
+            for combo in itertools.product(digits, repeat=depth):
+                # right-to-left: prepending "12" → "^2 ^1"
+                sbd[depth].add(' '.join(f'^{ch}' for ch in reversed(combo)))
+                a_cnt[depth] += 1
+
+        # ── Family B: Pure Append ─────────────────────────────────────────
+        # depths 1–4  (capped by max_depth)
+        # Each depth d produces 10^d chains.
         b_cnt: Dict[int, int] = defaultdict(int)
+        for depth in range(1, min(4, max_depth) + 1):
+            for combo in itertools.product(digits, repeat=depth):
+                # left-to-right: appending "1990" → "$1 $9 $9 $0"
+                sbd[depth].add(' '.join(f'${ch}' for ch in combo))
+                b_cnt[depth] += 1
 
-        # Family A: pure prepend  (e.g. n=12  →  "^2 ^1"  →  prepend "12")
-        for n in range(10 ** max_seed_depth):
-            s = str(n); d = len(s)
-            sbd[d].add(' '.join(f'^{ch}' for ch in reversed(s)))
-            a_cnt[d] += 1
-
-        # Family B: pure append  (e.g. n=12  →  "$1 $2"  →  append "12")
-        for n in range(10 ** max_seed_depth):
-            s = str(n); d = len(s)
-            sbd[d].add(' '.join(f'${ch}' for ch in s))
-            b_cnt[d] += 1
-
-        # Family C: mixed prepend/append combinations
-        for depth in range(1, max_seed_depth + 1):
+        # ── Family C: Mixed Prepend/Append ────────────────────────────────
+        # depths 1–4  (capped by max_depth)
+        # All {^d, $d}^depth × digits^depth combinations → 20^depth per depth.
+        for depth in range(1, min(4, max_depth) + 1):
             for ops in itertools.product(['^', '$'], repeat=depth):
                 for digs in itertools.product(digits, repeat=depth):
                     sbd[depth].add(' '.join(f'{o}{d}' for o, d in zip(ops, digs)))
 
-        # Family D: single transformation operator at position 1, followed by
-        # digit operators (^d / $d) and bracket operators ([ / ]) at positions 2+.
-        #
-        # Rules:
-        #   • transform_op is always first (no positional arguments required).
-        #   • Digit range covers all digits 0-9 for complete numeric coverage.
-        #   • [ and ] (delete-first / delete-last) are included as suffix ops,
-        #     supporting up to 4 [ / ] operators at positions 2+.
-        #   • depth 2: transform + one op
-        #       e.g.  u $1,  l ^7,  c [,  C ]
-        #   • depth 3: transform + two ops — all combos covered:
-        #       e.g.  u ^1 $9,  l $0 $8,  c ^2 $1,  C [ ],  t [ [
-        #   • depth 4: transform + three ops
-        #       e.g.  u ^1 $2 ^9,  c [ ] [,  l $0 $5 $2
-        #   • depth 5 (max): transform + four ops
-        #       e.g.  u [ [ [ [,  l ] ] ] ],  c [ ] [ ],  r ^1 $9 [ ]
-        TRANSFORM_SEED_DIGITS = '0123456789'
+        # ── Family D: Transform + Digit/Bracket (depths 2–4) ──────────────
+        # Only depths 2 to min(4, max_depth) are generated.
         transform_ops = [
             'l', 'u', 'c', 'C', 't', 'r', 'd', 'f',
             'E', 'k', 'K', '{', '}', '[', ']',
         ]
-        # Include [ and ] alongside digit-ops so Family D can use up to 4 of them
-        t_digit_ops = ([f'^{d}' for d in TRANSFORM_SEED_DIGITS] +
-                       [f'${d}' for d in TRANSFORM_SEED_DIGITS] +
-                       ['[', ']'])
-
-        # Allow depth 5 for Family D so we can fit transform + four [ / ] ops
-        max_seed_depth_d = min(max_depth, 5)
-
+        t_digit_ops = (
+            [f'^{d}' for d in digits] +
+            [f'${d}' for d in digits] +
+            ['[', ']']
+        )
         d_cnt: Dict[int, int] = defaultdict(int)
-        # depth 2: transform + 1 op  e.g.  u $1,  l ^2,  c [,  t ]
-        if max_seed_depth_d >= 2:
+        for depth in range(2, min(4, max_depth) + 1):          # <--- changed from 5 to 4
             for t_op in transform_ops:
-                for dop in t_digit_ops:
-                    seed = f"{t_op} {dop}"
+                for ops in itertools.product(t_digit_ops, repeat=depth - 1):
+                    seed = f"{t_op} {' '.join(ops)}"
                     if HashcatRuleValidator.validate_rule_for_gpu(seed):
-                        sbd[2].add(seed)
-                        d_cnt[2] += 1
-        # depth 3: transform + 2 ops  e.g.  u ^1 $2,  l $0 $3,  c [ ],  t [ [
-        if max_seed_depth_d >= 3:
-            for t_op in transform_ops:
-                for a in t_digit_ops:
-                    for b in t_digit_ops:
-                        seed = f"{t_op} {a} {b}"
-                        if HashcatRuleValidator.validate_rule_for_gpu(seed):
-                            sbd[3].add(seed)
-                            d_cnt[3] += 1
-        # depth 4: transform + 3 ops  e.g.  u ^1 $2 ^3,  c $0 $1 $2,  l [ ] [
-        if max_seed_depth_d >= 4:
-            for t_op in transform_ops:
-                for a in t_digit_ops:
-                    for b in t_digit_ops:
-                        for c in t_digit_ops:
-                            seed = f"{t_op} {a} {b} {c}"
-                            if HashcatRuleValidator.validate_rule_for_gpu(seed):
-                                sbd[4].add(seed)
-                                d_cnt[4] += 1
-        # depth 5: transform + 4 ops — supports up to 4 [ / ] operators
-        #   e.g.  u [ [ [ [,  l ] ] ] ],  c [ ] [ ],  r ^1 $2 [ ]
-        if max_seed_depth_d >= 5:
-            for t_op in transform_ops:
-                for a in t_digit_ops:
-                    for b in t_digit_ops:
-                        for c in t_digit_ops:
-                            for e in t_digit_ops:
-                                seed = f"{t_op} {a} {b} {c} {e}"
-                                if HashcatRuleValidator.validate_rule_for_gpu(seed):
-                                    sbd[5].add(seed)
-                                    d_cnt[5] += 1
+                        sbd[depth].add(seed)
+                        d_cnt[depth] += 1
 
-        # Family E: date-pattern seeds
-        # Covers the most common numeric date formats found in real passwords.
-        # Generated independently of max_seed_depth — specific date patterns
-        # are always worthwhile direct-extraction candidates.
-        #
-        # Both append ($d …) and prepend (^d … reversed) orientations are built.
-        # Transform variants (transform_op at position 1) are added only for
-        # 4-digit dates to keep the depth-5 seed count manageable.
-        #
-        # Formats and chain depths:
-        #   depth 4:  DDMM, MMDD, YYYY                 → append/prepend
-        #   depth 5:  transform + 4-digit date          → transform variants
-        #   depth 6:  DDMMYY, MMDDYY                   → append/prepend
-        #   depth 8:  DDMMYYYY, MMDDYYYY               → append/prepend
-
+        # ── Family E: Date Patterns ───────────────────────────────────────
         _days   = [f"{d:02d}" for d in range(1, 32)]
         _months = [f"{m:02d}" for m in range(1, 13)]
         _years2 = ([f"{y:02d}" for y in range(60, 100)] +
                    [f"{y:02d}" for y in range(0,  31)])
         _years4 = [str(y) for y in range(1960, 2031)]
 
-        # Build date string sets per format length
-        _date4: set = set()
-        _date6: set = set()
-        _date8: set = set()
+        _date4: set = set()   # DDMM, MMDD, YYYY   → depth 4
+        _date6: set = set()   # DDMMYY, MMDDYY     → depth 6
+        _date8: set = set()   # DDMMYYYY, MMDDYYYY  → depth 8
 
         for _d in _days:
             for _m in _months:
-                _date4.add(_d + _m)   # DDMM
-                _date4.add(_m + _d)   # MMDD
+                _date4.add(_d + _m)
+                _date4.add(_m + _d)
         for _y in _years4:
-            _date4.add(_y)            # YYYY
+            _date4.add(_y)
 
         for _d in _days:
             for _m in _months:
                 for _y in _years2:
-                    _date6.add(_d + _m + _y)   # DDMMYY
-                    _date6.add(_m + _d + _y)   # MMDDYY
+                    _date6.add(_d + _m + _y)
+                    _date6.add(_m + _d + _y)
 
         for _d in _days:
             for _m in _months:
                 for _y in _years4:
-                    _date8.add(_d + _m + _y)   # DDMMYYYY
-                    _date8.add(_m + _d + _y)   # MMDDYYYY
+                    _date8.add(_d + _m + _y)
+                    _date8.add(_m + _d + _y)
 
         e_cnt: Dict[int, int] = defaultdict(int)
 
-        for _ds_set, _depth in ((_date4, 4), (_date6, 6), (_date8, 8)):
+        # Base depth 4 / 6 / 8 → append + prepend
+        for _ds_set, _base_depth in ((_date4, 4), (_date6, 6), (_date8, 8)):
+            if _base_depth > max_depth:
+                continue
             for _ds in _ds_set:
-                # Append variant: "1990" → "$1 $9 $9 $0"
                 _app = ' '.join(f'${c}' for c in _ds)
-                sbd[_depth].add(_app); e_cnt[_depth] += 1
-                # Prepend variant (reversed for hashcat): "1990" → "^0 ^9 ^9 ^1"
                 _pre = ' '.join(f'^{c}' for c in reversed(_ds))
-                sbd[_depth].add(_pre); e_cnt[_depth] += 1
-                # Transform+date: only for 4-digit dates (depth 4 → depth 5)
-                # Includes single [ / ] since they are in transform_ops already.
-                if _depth == 4:
-                    for t_op in transform_ops:
-                        _ta = f"{t_op} {_app}"
-                        if HashcatRuleValidator.validate_rule_for_gpu(_ta):
-                            sbd[5].add(_ta); e_cnt[5] += 1
-                        _tp = f"{t_op} {_pre}"
-                        if HashcatRuleValidator.validate_rule_for_gpu(_tp):
-                            sbd[5].add(_tp); e_cnt[5] += 1
+                sbd[_base_depth].add(_app); e_cnt[_base_depth] += 1
+                sbd[_base_depth].add(_pre); e_cnt[_base_depth] += 1
 
-        # Bracket-prefix date variants: 2–4 [ / ] operators before the date chain,
-        # supporting up to 4 [ / ] operators total (1 bracket is already covered
-        # by transform_ops above for 4-digit dates).
-        #
-        # Generated per format depth:
-        #   4-digit dates  (depth 4):  prefix 2-4 brackets → new depths 6, 7, 8
-        #   6-digit dates  (depth 6):  prefix 1-2 brackets → new depths 7, 8
-        #   8-digit dates  (depth 8):  prefix 1   bracket  → new depth  9
-        #     (deeper chains get very long; cap at 4 bracket ops total)
+        # depth 5: transform + 4-digit date (all transform variants)
+        if max_depth >= 5:
+            for _ds in _date4:
+                _app = ' '.join(f'${c}' for c in _ds)
+                _pre = ' '.join(f'^{c}' for c in reversed(_ds))
+                for t_op in transform_ops:
+                    for _chain in (f"{t_op} {_app}", f"{t_op} {_pre}"):
+                        if HashcatRuleValidator.validate_rule_for_gpu(_chain):
+                            sbd[5].add(_chain); e_cnt[5] += 1
+
+        # Bracket-prefix date variants (at most 4 bracket ops total):
+        #   2–4 brackets + 4-digit date  → new depths 6, 7, 8
+        #   1–2 brackets + 6-digit date  → new depths 7, 8
+        #   1   bracket  + 8-digit date  → new depth  9
         _bracket_ops = ['[', ']']
         _bracket_date_schedule = [
-            (_date4, 4, range(2, 5)),   # 2, 3, 4 brackets before 4-char date
-            (_date6, 6, range(1, 3)),   # 1, 2 brackets before 6-char date
-            (_date8, 8, range(1, 2)),   # 1 bracket before 8-char date
+            (_date4, 4, range(2, 5)),  # +2, +3, +4 → depth 6, 7, 8
+            (_date6, 6, range(1, 3)),  # +1, +2     → depth 7, 8
+            (_date8, 8, range(1, 2)),  # +1          → depth 9
         ]
         for _bds, _bdepth, _brange in _bracket_date_schedule:
             for _num_b in _brange:
+                _new_depth = _bdepth + _num_b
+                if _new_depth > max_depth:
+                    continue
                 for _brackets in itertools.product(_bracket_ops, repeat=_num_b):
                     _bpfx = ' '.join(_brackets)
-                    _new_depth = _bdepth + _num_b
                     for _ds in _bds:
                         _app = ' '.join(f'${c}' for c in _ds)
                         _pre = ' '.join(f'^{c}' for c in reversed(_ds))
-                        _ba = f"{_bpfx} {_app}"
-                        _bp = f"{_bpfx} {_pre}"
-                        if HashcatRuleValidator.validate_rule_for_gpu(_ba):
-                            sbd[_new_depth].add(_ba); e_cnt[_new_depth] += 1
-                        if HashcatRuleValidator.validate_rule_for_gpu(_bp):
-                            sbd[_new_depth].add(_bp); e_cnt[_new_depth] += 1
+                        for _chain in (f"{_bpfx} {_app}", f"{_bpfx} {_pre}"):
+                            if HashcatRuleValidator.validate_rule_for_gpu(_chain):
+                                sbd[_new_depth].add(_chain)
+                                e_cnt[_new_depth] += 1
 
-        c_total = sum(2**d * 10**d for d in range(1, max_seed_depth + 1))
-        log_debug(f"Numeric seeds  max_seed_depth={max_seed_depth}  "
-                  f"max_seed_depth_d={max_seed_depth_d}")
-        log_debug("  A (pure ^): " +
+        # ── Debug summary ─────────────────────────────────────────────────
+        c_total = sum(20 ** d for d in range(1, min(4, max_depth) + 1))
+        log_debug(f"Numeric seeds  max_depth={max_depth}")
+        log_debug("  A (pure ^)     : " +
                   ", ".join(f"d{d}={a_cnt[d]:,}" for d in sorted(a_cnt)) +
                   f"  [{sum(a_cnt.values()):,} total]")
-        log_debug("  B (pure $): " +
+        log_debug("  B (pure $)     : " +
                   ", ".join(f"d{d}={b_cnt[d]:,}" for d in sorted(b_cnt)) +
                   f"  [{sum(b_cnt.values()):,} total]")
-        log_debug(f"  C (mixed) : [{c_total:,} total]")
-        log_debug("  D (transform+digit/bracket 0-3+[+]): " +
+        log_debug(f"  C (mixed ^/$)  : [{c_total:,} total]")
+        log_debug("  D (transform+) : " +
                   ", ".join(f"d{d}={d_cnt[d]:,}" for d in sorted(d_cnt)) +
                   f"  [{sum(d_cnt.values()):,} total]")
-        log_debug("  E (dates DDMM/MMDD/YYYY/… + bracket prefixes): " +
+        log_debug("  E (dates)      : " +
                   ", ".join(f"d{d}={e_cnt[d]:,}" for d in sorted(e_cnt)) +
                   f"  [{sum(e_cnt.values()):,} total]")
-        log_debug("  A∪…∪E     : " +
+        log_debug("  A∪B∪C∪D∪E     : " +
                   ", ".join(f"d{d}={len(sbd[d]):,}" for d in sorted(sbd)) +
                   f"  [{sum(len(v) for v in sbd.values()):,} total]")
         return dict(sbd)
@@ -1651,7 +1628,7 @@ class GPUExtractor:
         # The prebuilt sbd is forwarded to Phase 2 to avoid regenerating the
         # families and re-running them through the chain kernel.
         log_section("PHASE S — Numeric Seed Extraction")
-        sbd = self.gpu_engine.build_numeric_seed_families(max_depth=4)
+        sbd = self.gpu_engine.build_numeric_seed_families(max_depth=self.max_depth)
         seed_hits = self.gpu_engine.run_seed_extraction_pass(
             base_words, sbd, bloom_filter, rules_phase1)
         all_counts.update(seed_hits)
