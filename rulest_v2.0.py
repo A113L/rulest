@@ -1115,19 +1115,18 @@ class GPUEngine:
         #
         # Rules:
         #   • transform_op is always first (no positional arguments required).
-        #   • Digit range is restricted to 0-3 to keep the seed count manageable
-        #     while covering the most common numeric patterns in real passwords.
+        #   • Digit range covers all digits 0-9 for complete numeric coverage.
         #   • [ and ] (delete-first / delete-last) are included as suffix ops,
         #     supporting up to 4 [ / ] operators at positions 2+.
         #   • depth 2: transform + one op
-        #       e.g.  u $1,  l ^2,  c [,  C ]
+        #       e.g.  u $1,  l ^7,  c [,  C ]
         #   • depth 3: transform + two ops — all combos covered:
-        #       e.g.  u ^1 ^2,  l $0 $3,  c ^2 $1,  C [ ],  t [ [
+        #       e.g.  u ^1 $9,  l $0 $8,  c ^2 $1,  C [ ],  t [ [
         #   • depth 4: transform + three ops
-        #       e.g.  u ^1 $2 ^3,  c [ ] [,  l $0 $1 $2
-        #   • depth 5: transform + four ops (supports up to 4 [ / ] operators)
-        #       e.g.  u [ [ [ [,  l ] ] ] ],  c [ ] [ ],  r ^1 $2 [ ]
-        TRANSFORM_SEED_DIGITS = '0123'
+        #       e.g.  u ^1 $2 ^9,  c [ ] [,  l $0 $5 $2
+        #   • depth 5 (max): transform + four ops
+        #       e.g.  u [ [ [ [,  l ] ] ] ],  c [ ] [ ],  r ^1 $9 [ ]
+        TRANSFORM_SEED_DIGITS = '0123456789'
         transform_ops = [
             'l', 'u', 'c', 'C', 't', 'r', 'd', 'f',
             'E', 'k', 'K', '{', '}', '[', ']',
