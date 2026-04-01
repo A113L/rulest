@@ -156,7 +156,7 @@ usage: rulest_v2.py [options] base_wordlist target_wordlist
 
 | Flag | Default | Description |
 |---|---|---|
-| `-d`, `--max-depth` | `2` | Maximum rule chain depth (1–12; depths >12 warned) |
+| `--max-depth` | `2` | Maximum rule chain depth (1–31; depths >31 capped to 31) |
 | `-o`, `--output` | `rulest_output.txt` | Output file path |
 | `--max-chains` | unlimited | Hard cap on total chains generated |
 | `--target-hours` | `0.5` | Time budget in hours; controls chain generation budget |
@@ -280,9 +280,8 @@ A single case-/position-transformation operator at position 1 (one of `l u c C t
 | 2 | transform + 1 op | `u $1`, `l ^7`, `c [`, `C ]` |
 | 3 | transform + 2 ops | `u ^1 $9`, `l $0 $8`, `c [ ]`, `t [ [` |
 | 4 | transform + 3 ops | `u ^1 $2 ^9`, `c [ ] [`, `l $0 $5 $2` |
-| 5 | transform + 4 ops | `u [ [ [ [`, `l ] ] ] ]`, `c [ ] [ ]`, `r ^1 $9 [ ]` |
 
-All candidates are validated by `HashcatRuleValidator` before being added. Depths 2–5 are covered (depth 5 is included so that up to four `[`/`]` operators can follow a transform).
+All candidates are validated by `HashcatRuleValidator` before being added. Depths 2–4 are covered.
 
 ### Family E — Date Patterns
 
@@ -307,7 +306,7 @@ Date-pattern chains that cover the most common numeric date formats found in rea
 
 **Bracket-prefix variants** prepend 1–4 `[` or `]` operators before any date chain, allowing date extraction to succeed even when the base word has leading or trailing characters that need to be stripped.
 
-> The seed families are always built with `max_seed_depth=4` in Phase S (capped internally regardless of `--max-depth`), so the maximum seed depth tested is 4 for Families A–D and up to 9 for Family E (date formats).
+> **Seed family depth caps:** Families A, B, C, and D are internally capped at `min(4, max_depth)` — they never exceed depth 4 regardless of `--max-depth`. Family E (date patterns) is gated directly on `max_depth` and can reach depths 5–9 when `--max-depth` is high enough to permit them.
 
 ---
 
@@ -463,8 +462,8 @@ sa@ $0
 | Available VRAM | Scale Factor | Bloom Filter Cap |
 |---|---|---|
 | < 4 GB | 0.25–0.5× | 32 MB |
-| 4–8 GB | 0.5–1.0× | 64 MB |
-| 8 GB+ | 1.0× (full) | 64 MB |
+| 4–8 GB | 0.5–1.0× | 256 MB |
+| 8 GB+ | 1.0× (full) | 256 MB |
 
 ---
 
