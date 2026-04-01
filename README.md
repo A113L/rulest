@@ -16,6 +16,8 @@
 - [Usage](#-usage)
   - [rulest\_v2.py — Full Reference](#rulest_v2py--full-reference)
 - [Architecture (v2)](#-architecture-v2)
+  - [Extraction Pipeline](#extraction-pipeline)
+- [Built-in Seed Families](#-built-in-seed-families)
 - [Functional Minimization](#-functional-minimization)
 - [Rule Categories](#-rule-categories)
 - [GPU Command Support](#-gpu-command-support)
@@ -60,11 +62,12 @@ A complete redesign built around GPU efficiency, Hashcat compatibility, and inte
 **Key capabilities:**
 - ✅ Full **Hashcat GPU rule validation** (max 31 ops, correct argument types)
 - ✅ **Bloom filter** on-GPU for fast membership testing with configurable false-positive rate
-- ✅ **Two-phase extraction**: single-rule sweep → informed chain generation
+- ✅ **Three-phase extraction**: single-rule sweep (Phase 1) → built-in numeric seed pass (Phase S) → informed chain generation (Phase 2)
+- ✅ **Built-in numeric seed families** (A–E): five deterministically generated seed families covering numeric prefixes/suffixes, mixed prepend/append, transform+digit combos, and date patterns — always run as a dedicated extraction pass, independent of `--max-depth` and the random-chain time budget
 - ✅ **Signature-based functional minimization**: removes functionally equivalent rules post-GPU using a deterministic probe set, keeping only the highest-frequency representative per equivalence class
 - ✅ **Dynamic VRAM-aware** batch and budget sizing (scales with available VRAM; baseline 8 GB)
 - ✅ **Hot-rule biased** chain generation using Phase 1 results (60% hot-rule bias, configurable via `HOT_RULE_RATIO`)
-- ✅ **Seed rules** support to guide chain exploration (30% budget allocated to extending seeds)
+- ✅ **User seed rules** support via `--seed-rules` to guide chain exploration (30% budget allocated to extending seeds)
 - ✅ Per-depth chain budget overrides (depths 2–10)
 - ✅ Unlimited result cap (no global ceiling)
 - ✅ Full **hit counting** and frequency-ranked output
@@ -80,14 +83,15 @@ A complete redesign built around GPU efficiency, Hashcat compatibility, and inte
 |---|---|---|
 | **Rule validation** | None — invalid rules passed to Hashcat | Full `HashcatRuleValidator` against GPU spec (max 31 ops) |
 | **Functional minimization** | ❌ Not implemented | ✅ Signature-based deduplication via `minimize_by_signature`; removes 20–60% of raw candidates |
-| **Rule set size** | ~2,700 static rules | 5,000+ GPU-validated Hashcat single rules across 9 categories |
-| **Search strategy** | Naive BFS — every rule applied blindly | Phase 1 single-rule sweep → Phase 2 hot-biased chain generation |
+| **Rule set size** | ~2,700 static rules | 13,000+ GPU-validated Hashcat single rules across 9 categories |
+| **Search strategy** | Naive BFS — every rule applied blindly | Phase 1 single-rule sweep → Phase S built-in seed extraction → Phase 2 hot-biased chain generation |
+| **Built-in seed families** | ❌ Not implemented | ✅ Five families (A–E): numeric prepend/append, mixed, transform+digit, date patterns; always run as a dedicated pass independent of `--max-depth` |
 | **Target lookup** | Python `set` (host RAM, per-result) | 16–64 MB Bloom filter uploaded once to GPU VRAM (FNV-1a, 4 hash functions) |
 | **Chain state** | Temp `.tmp` files on disk per depth | In-memory, GPU buffer-based with proper release and `gc.collect()` |
 | **Memory management** | Halve batch on OOM, no VRAM awareness | Dynamic sizing based on actual free VRAM estimate + 55% usage safety factor |
 | **Hit counting** | ❌ Not implemented | ✅ Full `Counter`-based frequency tracking, sorted output |
 | **Device selection** | First platform, first device | `--list-devices`, `--device` by index or name substring |
-| **Seed rules** | ❌ Not supported | ✅ `--seed-rules` file; seeds used to extend chains to deeper depths |
+| **User seed rules** | ❌ Not supported | ✅ `--seed-rules` file; single seeds → Phase 1 + Phase 2 atoms; chain seeds → Phase 2 direct candidates |
 | **Per-depth budget** | ❌ Not supported | ✅ `--depth2-chains` through `--depth10-chains` overrides |
 | **Output** | Unsorted, no metadata | Sorted by frequency; header with total hits and rule count |
 | **Rule categories** | Simple, T/D, s, Group A | + `i`, `o`, `x`, `*`, `O`, `e`, `3`, `p`, `y`, `Y`, `z`, `Z`, `L`, `R`, `+`, `-`, `.`, `,`, `'`, `E`, `k`, `K`, `{`, `}`, `[`, `]`, `q` |
@@ -156,7 +160,7 @@ usage: rulest_v2.py [options] base_wordlist target_wordlist
 | `-o`, `--output` | `rulest_output.txt` | Output file path |
 | `--max-chains` | unlimited | Hard cap on total chains generated |
 | `--target-hours` | `0.5` | Time budget in hours; controls chain generation budget |
-| `--seed-rules` | None | File with known-good rules/chains to use as generation seeds |
+| `--seed-rules` | None | File of user-supplied rules/chains. Single-rule seeds are injected into Phase 1 **and** used as Phase 2 chain atoms; multi-rule chain seeds are tested directly in Phase 2. Does not affect the built-in seed families (Phase S). |
 | `--list-devices` | — | Print all available OpenCL devices and exit |
 | `--device` | best GPU | Device index (e.g. `0`) or name substring (e.g. `NVIDIA`) |
 | `--depth2-chains` | dynamic | Override chain generation limit for depth 2 |
@@ -200,6 +204,10 @@ usage: rulest.py -w WORDLIST [-b BASE_WORDLIST] [-d CHAIN_DEPTH]
 │  │  (all words ×       └───────────────────────┘ │  │
 │  │   single rules)                               │  │
 │  │                                               │  │
+│  │  Phase S ────────▶  Built-in seed families   │  │
+│  │  (Families A–E;      direct extraction pass,  │  │
+│  │   always runs,       depth 2–9 seeds)         │  │
+│  │                                               │  │
 │  │  Phase 2 ────────▶  Informed chain generation │  │
 │  │  (hot-biased,        + seed extension         │  │
 │  │   VRAM-budgeted)                              │  │
@@ -210,10 +218,13 @@ usage: rulest.py -w WORDLIST [-b BASE_WORDLIST] [-d CHAIN_DEPTH]
   HashcatRuleValidator  →  GPU-safe output (.rule file)
 ```
 
-### Two-Phase Processing
+### Extraction Pipeline
 
 **Phase 1 — Single Rule Sweep**
 All base words are processed against every GPU-compatible single rule in parallel. The Bloom filter (built from the entire target wordlist and uploaded once) allows near-zero-cost hit detection on-device using FNV-1a hashing with 4 independent hash functions. Results feed a `Counter` of rule → hit frequency.
+
+**Phase S — Built-in Numeric Seed Extraction**
+A dedicated extraction pass that runs the five built-in seed families (A–E) through the GPU chain kernel. This phase always runs, regardless of `--max-depth` and the random-chain time budget. Depth-1 seeds are skipped (already covered by Phase 1); all multi-rule seed chains at depths 2 and above are tested directly against the Bloom filter. The prebuilt seed families are then forwarded to Phase 2 as scaffolding atoms to avoid regeneration and double-counting. See [Built-in Seed Families](#-built-in-seed-families) for a full description.
 
 **Phase 2 — Informed Chain Generation**
 Using Phase 1 hit data, chains are generated with a bias toward rules that already demonstrated effectiveness:
@@ -221,7 +232,7 @@ Using Phase 1 hit data, chains are generated with a bias toward rules that alrea
 - **30%** of the budget extends known-good seed chains (`EXTENSION_RATIO = 0.3`)
 - **10%** is allocated to random exploration
 
-The remaining time budget (total `--target-hours` minus Phase 1 duration) is split evenly across requested depths. Seed rules from `--seed-rules` are extended to deeper depths automatically.
+The remaining time budget (total `--target-hours` minus Phase 1 + Phase S duration) is split evenly across requested depths. User seed rules from `--seed-rules` are extended to deeper depths automatically.
 
 ### Bloom Filter
 
@@ -230,6 +241,73 @@ The on-GPU Bloom filter uses FNV-1a hashing with two seeds (`0xDEADBEEF` and `0x
 ### VRAM Management
 
 Free VRAM is estimated as **55%** of total global memory (`VRAM_USAGE_FACTOR = 0.55`). All batch sizes, Bloom filter allocation, and chain budgets scale proportionally based on this estimate relative to an 8 GB baseline. Devices with fewer than 4 GB cap the Bloom filter at 32 MB; the batch floor prevents starvation on very constrained hardware.
+
+---
+
+## 🌱 Built-in Seed Families
+
+`rulest_v2.py` ships with five deterministically generated seed families (A–E) that are built unconditionally at startup and run as **Phase S** — a dedicated GPU extraction pass that sits between Phase 1 and Phase 2. This pass is fully independent of `--max-depth` and the random-chain time budget: numeric and date-pattern chains are always tested, even when `--max-depth 1` is specified.
+
+Depth-1 seeds (single-rule entries) are skipped in Phase S because Phase 1 already covers them. All multi-rule chains at depths 2 and above are submitted directly to the GPU chain kernel and checked against the Bloom filter. The prebuilt families are then forwarded to Phase 2 as scaffolding atoms so they can be used in chain extension without being re-tested or re-generated.
+
+### Family A — Pure Prepend
+
+Chains that prepend multi-digit numbers to a word by issuing one `^digit` operator per digit (right-to-left, so the number reads correctly). For example, prepending `12` produces the chain `^2 ^1`.
+
+- Depths covered: 1–4 (10, 100, 1 000, 10 000 chains respectively)
+- Example chains: `^0`, `^1 ^2`, `^9 ^8 ^7`, `^2 ^0 ^2 ^4`
+
+### Family B — Pure Append
+
+Chains that append multi-digit numbers to a word by issuing one `$digit` operator per digit (left-to-right). For example, appending `1990` produces `$1 $9 $9 $0`.
+
+- Depths covered: 1–4 (same counts as Family A)
+- Example chains: `$1`, `$1 $2`, `$1 $9 $9`, `$2 $0 $2 $4`
+
+### Family C — Mixed Prepend/Append
+
+All combinations of `^` and `$` operators with digits across every position. This covers patterns where numbers are split between prefix and suffix (e.g., `^1 $!` style numeric bookends).
+
+- Depths covered: 1–4
+- Total candidates: all `{^d, $d}^depth × digits^depth` combinations per depth
+
+### Family D — Transform + Digit/Bracket
+
+A single case-/position-transformation operator at position 1 (one of `l u c C t r d f E k K { } [ ]`), followed by 1–4 digit operators (`^d`, `$d`) or bracket operators (`[`, `]`).
+
+| Depth | Structure | Examples |
+|---|---|---|
+| 2 | transform + 1 op | `u $1`, `l ^7`, `c [`, `C ]` |
+| 3 | transform + 2 ops | `u ^1 $9`, `l $0 $8`, `c [ ]`, `t [ [` |
+| 4 | transform + 3 ops | `u ^1 $2 ^9`, `c [ ] [`, `l $0 $5 $2` |
+| 5 | transform + 4 ops | `u [ [ [ [`, `l ] ] ] ]`, `c [ ] [ ]`, `r ^1 $9 [ ]` |
+
+All candidates are validated by `HashcatRuleValidator` before being added. Depths 2–5 are covered (depth 5 is included so that up to four `[`/`]` operators can follow a transform).
+
+### Family E — Date Patterns
+
+Date-pattern chains that cover the most common numeric date formats found in real passwords, in both append and prepend orientations. The date ranges used are:
+
+- Days: `01`–`31`
+- Months: `01`–`12`
+- 2-digit years: `60`–`99` (1960s–1990s) and `00`–`30` (2000s–2030s)
+- 4-digit years: `1960`–`2030`
+
+| Format | Depth | Orientation |
+|---|---|---|
+| DDMM, MMDD, YYYY | 4 | append and prepend |
+| Transform + 4-digit date | 5 | transform variant of every depth-4 date |
+| DDMMYY, MMDDYY | 6 | append and prepend |
+| 2–4 brackets + 4-digit date | 6, 7, 8 | bracket-prefix append/prepend |
+| 1–2 brackets + 6-digit date | 7, 8 | bracket-prefix append/prepend |
+| DDMMYYYY, MMDDYYYY | 8 | append and prepend |
+| 1 bracket + 8-digit date | 9 | bracket-prefix append/prepend |
+
+**Transform variants** (depth 5) apply every transform operator from Family D as a leading rule before the 4-digit date chain, e.g., `u $1 $9 $9 $0`, `c ^0 ^9 ^9 ^1`.
+
+**Bracket-prefix variants** prepend 1–4 `[` or `]` operators before any date chain, allowing date extraction to succeed even when the base word has leading or trailing characters that need to be stripped.
+
+> The seed families are always built with `max_seed_depth=4` in Phase S (capped internally regardless of `--max-depth`), so the maximum seed depth tested is 4 for Families A–D and up to 9 for Family E (date formats).
 
 ---
 
@@ -317,7 +395,7 @@ These constants are defined at the top of `rulest_v2.py` and can be tuned for ad
 | `HOT_RULE_RATIO` | `0.6` | Fraction of Phase 2 chains biased toward hot rules |
 | `EXTENSION_RATIO` | `0.3` | Fraction of Phase 2 budget allocated to seed extension |
 | `TIME_SAFETY_FACTOR` | `0.9` | Multiplier applied to time-budget combo estimates |
-| `MAX_GPU_RULES` | `255` | Maximum operations allowed per rule chain |
+| `MAX_GPU_RULES` | `31` | Maximum operations allowed per rule chain |
 | `BASELINE_COMBOS_PER_SEC` | `120,000,000` | Estimated throughput on a capable GPU |
 | `LOW_END_COMBOS_PER_SEC` | `40,000,000` | Throughput fallback for devices with < 20 compute units |
 | `MAX_WORD_LEN` | `256` | Maximum word length accepted from wordlists |
