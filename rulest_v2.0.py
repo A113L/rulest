@@ -1537,7 +1537,8 @@ class GPUEngine:
 # --------------------------------------------------------------------
 class GPUExtractor:
     def __init__(self, base_count, target_count, max_depth, device_spec=None,
-                 target_hours=0.5, max_chains=None, seed_rules_file=None, bloom_mb=None):
+                 target_hours=0.5, max_chains=None, seed_rules_file=None, bloom_mb=None,
+                 builtin_seeds=True):
         self.base_count      = base_count
         self.target_count    = target_count
         self.max_depth       = max_depth
@@ -1545,6 +1546,7 @@ class GPUExtractor:
         self.max_chains      = max_chains
         self.seed_rules_file = seed_rules_file
         self.bloom_mb        = bloom_mb
+        self.builtin_seeds   = builtin_seeds
         self.params          = calculate_dynamic_parameters(
             base_count, target_count, None, target_hours, bloom_mb_override=bloom_mb)
         self.params['MAX_CHAIN_DEPTH'] = max_depth
@@ -1620,20 +1622,26 @@ class GPUExtractor:
         all_counts.update(single)
         log_debug(f"Phase 1 elapsed: {t1-t0:.1f}s")
 
-        # --- Phase S: Numeric Seed Extraction (always runs) ---
+        # --- Phase S: Numeric Seed Extraction (controlled by --no-builtin-seeds) ---
         # Build the numeric seed families and run them as a *dedicated direct
         # extraction pass* — independent of --max-depth and the random-chain
         # time budget.  Seeds up to depth 4 are always tested (depth-1 seeds
         # are skipped here since Phase 1 already covered them).
         # The prebuilt sbd is forwarded to Phase 2 to avoid regenerating the
         # families and re-running them through the chain kernel.
-        log_section("PHASE S — Numeric Seed Extraction")
-        sbd = self.gpu_engine.build_numeric_seed_families(max_depth=self.max_depth)
-        seed_hits = self.gpu_engine.run_seed_extraction_pass(
-            base_words, sbd, bloom_filter, rules_phase1)
-        all_counts.update(seed_hits)
-        ts     = time.time()
-        log_debug(f"Seed pass elapsed: {ts-t1:.1f}s")
+        if self.builtin_seeds:
+            log_section("PHASE S — Numeric Seed Extraction")
+            sbd = self.gpu_engine.build_numeric_seed_families(max_depth=self.max_depth)
+            seed_hits = self.gpu_engine.run_seed_extraction_pass(
+                base_words, sbd, bloom_filter, rules_phase1)
+            all_counts.update(seed_hits)
+            ts     = time.time()
+            log_debug(f"Seed pass elapsed: {ts-t1:.1f}s")
+        else:
+            log_info(f"[PS]   {yellow('Skipped')} — built-in numeric seed families disabled "
+                     f"(--no-builtin-seeds)")
+            sbd = {}
+            ts  = t1
 
         # --- Phase 2: random rule chains ---
         # all_seeds (user singles + chains) are forwarded so generate_informed_chains
@@ -1761,6 +1769,11 @@ def main() -> None:
     # ---- Misc ----------------------------------------------------
     ap.add_argument('--allow-reject-rules', action='store_true',
                     help='Allow rules that hashcat would reject (reject-class opcodes)')
+    ap.add_argument('--no-builtin-seeds', action='store_true',
+                    help='Disable the built-in numeric seed families (Phase S: '
+                         'pure prepend/append, mixed, transform+digit, date patterns). '
+                         'By default Phase S always runs; pass this flag to skip it '
+                         'and rely solely on Phase 1 atomic rules and Phase 2 random chains.')
     ap.add_argument('--debug',        action='store_true',
                     help='Enable verbose/debug output')
 
@@ -1797,6 +1810,8 @@ def main() -> None:
              f"bloom: {bold(str(args.bloom_mb or BLOOM_FILTER_MAX_MB))}MB  |  "
              f"sig_words: {bold(str(args.sig_words))}  "
              f"min_len: {bold(str(args.min_word_len))}")
+    _bs_status = red('DISABLED (--no-builtin-seeds)') if args.no_builtin_seeds else green('enabled')
+    log_info(f"  builtin seeds (Phase S) : {_bs_status}")
     if args.seed_rules:
         log_info(f"  seeds     : {bold(args.seed_rules)}  "
                  f"{dim('(singles -> Phase 1 + Phase 2 atoms | chains -> Phase 2 direct)')}")
@@ -1813,7 +1828,8 @@ def main() -> None:
     extractor = GPUExtractor(
         len(base_words), len(target_words), args.max_depth,
         args.device, args.target_hours, args.max_chains,
-        args.seed_rules, args.bloom_mb)
+        args.seed_rules, args.bloom_mb,
+        builtin_seeds=not args.no_builtin_seeds)
 
     depth_overrides = {f'depth{i}_override': getattr(args, f'depth{i}_chains')
                        for i in range(2, 11)}
