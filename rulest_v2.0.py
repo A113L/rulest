@@ -1346,14 +1346,16 @@ class GPUEngine:
         """
         Generate random chain candidates for Phase 2.
 
-        Built-in seed families (A–E) are built ONCE in Phase S
-        (build_numeric_seed_families → run_seed_extraction_pass) and must NOT
-        be re-submitted as GPU candidates here.  *prebuilt_sbd* carries those
-        families in; they are used exclusively as scaffolding atoms for random
-        chain extension — never added to the Phase 2 candidate list.
+        Chains are built entirely from atomic rules discovered in Phase 1
+        (valid / hot).  Seeds play no role here:
+          - Built-in seed families (A–E) are tested in Phase S only and are
+            never used as scaffolding or candidates in this phase.
+          - User-supplied single-rule seeds are already present in *valid*.
+          - User-supplied multi-rule seed chains are injected as direct
+            Phase 2 candidates but are NOT used as building blocks for
+            further chain extension.
 
-        User-supplied seed chains (*seed_chains*) that were not tested in
-        Phase S are still injected as direct Phase 2 candidates.
+        *prebuilt_sbd* is accepted for signature compatibility but ignored.
         """
         # Cap max_depth to hashcat limit
         max_depth = min(max_depth, MAX_HASHCAT_CHAIN)
@@ -1364,76 +1366,32 @@ class GPUEngine:
         # Phase 2 candidate set — starts with atomic rules only.
         chains  = set(valid)
 
-        # ── Built-in seed families ────────────────────────────────────────────
-        # Load prebuilt_sbd (always provided by extract_rules via Phase S).
-        # If somehow absent, use an empty scaffold and warn — seeds are not
-        # regenerated here; that would duplicate Phase S work.
-        if prebuilt_sbd is not None:
-            sbd = defaultdict(set, {d: set(v) for d, v in prebuilt_sbd.items()})
-            n_seeds = sum(len(v) for v in sbd.values())
-            log_debug(f"generate_informed_chains: prebuilt sbd loaded — "
-                      f"{n_seeds:,} seeds across {len(sbd)} depth(s), "
-                      f"used as scaffolding atoms only (not re-tested)")
-        else:
-            log_warn("generate_informed_chains: no prebuilt_sbd supplied — "
-                     "built-in seed families absent from scaffolding. "
-                     "Ensure Phase S ran before Phase 2.")
-            sbd = defaultdict(set)
-
-        # Freeze the entire built-in seed set so it can never be added back to
-        # the Phase 2 candidate list through the extension loops below.
-        builtin_seed_set: set = set()
-        for _ds in sbd.values():
-            builtin_seed_set.update(_ds)
-
-        # ── User-supplied seeds ───────────────────────────────────────────────
-        # Single-rule user seeds are already in *valid* (Phase 1 atoms).
-        # Multi-rule user seed chains were NOT tested in Phase S, so they ARE
-        # direct Phase 2 candidates.  All user seeds also serve as sbd atoms.
-        n_user_atoms   = 0
-        n_user_direct  = 0
+        # ── User-supplied multi-rule seed chains (direct candidates only) ─────
+        # Single-rule user seeds are already captured in *valid* above.
+        # Multi-rule chains are added directly as candidates; they are not
+        # used as building blocks for further extension.
+        n_user_direct = 0
         if seed_chains:
             for sc in seed_chains:
-                depth = sc.count(' ') + 1
-                sbd[depth].add(sc)
-                if depth >= 2:
-                    # multi-rule chain — direct Phase 2 candidate
+                if sc.count(' ') >= 1:      # depth >= 2
                     chains.add(sc)
                     n_user_direct += 1
-                else:
-                    n_user_atoms += 1
-            log_debug(f"User seeds in Phase 2: {n_user_atoms} atom(s) "
-                      f"+ {n_user_direct} direct chain candidate(s)")
+            if n_user_direct:
+                log_debug(f"User seed chains injected as Phase 2 candidates: "
+                          f"{n_user_direct}")
 
-        # ── Random chain extension ────────────────────────────────────────────
-        # Use sbd entries as *prev* atoms when extending to a new depth.
-        # Built-in seeds are excluded from entering chains via builtin_seed_set.
+        # ── Random chain extension (atomic rules only) ────────────────────────
+        # _gen_random_chains builds from *valid* / *hot* atoms exclusively.
         for depth in range(2, max_depth + 1):
             budget = self.params.get(f'CHAIN_GEN_LIMIT_{depth}', 0)
             if budget <= 0: continue
-            budget  = min(budget, len(valid) ** depth)
-            # new: seed-derived extensions that are not already in chains and
-            #      are not built-in seeds (those belong to Phase S only).
-            new     = set(sbd.get(depth, set())) - chains - builtin_seed_set
-            prev    = list(sbd.get(depth - 1, set()))
-            ext_tgt = int(budget * EXTENSION_RATIO)
-            att = 0
-            while len(new) < ext_tgt and att < ext_tgt * MAX_ATTEMPTS_MULTIPLIER:
-                att += 1
-                if prev:
-                    nc = random.choice(prev) + ' ' + random.choice(valid)
-                    if nc not in chains and nc not in new and nc not in builtin_seed_set:
-                        new.add(nc)
-            rem = budget - len(new)
-            if rem > 0:
-                new.update(self._gen_random_chains(depth, rem, valid, hot, chains, new))
+            budget = min(budget, len(valid) ** depth)
+            new    = self._gen_random_chains(depth, budget, valid, hot, chains, set())
             chains.update(new)
-            sbd[depth].update(new)
             log_debug(f"Depth {depth}: budget={budget:,}, generated={len(new):,}")
 
         log_debug(f"Total Phase 2 candidates: {len(chains):,}  "
-                  f"(atomic rules + user chains + random extensions; "
-                  f"built-in seeds excluded)")
+                  f"(atomic rules + user chains + random extensions)")
         return list(chains)
 
     def process_all_words_chain_rules(self, base_words, rules, max_depth,
@@ -1627,8 +1585,8 @@ class GPUExtractor:
         # extraction pass* — independent of --max-depth and the random-chain
         # time budget.  Seeds up to depth 4 are always tested (depth-1 seeds
         # are skipped here since Phase 1 already covered them).
-        # The prebuilt sbd is forwarded to Phase 2 to avoid regenerating the
-        # families and re-running them through the chain kernel.
+        # The prebuilt sbd is kept locally for reference but is not forwarded
+        # to Phase 2 — seeds are never used as scaffolding in chain generation.
         if self.builtin_seeds:
             log_section("PHASE S — Numeric Seed Extraction")
             sbd = self.gpu_engine.build_numeric_seed_families(max_depth=self.max_depth)
@@ -1644,9 +1602,8 @@ class GPUExtractor:
             ts  = t1
 
         # --- Phase 2: random rule chains ---
-        # all_seeds (user singles + chains) are forwarded so generate_informed_chains
-        # can use them as prioritised building blocks.  The numeric seed families
-        # (prebuilt_sbd) are passed so they are NOT regenerated or re-run.
+        # Phase 2 chains are built purely from atomic rules (Phase 1 output).
+        # Seeds are not used as scaffolding or building blocks here.
         if self.max_depth > 1:
             log_section("PHASE 2 — Rule Chain Search")
             remaining = max(0, self.params['TARGET_SECONDS'] - (ts-t0))
