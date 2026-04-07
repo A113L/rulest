@@ -14,6 +14,27 @@ Key feature: --sig-words / --min-word-len
   GPU hit-count is retained.  The final ruleset is written to a single file
   sorted by GPU frequency (descending, UTF-8).
 
+Phase S — Built-in Seed Families (A–I)
+  Nine seed families are always tested via a dedicated GPU chain-kernel pass,
+  independent of the random-chain time budget:
+
+  Numeric families
+    A  Pure Prepend digits           (depths 1–4)
+    B  Pure Append digits            (depths 1–4)
+    C  Mixed Prepend/Append digits   (depths 1–4)
+    D  Transform + digit/bracket     (depths 2–4)
+    E  Date patterns DDMM/YYYY/…     (depths 4–9)
+
+  Special-character families
+    F  Pure Append special chars     (depths 1–2, top-15 chars)
+    G  Pure Prepend special chars    (depths 1–2, top-15 chars)
+    H  Transform + special char      (depths 2–3, top-15 chars)
+    I  Digit(s) + special char       (depths 2–4, core-7 chars)
+       — covers the ubiquitous "word123!" / "!word123" patterns
+
+  Special chars — top-15 (F/G/H):  ! @ # $ % ^ & * ? . - _ + ( )
+  Special chars — core-7  (I):     ! @ # $ % * ?
+
 """
 
 import os
@@ -146,6 +167,13 @@ DEFAULT_MIN_WORD_LEN = 10   # minimum word length for probe words
 
 # Sentinel used in signatures when a rule contains unsupported opcodes
 _UNSUPPORTED_SENTINEL = object()
+
+# ── Special-character seed constants ────────────────────────────────────────
+# Ordered by real-world frequency of appearance as password suffix/prefix.
+SPECIAL_CHARS_TOP  = ['!', '@', '#', '$', '%', '^', '&', '*',
+                      '?', '.', '-', '_', '+', '(', ')']
+# Reduced "core" set used where combinatorial explosion must be limited.
+SPECIAL_CHARS_CORE = ['!', '@', '#', '$', '%', '*', '?']
 
 # ====================================================================
 # --- RULE EXCLUSION FILTER ---
@@ -1071,11 +1099,13 @@ class GPUEngine:
 
     def build_numeric_seed_families(self, max_depth: int = 4) -> dict:
         """
-        Build five numeric seed families for Phase S direct extraction.
+        Build nine seed families for Phase S direct extraction.
 
         Every family produces chains that are tested against the bloom filter
         individually via the GPU chain kernel — they are extraction candidates
         first, not only scaffolding for random chain generation.
+
+        ── Numeric families (A–E) ──────────────────────────────────────────
 
         Family A — Pure Prepend (depths 1–4)
             One ^digit op per digit, right-to-left so the number reads
@@ -1095,7 +1125,7 @@ class GPUEngine:
         Family D — Transform + Digit/Bracket (depths 2–4)
             A single case-/position-transformation op at position 1
             (l u c C t r d f E k K { } [ ]), followed by 1–3 digit ops
-            (^d, $d) or bracket ops ([ ]).  Depth 4 is the maximum now.
+            (^d, $d) or bracket ops ([ ]).  Depth 4 is the maximum.
             depth 2: transform + 1 op   e.g. "u $1", "l ^7", "c ["
             depth 3: transform + 2 ops  e.g. "u ^1 $9", "c [ ]", "t [ ["
             depth 4: transform + 3 ops  e.g. "u ^1 $2 ^9", "c [ ] ["
@@ -1114,6 +1144,51 @@ class GPUEngine:
             depth 8:  DDMMYYYY, MMDDYYYY        → append / prepend
             depth 9:  1 bracket  + 8-digit date  → bracket-prefix a/p
             (at most 4 bracket ops total)
+
+        ── Special-character families (F–I) ────────────────────────────────
+
+        Special chars used (by real-world frequency):
+            TOP  (15): ! @ # $ % ^ & * ? . - _ + ( )
+            CORE  (7): ! @ # $ % * ?   ← used where combos must stay bounded
+
+        Family F — Pure Append Special Chars (depths 1–2)
+            One or two $X ops for the top 15 special characters.
+            depth 1 : 15 chains  ($!, $@, ...)
+            depth 2 : up to 15² = 225 chains  ($! $!, $! $@, $1 $!, ...)
+
+        Family G — Pure Prepend Special Chars (depths 1–2)
+            One or two ^X ops (right-to-left order so the string reads
+            correctly).
+            depth 1 : 15 chains  (^!, ^@, ...)
+            depth 2 : up to 15² chains
+
+        Family H — Transform + Special Char (depths 2–3)
+            A single transform op followed by 1–2 special-char append/
+            prepend ops.  Uses the full top-15 set.
+            depth 2: 15 transforms × 30 ops   = 450 chains
+            depth 3: 15 transforms × 30² ops  = 13 500 chains
+
+        Family I — Number + Special Char Combos (depths 2–4)
+            The most common real-world suffix pattern: digits followed by
+            a special character (e.g. "password1!", "password123!").
+            Uses the CORE 7 special chars to keep depth-4 counts reasonable.
+            depth 2: 1 digit  + 1 special char → 10 × 7 = 70 chains (append)
+                                                  10 × 7 = 70 chains (prepend)
+            depth 3: 2 digits + 1 special char → 100 × 7 = 700 + 700 chains
+            depth 4: 3 digits + 1 special char → 1 000 × 7 = 7 000 + 7 000
+
+            Append orientation : $d₁ … $dₙ $sp  → word<digits><sp>
+            Prepend orientation: ^sp ^dₙ … ^d₁  → <sp><digits>word
+              (prepend ops are applied right-to-left so the final string
+               reads <digits><sp> as a prefix — no, see note below)
+
+            Note on prepend order in hashcat:
+              Each ^X prepends X on top of the current word.
+              To obtain "<sp><digits>word" the ops must be applied in reverse
+              reading order: last character prepended first, first character
+              prepended last.
+              e.g. to get "1!word" → apply ^! first → "!word", then ^1 → "1!word"
+              So the rule chain is: ^! ^1  (special char first, then digits)
 
         Parameters
         ----------
@@ -1168,7 +1243,7 @@ class GPUEngine:
             ['[', ']']
         )
         d_cnt: Dict[int, int] = defaultdict(int)
-        for depth in range(2, min(4, max_depth) + 1):          # <--- changed from 5 to 4
+        for depth in range(2, min(4, max_depth) + 1):
             for t_op in transform_ops:
                 for ops in itertools.product(t_digit_ops, repeat=depth - 1):
                     seed = f"{t_op} {' '.join(ops)}"
@@ -1253,23 +1328,105 @@ class GPUEngine:
                                 sbd[_new_depth].add(_chain)
                                 e_cnt[_new_depth] += 1
 
+        # ── Family F: Pure Append Special Chars ──────────────────────────
+        # depths 1–2  (capped by max_depth)
+        # Covers the 15 most commonly appended special characters in real
+        # passwords.  Depth 2 covers two-character suffixes (!!, !@, @!, …).
+        f_cnt: Dict[int, int] = defaultdict(int)
+        for depth in range(1, min(2, max_depth) + 1):
+            for combo in itertools.product(SPECIAL_CHARS_TOP, repeat=depth):
+                chain = ' '.join(f'${ch}' for ch in combo)
+                if HashcatRuleValidator.validate_rule_for_gpu(chain):
+                    sbd[depth].add(chain)
+                    f_cnt[depth] += 1
+
+        # ── Family G: Pure Prepend Special Chars ─────────────────────────
+        # depths 1–2  (capped by max_depth)
+        # Mirror of Family F but using the ^ (prepend) operator.
+        # right-to-left order so the final string reads left-to-right.
+        g_cnt: Dict[int, int] = defaultdict(int)
+        for depth in range(1, min(2, max_depth) + 1):
+            for combo in itertools.product(SPECIAL_CHARS_TOP, repeat=depth):
+                # e.g. prepend "!@" → "^@ ^!"  (@ applied first, ! on top)
+                chain = ' '.join(f'^{ch}' for ch in reversed(combo))
+                if HashcatRuleValidator.validate_rule_for_gpu(chain):
+                    sbd[depth].add(chain)
+                    g_cnt[depth] += 1
+
+        # ── Family H: Transform + Special Char (depths 2–3) ──────────────
+        # A single case-/position-transform op followed by 1–2 special-char
+        # append/prepend ops (both ^ and $, top-15 special chars each).
+        # depth 2: 15 transforms × 30 ops        =   450 seeds
+        # depth 3: 15 transforms × 30² ops        = 13 500 seeds
+        sp_ops_top = (
+            [f'${ch}' for ch in SPECIAL_CHARS_TOP] +
+            [f'^{ch}' for ch in SPECIAL_CHARS_TOP]
+        )
+        h_cnt: Dict[int, int] = defaultdict(int)
+        for depth in range(2, min(3, max_depth) + 1):
+            for t_op in transform_ops:
+                for ops in itertools.product(sp_ops_top, repeat=depth - 1):
+                    seed = f"{t_op} {' '.join(ops)}"
+                    if HashcatRuleValidator.validate_rule_for_gpu(seed):
+                        sbd[depth].add(seed)
+                        h_cnt[depth] += 1
+
+        # ── Family I: Number + Special Char Combos (depths 2–4) ──────────
+        # Real-world pattern: word followed by digits then a special char,
+        # e.g. "password1!", "password123!".
+        # Uses SPECIAL_CHARS_CORE (7 chars) to limit depth-4 cardinality.
+        #
+        # Append orientation:  $d₁ … $dₙ $sp  → word<digits><sp>
+        # Prepend orientation: ^sp ^dₙ … ^d₁  → <sp><digits>word
+        #   (each ^ prepends on top, so the last char prepended ends up first)
+        i_cnt: Dict[int, int] = defaultdict(int)
+        for depth in range(2, min(4, max_depth) + 1):
+            n_digits = depth - 1   # number of digit ops; 1 slot for the special char
+            for digit_combo in itertools.product(digits, repeat=n_digits):
+                for sp in SPECIAL_CHARS_CORE:
+                    # ---- Append: $d1 $d2 ... $sp  (e.g. "$1 $2 $3 $!")
+                    app = ' '.join(f'${d}' for d in digit_combo) + f' ${sp}'
+                    if HashcatRuleValidator.validate_rule_for_gpu(app):
+                        sbd[depth].add(app)
+                        i_cnt[depth] += 1
+                    # ---- Prepend: ^sp ^dn ... ^d1
+                    # Result: <sp><digits>word
+                    # e.g. to prepend "1!" → apply ^! first → "!word",
+                    #      then ^1 → "1!word", chain: "^! ^1"
+                    pre = f'^{sp} ' + ' '.join(f'^{d}' for d in reversed(digit_combo))
+                    if HashcatRuleValidator.validate_rule_for_gpu(pre):
+                        sbd[depth].add(pre)
+                        i_cnt[depth] += 1
+
         # ── Debug summary ─────────────────────────────────────────────────
         c_total = sum(20 ** d for d in range(1, min(4, max_depth) + 1))
-        log_debug(f"Numeric seeds  max_depth={max_depth}")
-        log_debug("  A (pure ^)     : " +
+        log_debug(f"Seed families  max_depth={max_depth}")
+        log_debug("  A (pure ^)          : " +
                   ", ".join(f"d{d}={a_cnt[d]:,}" for d in sorted(a_cnt)) +
                   f"  [{sum(a_cnt.values()):,} total]")
-        log_debug("  B (pure $)     : " +
+        log_debug("  B (pure $)          : " +
                   ", ".join(f"d{d}={b_cnt[d]:,}" for d in sorted(b_cnt)) +
                   f"  [{sum(b_cnt.values()):,} total]")
-        log_debug(f"  C (mixed ^/$)  : [{c_total:,} total]")
-        log_debug("  D (transform+) : " +
+        log_debug(f"  C (mixed ^/$)       : [{c_total:,} total]")
+        log_debug("  D (transform+digit) : " +
                   ", ".join(f"d{d}={d_cnt[d]:,}" for d in sorted(d_cnt)) +
                   f"  [{sum(d_cnt.values()):,} total]")
-        log_debug("  E (dates)      : " +
+        log_debug("  E (dates)           : " +
                   ", ".join(f"d{d}={e_cnt[d]:,}" for d in sorted(e_cnt)) +
                   f"  [{sum(e_cnt.values()):,} total]")
-        log_debug("  A∪B∪C∪D∪E     : " +
+        log_debug("  F (append special)  : " +
+                  ", ".join(f"d{d}={f_cnt[d]:,}" for d in sorted(f_cnt)) +
+                  f"  [{sum(f_cnt.values()):,} total]")
+        log_debug("  G (prepend special) : " +
+                  ", ".join(f"d{d}={g_cnt[d]:,}" for d in sorted(g_cnt)) +
+                  f"  [{sum(g_cnt.values()):,} total]")
+        log_debug("  H (transform+spec.) : " +
+                  ", ".join(f"d{d}={h_cnt[d]:,}" for d in sorted(h_cnt)) +
+                  f"  [{sum(h_cnt.values()):,} total]")
+        log_debug("  I (num+special)     : " +
+                  ", ".join(f"d{d}={i_cnt[d]:,}" for d in sorted(i_cnt)) +
+                  f"  [{sum(i_cnt.values()):,} total]")
+        log_debug("  A∪…∪I (all seeds)   : " +
                   ", ".join(f"d{d}={len(sbd[d]):,}" for d in sorted(sbd)) +
                   f"  [{sum(len(v) for v in sbd.values()):,} total]")
         return dict(sbd)
@@ -1588,7 +1745,7 @@ class GPUExtractor:
         # The prebuilt sbd is kept locally for reference but is not forwarded
         # to Phase 2 — seeds are never used as scaffolding in chain generation.
         if self.builtin_seeds:
-            log_section("PHASE S — Numeric Seed Extraction")
+            log_section("PHASE S — Seed Extraction (numeric + special-char families A–I)")
             sbd = self.gpu_engine.build_numeric_seed_families(max_depth=self.max_depth)
             seed_hits = self.gpu_engine.run_seed_extraction_pass(
                 base_words, sbd, bloom_filter, rules_phase1)
@@ -1727,8 +1884,10 @@ def main() -> None:
     ap.add_argument('--allow-reject-rules', action='store_true',
                     help='Allow rules that hashcat would reject (reject-class opcodes)')
     ap.add_argument('--no-builtin-seeds', action='store_true',
-                    help='Disable the built-in numeric seed families (Phase S: '
-                         'pure prepend/append, mixed, transform+digit, date patterns). '
+                    help='Disable the built-in seed families (Phase S: '
+                         'pure prepend/append, mixed, transform+digit, date patterns, '
+                         'and special-char families F–I: append/prepend special chars, '
+                         'transform+special, number+special combos). '
                          'By default Phase S always runs; pass this flag to skip it '
                          'and rely solely on Phase 1 atomic rules and Phase 2 random chains.')
     ap.add_argument('--debug',        action='store_true',
@@ -1767,7 +1926,7 @@ def main() -> None:
              f"bloom: {bold(str(args.bloom_mb or BLOOM_FILTER_MAX_MB))}MB  |  "
              f"sig_words: {bold(str(args.sig_words))}  "
              f"min_len: {bold(str(args.min_word_len))}")
-    _bs_status = red('DISABLED (--no-builtin-seeds)') if args.no_builtin_seeds else green('enabled')
+    _bs_status = red('DISABLED (--no-builtin-seeds)') if args.no_builtin_seeds else green('enabled (families A–I)')
     log_info(f"  builtin seeds (Phase S) : {_bs_status}")
     if args.seed_rules:
         log_info(f"  seeds     : {bold(args.seed_rules)}  "
