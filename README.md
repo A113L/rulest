@@ -657,7 +657,22 @@ python rulest_v2.py rockyou.txt target.txt -d 3 --target-hours 1.0 \
 python rulest_v2.py rockyou.txt target.txt -d 5 --target-hours 4.0 \
   --seed-rules pass2.txt -o pass3_final.txt
 ```
+**Skip built-in seed families (Phase S disabled):**
+```bash
+# Faster run when you supply all seeds yourself and don't need families A–M
+python rulest_v2.py base.txt target.txt -d 3 --target-hours 1.0 \
+  --seed-rules my_seeds.txt \
+  --no-builtin-seeds \
+  -o no_phase_s.txt
+```
  
+**Benchmark Phase S contribution:**
+```bash
+# With built-in seeds (default — families A–M)
+python rulest_v2.py base.txt target.txt -d 2 -o with_seeds.txt
+ 
+# Without built-in seeds — compare output sizes to measure Phase S value
+python rulest_v2.py base.txt target.txt -d 2 --no-builtin-seeds -o without_seeds.txt 
 ---
  
 ## 📝 License
