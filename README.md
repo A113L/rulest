@@ -5,16 +5,16 @@
 ---
  
 ## 📋 Table of Contents
-
+ 
 - [Overview](#-overview)
 - [Scripts](#-scripts)
   - [rulest.py — v1 (BFS, Legacy)](#rulestpy--v1-bfs-legacy)
-  - [rulest_v2.py — v2 (Recommended)](#rulest_v2py--v2-recommended)
+  - [rulest\_v2.py — v2 (Recommended)](#rulest_v2py--v2-recommended)
 - [Why v2 Supersedes v1](#-why-v2-supersedes-v1)
 - [Requirements](#-requirements)
 - [Installation](#-installation)
 - [Usage](#-usage)
-  - [rulest_v2.py — Full Reference](#rulest_v2py--full-reference)
+  - [rulest\_v2.py — Full Reference](#rulest_v2py--full-reference)
 - [Architecture (v2)](#-architecture-v2)
   - [Extraction Pipeline](#extraction-pipeline)
 - [Built-in Seed Families (A–M)](#-built-in-seed-families)
@@ -63,7 +63,7 @@ A complete redesign built around GPU efficiency, Hashcat compatibility, and inte
 - ✅ Full **Hashcat GPU rule validation** (max 31 ops, correct argument types)
 - ✅ **Bloom filter** on-GPU for fast membership testing with configurable false-positive rate
 - ✅ **Three-phase extraction**: single-rule sweep (Phase 1) → built-in seed pass (Phase S) → informed chain generation (Phase 2)
-- ✅ **Built-in seed families** (A–M): thirteen deterministically generated seed families covering numeric prefixes/suffixes, mixed prepend/append, transform+digit combos, date patterns, special-character append/prepend/transform/combo patterns, leet substitutions, double-transform chains, special-before-digit patterns, and leet+transform combos — run by default as a dedicated extraction pass, independent of `--max-depth` and the random-chain time budget
+- ✅ **Built-in seed families** (A–M): thirteen deterministically generated seed families covering numeric prefixes/suffixes, mixed prepend/append, transform+digit combos, date patterns, special-character append/prepend/transform/combo patterns, leet substitutions, double-transform chains, special-before-digit patterns, and leet+transform combos — run by default as a dedicated extraction pass, independent of `--max-depth` and the random-chain time budget; can be skipped with `--no-builtin-seeds`
 - ✅ **Signature-based functional minimization**: removes functionally equivalent rules post-GPU using a deterministic probe set, keeping only the highest-frequency representative per equivalence class
 - ✅ **Dynamic VRAM-aware** batch and budget sizing (scales with available VRAM; baseline 8 GB)
 - ✅ **Hot-rule biased** chain generation using Phase 1 results (60% hot-rule bias, configurable via `HOT_RULE_RATIO`)
@@ -168,6 +168,7 @@ usage: rulest_v2.py [options] base_wordlist target_wordlist
 | `--depth4-chains` through `--depth10-chains` | dynamic | Per-depth overrides up to depth 10 |
 | `--bloom-mb` | dynamic | Override Bloom filter size (MB); 0 = auto-scale |
 | `--allow-reject-rules` | off | Include rejection rules (normally excluded as GPU-incompatible) |
+| `--no-builtin-seeds` | off | Disable the built-in seed families (Phase S). By default Phase S always runs; pass this flag to skip it entirely and rely solely on Phase 1 atomic rules and Phase 2 random chains. Useful for faster runs or when supplying all seeds via `--seed-rules`. Skips all thirteen families (A–M): numeric, date-pattern, special-character, leet substitution, double-transform, special-before-digit, and leet+transform. |
 | `--debug` | off | Enable verbose output (sets `VERBOSE = True` at runtime) |
  
 #### Legacy v1 Reference
@@ -222,7 +223,7 @@ usage: rulest.py -w WORDLIST [-b BASE_WORDLIST] [-d CHAIN_DEPTH]
 All base words are processed against every GPU-compatible single rule in parallel. The Bloom filter (built from the entire target wordlist and uploaded once) allows near-zero-cost hit detection on-device using FNV-1a hashing with 4 independent hash functions. Results feed a `Counter` of rule → hit frequency.
  
 **Phase S — Built-in Seed Extraction**
-A dedicated extraction pass that runs the thirteen built-in seed families (A–M) through the GPU chain kernel. This phase runs by default, regardless of `--max-depth` and the random-chain time budget. Depth-1 seeds are skipped (already covered by Phase 1); all multi-rule seed chains at depths 2 and above are tested directly against the Bloom filter. The prebuilt seed families are then forwarded to Phase 2 as scaffolding atoms to avoid regeneration and double-counting. See [Built-in Seed Families (A–M)](#-built-in-seed-families) for a full description.
+A dedicated extraction pass that runs the thirteen built-in seed families (A–M) through the GPU chain kernel. This phase runs by default, regardless of `--max-depth` and the random-chain time budget; it can be disabled with `--no-builtin-seeds`. Depth-1 seeds are skipped (already covered by Phase 1); all multi-rule seed chains at depths 2 and above are tested directly against the Bloom filter. The prebuilt seed families are then forwarded to Phase 2 as scaffolding atoms to avoid regeneration and double-counting. See [Built-in Seed Families (A–M)](#-built-in-seed-families) for a full description.
  
 **Phase 2 — Informed Chain Generation**
 Using Phase 1 hit data, chains are generated with a bias toward rules that already demonstrated effectiveness:
@@ -434,12 +435,12 @@ Every leet substitution op paired with every structural transform op in both ord
 | D | Transform + digit/bracket | v2 | ~167 000 |
 | E | Date patterns | v2 | ~varies |
 | F | Append special chars | v2 | 3 600 |
-| G | Prepend special chars | v2 | 3 600 |
+| G | Prepend special chars | v2| 3 600 |
 | H | Transform + special char | v2 | 13 950 |
 | I | Digit(s) + special char | v2 | 15 540 |
 | J | Leet substitutions | v2 | ~520 |
 | K | Double-transform | v2 | 225 |
-| L | Special-before-digit | v2 | 1 540 |
+| L | Special-before-digit |v2 | 1 540 |
 | M | Leet + transform | v2 | ~300 |
  
 ---
@@ -664,7 +665,6 @@ python rulest_v2.py rockyou.txt target.txt -d 5 --target-hours 4.0 \
 MIT
  
 ## Credits
-
  
 MIT
  
