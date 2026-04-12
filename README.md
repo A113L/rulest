@@ -5,19 +5,19 @@
 ---
  
 ## 📋 Table of Contents
- 
+
 - [Overview](#-overview)
 - [Scripts](#-scripts)
-  - [rulest.py — v1 (BFS, Legacy)](#rulestypy--v1-bfs-legacy)
-  - [rulest\_v2.py — v2 (Recommended)](#rulest_v2py--v2-recommended)
+  - [rulest.py — v1 (BFS, Legacy)](#rulestpy--v1-bfs-legacy)
+  - [rulest_v2.py — v2 (Recommended)](#rulest_v2py--v2-recommended)
 - [Why v2 Supersedes v1](#-why-v2-supersedes-v1)
 - [Requirements](#-requirements)
 - [Installation](#-installation)
 - [Usage](#-usage)
-  - [rulest\_v2.py — Full Reference](#rulest_v2py--full-reference)
+  - [rulest_v2.py — Full Reference](#rulest_v2py--full-reference)
 - [Architecture (v2)](#-architecture-v2)
   - [Extraction Pipeline](#extraction-pipeline)
-- [Built-in Seed Families](#-built-in-seed-families)
+- [Built-in Seed Families (A–M)](#-built-in-seed-families)
 - [Functional Minimization](#-functional-minimization)
 - [Rule Categories](#-rule-categories)
 - [GPU Command Support](#-gpu-command-support)
@@ -63,7 +63,7 @@ A complete redesign built around GPU efficiency, Hashcat compatibility, and inte
 - ✅ Full **Hashcat GPU rule validation** (max 31 ops, correct argument types)
 - ✅ **Bloom filter** on-GPU for fast membership testing with configurable false-positive rate
 - ✅ **Three-phase extraction**: single-rule sweep (Phase 1) → built-in seed pass (Phase S) → informed chain generation (Phase 2)
-- ✅ **Built-in seed families** (A–I): nine deterministically generated seed families covering numeric prefixes/suffixes, mixed prepend/append, transform+digit combos, date patterns, and special-character append/prepend/transform/combo patterns — run by default as a dedicated extraction pass, independent of `--max-depth` and the random-chain time budget; can be skipped with `--no-builtin-seeds`
+- ✅ **Built-in seed families** (A–M): thirteen deterministically generated seed families covering numeric prefixes/suffixes, mixed prepend/append, transform+digit combos, date patterns, special-character append/prepend/transform/combo patterns, leet substitutions, double-transform chains, special-before-digit patterns, and leet+transform combos — run by default as a dedicated extraction pass, independent of `--max-depth` and the random-chain time budget
 - ✅ **Signature-based functional minimization**: removes functionally equivalent rules post-GPU using a deterministic probe set, keeping only the highest-frequency representative per equivalence class
 - ✅ **Dynamic VRAM-aware** batch and budget sizing (scales with available VRAM; baseline 8 GB)
 - ✅ **Hot-rule biased** chain generation using Phase 1 results (60% hot-rule bias, configurable via `HOT_RULE_RATIO`)
@@ -83,9 +83,9 @@ A complete redesign built around GPU efficiency, Hashcat compatibility, and inte
 |---|---|---|
 | **Rule validation** | None — invalid rules passed to Hashcat | Full `HashcatRuleValidator` against GPU spec (max 31 ops) |
 | **Functional minimization** | ❌ Not implemented | ✅ Signature-based deduplication via `minimize_by_signature`; removes 20–60% of raw candidates |
-| **Rule set size** | ~2,700 static rules | 5,000+ GPU-validated Hashcat single rules across 9 categories |
+| **Rule set size** | ~2,700 static rules | 5,600+ GPU-validated Hashcat single rules across 9 categories |
 | **Search strategy** | Naive BFS — every rule applied blindly | Phase 1 single-rule sweep → Phase S built-in seed extraction → Phase 2 hot-biased chain generation |
-| **Built-in seed families** | ❌ Not implemented | ✅ Nine families (A–I): numeric prepend/append, mixed, transform+digit, date patterns, special-char append/prepend/transform/combo; run by default as a dedicated pass independent of `--max-depth`; disable with `--no-builtin-seeds` |
+| **Built-in seed families** | ❌ Not implemented | ✅ Thirteen families (A–M): numeric prepend/append, mixed, transform+digit, date patterns, special-char append/prepend/transform/combo (F–I), leet substitutions (J), double-transform chains (K), special-before-digit (L), leet+transform (M); run by default as a dedicated pass independent of `--max-depth`; disable with `--no-builtin-seeds` |
 | **Target lookup** | Python `set` (host RAM, per-result) | 16–256 MB Bloom filter uploaded once to GPU VRAM (FNV-1a, 4 hash functions) |
 | **Chain state** | Temp `.tmp` files on disk per depth | In-memory, GPU buffer-based with proper release and `gc.collect()` |
 | **Memory management** | Halve batch on OOM, no VRAM awareness | Dynamic sizing based on actual free VRAM estimate + 55% usage safety factor |
@@ -156,7 +156,7 @@ usage: rulest_v2.py [options] base_wordlist target_wordlist
  
 | Flag | Default | Description |
 |---|---|---|
-| `-d`, `--max-depth` | `2` | Maximum rule chain depth (1–31; depths >31 capped with a warning) |
+| `--max-depth` | `2` | Maximum rule chain depth (1–31; depths >31 capped with a warning) |
 | `-o`, `--output` | `rulest_output.txt` | Output file path |
 | `--max-chains` | unlimited | Hard cap on total chains generated |
 | `--target-hours` | `0.5` | Time budget in hours; controls chain generation budget |
@@ -167,10 +167,7 @@ usage: rulest_v2.py [options] base_wordlist target_wordlist
 | `--depth3-chains` | dynamic | Override chain generation limit for depth 3 |
 | `--depth4-chains` through `--depth10-chains` | dynamic | Per-depth overrides up to depth 10 |
 | `--bloom-mb` | dynamic | Override Bloom filter size (MB); 0 = auto-scale |
-| `--sig-words` | `21` | Number of probe words used for functional deduplication (see [Functional Minimization](#-functional-minimization)) |
-| `--min-word-len` | `10` | Minimum character length for probe words used in signature computation |
 | `--allow-reject-rules` | off | Include rejection rules (normally excluded as GPU-incompatible) |
-| `--no-builtin-seeds` | off | Disable the built-in seed families (Phase S). By default Phase S always runs; pass this flag to skip it entirely and rely solely on Phase 1 atomic rules and Phase 2 random chains. Useful when you want faster runs or are supplying all seeds via `--seed-rules`. Skips all nine families (A–I): numeric, date-pattern, and special-character. |
 | `--debug` | off | Enable verbose output (sets `VERBOSE = True` at runtime) |
  
 #### Legacy v1 Reference
@@ -206,9 +203,8 @@ usage: rulest.py -w WORDLIST [-b BASE_WORDLIST] [-d CHAIN_DEPTH]
 │  │   single rules)                               │  │
 │  │                                               │  │
 │  │  Phase S ────────▶  Built-in seed families   │  │
-│  │  (Families A–I;      direct extraction pass,  │  │
+│  │  (Families A–M;      direct extraction pass,  │  │
 │  │   default on;        depth 2–9 seeds;         │  │
-│  │   --no-builtin-seeds to skip)                 │  │
 │  │                                               │  │
 │  │  Phase 2 ────────▶  Informed chain generation │  │
 │  │  (hot-biased,        + seed extension         │  │
@@ -226,7 +222,7 @@ usage: rulest.py -w WORDLIST [-b BASE_WORDLIST] [-d CHAIN_DEPTH]
 All base words are processed against every GPU-compatible single rule in parallel. The Bloom filter (built from the entire target wordlist and uploaded once) allows near-zero-cost hit detection on-device using FNV-1a hashing with 4 independent hash functions. Results feed a `Counter` of rule → hit frequency.
  
 **Phase S — Built-in Seed Extraction**
-A dedicated extraction pass that runs the nine built-in seed families (A–I) through the GPU chain kernel. This phase runs by default, regardless of `--max-depth` and the random-chain time budget; it can be disabled with `--no-builtin-seeds`. Depth-1 seeds are skipped (already covered by Phase 1); all multi-rule seed chains at depths 2 and above are tested directly against the Bloom filter. The prebuilt seed families are then forwarded to Phase 2 as scaffolding atoms to avoid regeneration and double-counting. See [Built-in Seed Families](#-built-in-seed-families) for a full description.
+A dedicated extraction pass that runs the thirteen built-in seed families (A–M) through the GPU chain kernel. This phase runs by default, regardless of `--max-depth` and the random-chain time budget. Depth-1 seeds are skipped (already covered by Phase 1); all multi-rule seed chains at depths 2 and above are tested directly against the Bloom filter. The prebuilt seed families are then forwarded to Phase 2 as scaffolding atoms to avoid regeneration and double-counting. See [Built-in Seed Families (A–M)](#-built-in-seed-families) for a full description.
  
 **Phase 2 — Informed Chain Generation**
 Using Phase 1 hit data, chains are generated with a bias toward rules that already demonstrated effectiveness:
@@ -246,9 +242,9 @@ Free VRAM is estimated as **55%** of total global memory (`VRAM_USAGE_FACTOR = 0
  
 ---
  
-## 🌱 Built-in Seed Families
+## 🌱 Built-in Seed Families (A–M)
  
-`rulest_v2.py` ships with nine deterministically generated seed families (A–I) that are built at startup and run as **Phase S** — a dedicated GPU extraction pass that sits between Phase 1 and Phase 2. This pass runs by default and is fully independent of `--max-depth` and the random-chain time budget: numeric, date-pattern, and special-character chains are tested even when `--max-depth 1` is specified. To skip Phase S entirely, pass `--no-builtin-seeds`; this is useful for faster runs when you are supplying all seeds yourself via `--seed-rules` or when benchmarking the contribution of the built-in families.
+`rulest_v2.py` ships with thirteen deterministically generated seed families (A–M) that are built at startup and run as **Phase S** — a dedicated GPU extraction pass that sits between Phase 1 and Phase 2. This pass runs by default and is fully independent of `--max-depth` and the random-chain time budget: numeric, date-pattern, special-character, leet-substitution, and transform chains are tested even when `--max-depth 1` is specified. To skip Phase S entirely, pass `--no-builtin-seeds`; this is useful for faster runs when you are supplying all seeds yourself via `--seed-rules` or when benchmarking the contribution of the built-in families.
  
 Depth-1 seeds (single-rule entries) are skipped in Phase S because Phase 1 already covers them. All multi-rule chains at depths 2 and above are submitted directly to the GPU chain kernel and checked against the Bloom filter. The prebuilt families are then forwarded to Phase 2 as scaffolding atoms so they can be used in chain extension without being re-tested or re-generated.
  
@@ -309,23 +305,25 @@ Date-pattern chains that cover the most common numeric date formats found in rea
  
 **Bracket-prefix variants** prepend 1–4 `[` or `]` operators before any date chain, allowing date extraction to succeed even when the base word has leading or trailing characters that need to be stripped.
  
-> The seed families are always built with `max_seed_depth=4` in Phase S (capped internally regardless of `--max-depth`), so the maximum seed depth tested is 4 for Families A–D and F–I, and up to 9 for Family E (date formats).
+> The seed families are always built with `max_seed_depth=4` in Phase S (capped internally regardless of `--max-depth`), so the maximum seed depth tested is 4 for Families A–D and F–M, and up to 9 for Family E (date formats).
  
 ### Family F — Pure Append Special Chars
  
-Chains that append one or two special characters from the top-15 set to a word using `$char` operators.
+Chains that append one, two, or three special characters from the top-15 set to a word using `$char` operators. Depth 3 was added in v2.1 to cover three-char suffixes such as `!!!` or `!@#` that appear in older forced-complexity passwords.
  
-- Depths covered: 1–2
+- Depths covered: 1–3
 - Special chars: `! @ # $ % ^ & * ? . - _ + ( )`
-- Example chains: `$!`, `$@`, `$! $1` (depth-2 combos with digits handled by Family I)
+- Seed counts: 15 (d1) · 225 (d2) · 3 375 (d3)
+- Example chains: `$!`, `$@ $#`, `$! $! $!`, `$! $@ $#`
  
 ### Family G — Pure Prepend Special Chars
  
-Chains that prepend one or two special characters from the top-15 set to a word using `^char` operators.
+Chains that prepend one, two, or three special characters from the top-15 set to a word using `^char` operators (right-to-left order so the final string reads left-to-right). Depth 3 mirrors the Family F extension.
  
-- Depths covered: 1–2
+- Depths covered: 1–3
 - Special chars: `! @ # $ % ^ & * ? . - _ + ( )`
-- Example chains: `^!`, `^@`, `^! ^@`
+- Seed counts: 15 (d1) · 225 (d2) · 3 375 (d3)
+- Example chains: `^!`, `^@ ^!`, `^# ^@ ^!`
  
 ### Family H — Transform + Special Char
  
@@ -338,15 +336,111 @@ A single case-/position-transformation operator followed by one or two special-c
  
 ### Family I — Digit(s) + Special Char
  
-Chains combining one or more digit operators with a special character from the core-7 set. Covers the ubiquitous `word123!` / `!word123` patterns.
+Chains combining one or more digit operators with a special character from the core-7 set. Covers the ubiquitous `word123!` / `!word123` patterns — digits first, special char last.
  
 - Depths covered: 2–4
 - Core-7 special chars: `! @ # $ % * ?`
-- Example chains: `$1 $!`, `^! $1 $2`, `$1 $2 $3 $!`, `^@ ^1 ^2 ^3`
+- Example chains: `$1 $!`, `^! ^1`, `$1 $2 $3 $!`, `^@ ^3 ^2 ^1`
+ 
+### Family J — Leet Substitutions
+ 
+The ten most common character→character leet-speak substitutions used in real passwords, applied as `sXY` opcode rules.
+ 
+**Core leet pairs** (ordered by real-world frequency):
+ 
+| Rule | Substitution | Example |
+|---|---|---|
+| `sa@` | a → @ | `password` → `p@ssword` |
+| `se3` | e → 3 | `secret` → `s3cr3t` |
+| `so0` | o → 0 | `football` → `f00tball` |
+| `si1` | i → 1 | `login` → `log1n` |
+| `sl1` | l → 1 | `leet` → `1eet` |
+| `ss5` | s → 5 | `pass` → `pa55` |
+| `ss$` | s → $ | `pass` → `pa$$` |
+| `st7` | t → 7 | `test` → `7es7` |
+| `sa4` | a → 4 | `admin` → `4dmin` |
+| `si!` | i → ! | `bitcoin` → `b!tco!n` |
+ 
+**Depth breakdown:**
+- **Depth 1 (~10 seeds):** Pure substitution. These are also seen in Phase 1 as atomic rules; explicit seeding guarantees they are never missed.
+- **Depth 2a (~340 seeds):** Each leet op combined with one digit or special-char append/prepend. Catches `p@ssword1`, `p@ssword!`, `1p@ssword`, etc.
+- **Depth 2b (~90 seeds):** Two distinct leet ops chained. Catches multi-substitution passwords like `p@ssw0rd` (= `sa@` + `so0`) and `s3cur1ty` (= `se3` + `si1`), which previously relied on random Phase 2 discovery.
+ 
+### Family K — Double-Transform Chains
+ 
+All ordered pairs of pure structural transformation operators (no digit or special-char appends). None of these chains are generated by any other family — Family D always pairs a transform with a digit or bracket op, never with a second transform — so Family K adds entirely new coverage.
+ 
+- Depth covered: 2 only
+- Seed count: 15 × 15 = **225 chains**
+- Transform ops: `l u c C t r d f E k K { } [ ]`
+ 
+| Example chain | Effect |
+|---|---|
+| `c r` | Capitalize then reverse → `"password"` → `"drowssaP"` |
+| `u d` | Uppercase then duplicate → `"abc"` → `"ABCABC"` |
+| `t f` | Toggle case then fold → `"Hello"` → `"hELLOolleh"` |
+| `E l` | Title-case then lowercase (no-op on plain words; meaningful after prior transforms) |
+| `l ]` | Lowercase then drop last char |
+| `c {` | Capitalize then rotate left |
+ 
+### Family L — Special-before-Digit Patterns
+ 
+The reverse orientation of Family I. Family I covers `word<digits><sp>` (digits first, then special char). Family L covers `word<sp><digits>` (special char first, then digits) — patterns like `word!12` and `!12word`.
+ 
+- Depths covered: 2–3
+- Core-7 special chars: `! @ # $ % * ?`
+- Append orientation: `$sp $d₁ … $dₙ` → `word!12`
+- Prepend orientation: `^dₙ … ^d₁ ^sp` → `12!word`
+ 
+| Depth | Seeds | Orientation | Example |
+|---|---|---|---|
+| 2 | 70 append + 70 prepend = **140** | 7 sp × 10 d | `$! $1`, `^1 ^!` |
+| 3 | 700 append + 700 prepend = **1 400** | 7 sp × 100 dd | `$! $1 $2`, `^2 ^1 ^!` |
+ 
+> **Prepend ordering note:** to produce `12!word`, hashcat prepend ops are applied right-to-left. The chain `^2 ^1 ^!` reads: first prepend `!` → `!word`, then `1` → `1!word`, then `2` → `12!word`. Family L constructs chains accordingly.
+ 
+### Family M — Leet + Transform Chains
+ 
+Every leet substitution op paired with every structural transform op in both orderings. This closes the gap between leet-only (Family J) and transform-only (Family K) chains, covering patterns where a word is both transformed in case/structure *and* leet-substituted.
+ 
+- Depth covered: 2 only
+- Seed count: 10 leet × 15 transforms × 2 orderings = **300 chains** (≈280–295 unique after dedup)
+ 
+| Chain | Effect | Example |
+|---|---|---|
+| `sa@ c` | leet then capitalize | `password` → `p@ssword` → `P@ssword` |
+| `c sa@` | capitalize then leet | `password` → `Password` → `P@ssword` |
+| `so0 u` | leet then uppercase | `password` → `passw0rd` → `PASSW0RD` |
+| `u sa@` | uppercase then leet | `password` → `PASSWORD` → `PASSWORD`* |
+| `sl1 r` | leet then reverse | `leet` → `1eet` → `tee1` |
+ 
+> \* `u sa@` on a word with no remaining lowercase `a` after uppercasing is a no-op for the substitution step — this is correct hashcat behavior and is handled transparently.
+ 
+---
  
 > **Special-character sets:**  
 > Top-15 (Families F/G/H): `! @ # $ % ^ & * ? . - _ + ( )`  
-> Core-7 (Family I): `! @ # $ % * ?`
+> Core-7 (Families I/L): `! @ # $ % * ?`
+ 
+---
+ 
+### Phase S seed count summary (at `--max-depth 4`)
+ 
+| Family | Description | New in | Approx. seeds (d≥2) |
+|---|---|---|---|
+| A | Pure prepend digits | v1 | 11 100 |
+| B | Pure append digits | v1 | 11 100 |
+| C | Mixed prepend/append | v1 | ~168 000 |
+| D | Transform + digit/bracket | v1 | ~167 000 |
+| E | Date patterns | v1 | ~varies |
+| F | Append special chars | v1 → depth 3 added v2.1 | 3 600 |
+| G | Prepend special chars | v1 → depth 3 added v2.1 | 3 600 |
+| H | Transform + special char | v1 | 13 950 |
+| I | Digit(s) + special char | v1 | 15 540 |
+| J | Leet substitutions | **v2.1** | ~520 |
+| K | Double-transform | **v2.1** | 225 |
+| L | Special-before-digit | **v2.1** | 1 540 |
+| M | Leet + transform | **v2.1** | ~300 |
  
 ---
  
@@ -356,7 +450,7 @@ After GPU extraction, `rulest_v2.py` applies a **signature-based functional mini
  
 ### Algorithm
  
-1. **Build a probe set.** A fixed set of `--sig-words` words (default: 21) is sampled deterministically from the base wordlist, preferring words of length ≥ `--min-word-len` (default: 10). The selection uses a fixed random seed so results are reproducible across runs. If fewer long words are available than requested, shorter words are used to fill the set (with a warning).
+1. **Use the built-in probe set.** A fixed, hand-curated set of probe words is always used (no external file or CLI flag required). The set is designed to exercise every class of hashcat opcode: very short words (edge cases for `k`, `K`, `{`, `}`, `[`, `]`), short alphanumeric base words, typical password base words of lengths 7–9, longer words for truncation and repeat ops, mixed-case words, words with embedded digits, words with special characters, words with repeated characters, and dedicated leet-substitution targets (`master`, `leet`, `elite`, `access`). Because the probe set is deterministic and ships with the script, minimization results are fully reproducible across runs with no configuration needed.
  
 2. **Compute each rule's signature.** Every candidate rule (or chain) is applied to every probe word using a pure-Python interpreter (`py_apply_chain`). The signature is the resulting tuple of transformed strings — one per probe word. Rules containing opcodes that cannot be emulated in Python are assigned the sentinel signature `('__UNSUPPORTED__',)` and are bucketed together.
  
@@ -364,7 +458,7 @@ After GPU extraction, `rulest_v2.py` applies a **signature-based functional mini
  
 4. **Select the best representative.** Within each signature group, the rule with the **highest GPU hit-count** is kept. Ties are broken by preferring shorter chain depth, then lexicographic order.
  
-5. **Write the minimized ruleset.** Surviving rules are written to the output file sorted by GPU frequency (descending). The file header records the number of probe words, the minimum word length, and how many equivalent rules were removed.
+5. **Write the minimized ruleset.** Surviving rules are written to the output file sorted by GPU frequency (descending). The file header records the probe word count and how many equivalent rules were removed.
  
 ### Why It Matters
  
@@ -372,16 +466,23 @@ GPU Bloom filter screening (Phase 1 & 2) can yield thousands of candidates where
  
 Minimization typically removes **20–60% of raw candidates** depending on chain depth and wordlist diversity, leaving a tighter, faster ruleset with no reduction in theoretical coverage.
  
-### Tuning
+### Built-in Probe Set Design
  
-| Goal | Recommendation |
-|---|---|
-| More precise deduplication | Increase `--sig-words` (more probe words → fewer false equivalences) |
-| Faster minimization pass | Decrease `--sig-words` (fewer probe words to evaluate per rule) |
-| Bias toward longer probe words | Increase `--min-word-len` (longer words exercise more positional opcodes) |
-| Reproduce a prior minimization exactly | Keep `--sig-words` and `--min-word-len` identical between runs (seed is fixed at 42) |
+The probe set covers several distinct word classes to minimise false equivalences (two rules appearing identical on the probe set when they differ on real words):
  
-> **Note:** Signature equivalence is probabilistic — two rules might match on all 21 probe words yet differ on others. Increasing `--sig-words` reduces this false-equivalence rate but never eliminates it entirely. For production rulesets, values of 30–50 are reasonable; above 100 yields diminishing returns.
+| Word class | Purpose | Examples |
+|---|---|---|
+| Very short (len 2–4) | Edge cases for `k K { } [ ]` | `ab`, `abc`, `abcd` |
+| Short alphanumeric (len 4–6) | Common base words | `pass`, `root`, `admin` |
+| Typical password words (len 7–9) | Core coverage | `letmein`, `password`, `sunshine` |
+| Longer words (len 10+) | Truncation and repeat ops | `qwertyuiop`, `monkey12345` |
+| Mixed-case words | `l u c C t E T k K` ops | `Password`, `AdminUser`, `HelloWorld` |
+| Words with embedded digits | `s o @ T` ops | `pass123`, `admin2024` |
+| Words with special chars | `@` removal, `s` substitution | `p@ssw0rd`, `s3cur1ty` |
+| Leet-substitution targets | Family J / M coverage | `master`, `leet`, `elite`, `access` |
+| Repeated-char words | `q z Z` ops | `aaaa`, `bbbb` |
+ 
+> Signature equivalence is probabilistic — two rules might match on all probe words yet differ on others. The hand-curated set is tuned to keep the false-equivalence rate very low for the rule patterns generated by rulest. If you observe unexpected merging in the output, you can increase probe coverage by passing a `--seed-rules` file containing probe-sensitive rules to force Phase 2 to preserve them.
  
 ---
  
@@ -442,8 +543,6 @@ These constants are defined at the top of `rulest_v2.py` and can be tuned for ad
 | `MAX_OUTPUT_LEN` | `512` | Maximum transformed word output length in GPU buffers |
 | `MAX_CHAIN_STRING_LEN` | `128` | Maximum chained rule string length in GPU buffers |
 | `MAX_HASHCAT_CHAIN` | `31` | Maximum number of rules in a single Hashcat chain |
-| `DEFAULT_SIG_WORDS` | `21` | Default number of probe words for signature-based minimization |
-| `DEFAULT_MIN_WORD_LEN` | `10` | Default minimum word length for probe word selection |
  
 ---
  
@@ -461,7 +560,7 @@ These constants are defined at the top of `rulest_v2.py` and can be tuned for ad
 #
 # GPU raw candidates      : 9,214  (bloom hits, includes false positives)
 # Post-processing         : signature-based minimization
-#   Probe words           : 21  (min length 10)
+#   Probe words           : 38  (built-in)
 #   Equiv. rules removed  : 4,393
 #
 # Rules kept     : 4,821  (d1:3104  d2:1512  d3:205)
@@ -489,7 +588,7 @@ sa@ $0
 | Goal | Recommendation |
 |---|---|
 | Maximize coverage in fixed time | Increase `--target-hours` |
-| Skip numeric/date seed families | Pass `--no-builtin-seeds` to skip Phase S; useful when supplying all seeds via `--seed-rules` or benchmarking Phase S contribution |
+| Skip built-in seed families | Pass `--no-builtin-seeds` to skip Phase S entirely; useful when supplying all seeds via `--seed-rules` or benchmarking Phase S contribution (families A–M) |
 | Reduce VRAM pressure | Lower `--max-chains` or use `--depth2-chains` / `--depth3-chains` |
 | Force deep chain exploration | Set `--depth4-chains 50000 --depth5-chains 10000` explicitly |
 | Use a specific GPU | `--device 1` or `--device "RTX 4090"` |
@@ -558,27 +657,14 @@ python rulest_v2.py rockyou.txt target.txt -d 5 --target-hours 4.0 \
   --seed-rules pass2.txt -o pass3_final.txt
 ```
  
-**Skip built-in seed families (Phase S disabled):**
-```bash
-# Faster run when you supply all seeds yourself and don't need A–E families
-python rulest_v2.py base.txt target.txt -d 3 --target-hours 1.0 \
-  --seed-rules my_seeds.txt \
-  --no-builtin-seeds \
-  -o no_phase_s.txt
-```
- 
-**Benchmark Phase S contribution:**
-```bash
-# With built-in seeds (default)
-python rulest_v2.py base.txt target.txt -d 2 -o with_seeds.txt
- 
-# Without built-in seeds — compare output sizes to measure Phase S value
-python rulest_v2.py base.txt target.txt -d 2 --no-builtin-seeds -o without_seeds.txt
-```
- 
 ---
  
 ## 📝 License
+ 
+MIT
+ 
+## Credits
+
  
 MIT
  
