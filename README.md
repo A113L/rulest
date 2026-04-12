@@ -433,8 +433,8 @@ Every leet substitution op paired with every structural transform op in both ord
 | C | Mixed prepend/append | v2 | ~168 000 |
 | D | Transform + digit/bracket | v2 | ~167 000 |
 | E | Date patterns | v2 | ~varies |
-| F | Append special chars | v2 → depth 3 added v2.1 | 3 600 |
-| G | Prepend special chars | v2 → depth 3 added v2.1 | 3 600 |
+| F | Append special chars | v2 | 3 600 |
+| G | Prepend special chars | v2 | 3 600 |
 | H | Transform + special char | v2 | 13 950 |
 | I | Digit(s) + special char | v2 | 15 540 |
 | J | Leet substitutions | v2 | ~520 |
