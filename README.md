@@ -672,7 +672,8 @@ python rulest_v2.py base.txt target.txt -d 3 --target-hours 1.0 \
 python rulest_v2.py base.txt target.txt -d 2 -o with_seeds.txt
  
 # Without built-in seeds — compare output sizes to measure Phase S value
-python rulest_v2.py base.txt target.txt -d 2 --no-builtin-seeds -o without_seeds.txt 
+python rulest_v2.py base.txt target.txt -d 2 --no-builtin-seeds -o without_seeds.txt
+```
 ---
  
 ## 📝 License
