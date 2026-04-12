@@ -6,17 +6,18 @@ Extracts hashcat rules/chains by comparing a base wordlist against a target
 wordlist.  GPU bloom filter screening (Phase 1: single rules, Phase 2: chains)
 is followed by signature-based functional minimization.
 
-Key feature: --sig-words / --min-word-len
-  After GPU extraction, rules are deduplicated by their functional signature —
-  the tuple of outputs produced when applied to a fixed probe set of words with
-  length >= min_word_len.  Rules that produce identical outputs on every probe
-  word are considered functionally equivalent; only the one with the highest
-  GPU hit-count is retained.  The final ruleset is written to a single file
-  sorted by GPU frequency (descending, UTF-8).
+Key feature: built‑in probe set for functional minimisation.
+  Rules are deduplicated by their functional signature — the tuple of outputs
+  produced when applied to a fixed hand‑curated set of probe words.  Rules that
+  produce identical outputs on every probe word are considered functionally
+  equivalent; only the one with the highest GPU hit‑count is retained.
+  The built‑in probe set covers short words (including "password"), mixed case,
+  words with digits/specials, and repeated‑char words – no external wordlist
+  is required for accurate minimisation.
 
-Phase S — Built-in Seed Families (A–I)
-  Nine seed families are always tested via a dedicated GPU chain-kernel pass,
-  independent of the random-chain time budget:
+Phase S — Built-in Seed Families (A–M)
+  Thirteen seed families are always tested via a dedicated GPU chain-kernel
+  pass, independent of the random-chain time budget:
 
   Numeric families
     A  Pure Prepend digits           (depths 1–4)
@@ -26,14 +27,29 @@ Phase S — Built-in Seed Families (A–I)
     E  Date patterns DDMM/YYYY/…     (depths 4–9)
 
   Special-character families
-    F  Pure Append special chars     (depths 1–2, top-15 chars)
-    G  Pure Prepend special chars    (depths 1–2, top-15 chars)
+    F  Pure Append special chars     (depths 1–3, top-15 chars)
+    G  Pure Prepend special chars    (depths 1–3, top-15 chars)
     H  Transform + special char      (depths 2–3, top-15 chars)
     I  Digit(s) + special char       (depths 2–4, core-7 chars)
        — covers the ubiquitous "word123!" / "!word123" patterns
 
+  New families
+    J  Leet substitutions            (depths 1–2, 10 core pairs)
+       — sa@ se3 so0 si1 sl1 ss5 ss$ st7 sa4 si!
+       — depth 2: leet + digit/special suffix/prefix
+       — depth 2: double-leet chains (e.g. "sa@ so0" → "p@ssw0rd")
+    K  Double-transform chains       (depth 2, all 15×15 pairs)
+       — covers "c r", "u d", "t f", "E l", "c {", "l ]", etc.
+    L  Special-before-digit patterns (depths 2–3, core-7 chars)
+       — reverse orientation of Family I: "!1word" / "word!12"
+       — append: $sp $d…  prepend: ^d… ^sp
+    M  Leet + transform chains       (depth 2)
+       — leet substitution followed by a transform op (all 15)
+       — and transform op followed by leet substitution
+       — covers "P@ssword", "@DMIN", "p@SSW0RD" patterns
+
   Special chars — top-15 (F/G/H):  ! @ # $ % ^ & * ? . - _ + ( )
-  Special chars — core-7  (I):     ! @ # $ % * ?
+  Special chars — core-7  (I/L):   ! @ # $ % * ?
 
 """
 
@@ -51,8 +67,6 @@ import math
 import random
 from typing import Dict, Set, Tuple, Optional, List
 import gc
-import multiprocessing as mp
-from functools import partial
 import datetime
 
 # ================== GLOBAL FLAGS ===================
@@ -161,10 +175,6 @@ FNV1A_SEED2        = 0xCAFEBABE
 
 MAX_GPU_RULES = 255
 
-# Default probe-set parameters for signature-based minimization
-DEFAULT_SIG_WORDS    = 21   # number of words to use as the probe set
-DEFAULT_MIN_WORD_LEN = 10   # minimum word length for probe words
-
 # Sentinel used in signatures when a rule contains unsupported opcodes
 _UNSUPPORTED_SENTINEL = object()
 
@@ -174,6 +184,88 @@ SPECIAL_CHARS_TOP  = ['!', '@', '#', '$', '%', '^', '&', '*',
                       '?', '.', '-', '_', '+', '(', ')']
 # Reduced "core" set used where combinatorial explosion must be limited.
 SPECIAL_CHARS_CORE = ['!', '@', '#', '$', '%', '*', '?']
+
+# ── Leet-substitution seed constants (Family J / M) ─────────────────────────
+# Ten most common character→character leet mappings found in real passwords,
+# ordered by real-world frequency.  Each entry is (original, replacement).
+LEET_SUBS: List[Tuple[str, str]] = [
+    ('a', '@'),   # p@ssword
+    ('e', '3'),   # s3cur1ty
+    ('o', '0'),   # passw0rd
+    ('i', '1'),   # pass1word
+    ('l', '1'),   # 1eet
+    ('s', '5'),   # pa55word
+    ('s', '$'),   # pa$$word
+    ('t', '7'),   # 7error
+    ('a', '4'),   # p4ssword
+    ('i', '!'),   # pass!word
+]
+# Pre-built hashcat rule strings derived from LEET_SUBS (e.g. "sa@").
+LEET_OPS: List[str] = [f's{orig}{rep}' for orig, rep in LEET_SUBS]
+
+# ====================================================================
+# --- BUILT-IN PROBE SET (hand‑curated, covers all important cases) ---
+# ====================================================================
+# This set replaces the old sampling‑based probe set.  It ensures that
+# functional equivalence is detected even when the base wordlist lacks
+# long words or has an unusual distribution.
+BUILTIN_PROBES: List[str] = [
+    # ── very short — edge cases for k, K, {, }, [, ] ────────────────
+    "ab",
+    "abc",
+    "abcd",
+    # ── short alphanumeric (len 4–6) ─────────────────────────────────
+    "pass",
+    "root",
+    "test",
+    "admin",
+    "login",
+    # ── typical password base words (len 7–9) ────────────────────────
+    "letmein",          # len 7
+    "welcome",          # len 7
+    "password",         # len 8  ← THE critical one missing in old sampling
+    "sunshine",         # len 8
+    "football",         # len 8
+    "baseball",         # len 8
+    "princess",         # len 8
+    "dragon12",         # len 8, ends with digits
+    # ── longer words (len 10+) — truncation / repeat ops ─────────────
+    "qwertyuiop",       # len 10
+    "iloveyou12",       # len 10, trailing digits
+    "monkey12345",      # len 11
+    "superman123",      # len 11
+    "mustang2024",      # len 11
+    # ── mixed-case — l/u/c/C/t/E/T/k/K ─────────────────────────────
+    "Password",
+    "AdminUser",
+    "MySecret",
+    "HelloWorld",
+    # ── words with embedded digits — s, o, @, T ──────────────────────
+    "pass123",
+    "admin2024",
+    "test1234",
+    "user9999",
+    # ── words with special chars — @ removal, s substitution ─────────
+    "p@ssw0rd",
+    "s3cur1ty",
+    # ── leet-substitution targets — exercises Family J/M ─────────────
+    "master",           # sa@ → m@ster, se3 → mast3r
+    "leet",             # sl1 → 1eet
+    "elite",            # si1 → e11te
+    "access",           # sa@ → @ccess, ss$ → acce$$
+    # ── repeated chars — q (double each), z/Z (extend) ───────────────
+    "aaaa",
+    "bbbb",
+]
+# Deduplicate while preserving order (already unique, but safe)
+_seen = set()
+_deduped = []
+for w in BUILTIN_PROBES:
+    if w not in _seen:
+        _seen.add(w)
+        _deduped.append(w)
+BUILTIN_PROBES = _deduped
+del _seen, _deduped, w
 
 # ====================================================================
 # --- RULE EXCLUSION FILTER ---
@@ -416,33 +508,6 @@ def py_apply_chain(chain: str, word: str) -> Optional[str]:
 # --- SIGNATURE-BASED FUNCTIONAL MINIMIZATION ---
 # ====================================================================
 
-def _build_probe_set(base_words: list, sig_words: int, min_word_len: int,
-                     seed: int = 42) -> List[str]:
-    """
-    Select *sig_words* probe words of length >= min_word_len from base_words.
-    Falls back to shorter words if not enough long words are available.
-    The selection is deterministic (fixed seed).
-    """
-    long_words = [w for w in base_words if len(w) >= min_word_len]
-    rng = random.Random(seed)
-
-    if len(long_words) >= sig_words:
-        return rng.sample(long_words, sig_words)
-
-    # Not enough long words — use what we have + fill from the rest
-    short_words = [w for w in base_words if len(w) < min_word_len]
-    needed = sig_words - len(long_words)
-    fill   = rng.sample(short_words, min(needed, len(short_words)))
-    probe  = long_words + fill
-
-    if len(probe) < sig_words:
-        log_warn(
-            f"Only {len(probe)} words available for probe set "
-            f"(requested {sig_words}). Minimization may be less precise."
-        )
-    return probe
-
-
 def compute_rule_signature(rule: str, probe_words: List[str]) -> tuple:
     """
     Compute the functional signature of *rule* over *probe_words*.
@@ -463,24 +528,20 @@ def compute_rule_signature(rule: str, probe_words: List[str]) -> tuple:
 
 def minimize_by_signature(
     rule_counter: Counter,
-    base_words:   list,
-    sig_words:    int = DEFAULT_SIG_WORDS,
-    min_word_len: int = DEFAULT_MIN_WORD_LEN,
+    probe_words:  List[str],
 ) -> Counter:
     """
     Deduplicate *rule_counter* by functional signature.
 
     Algorithm
     ---------
-    1. Build a probe set of *sig_words* words with length >= *min_word_len*
-       drawn deterministically from *base_words*.
-    2. For every candidate rule (with a tqdm progress bar), compute its
-       signature = tuple of outputs on the probe set.
-    3. Group rules that share the same signature — they are functionally
+    1. For every candidate rule (with a tqdm progress bar), compute its
+       signature = tuple of outputs on the *probe_words*.
+    2. Group rules that share the same signature — they are functionally
        equivalent on the probe set.
-    4. Within each group, keep the rule with the **highest GPU hit-count**
+    3. Within each group, keep the rule with the **highest GPU hit-count**
        (ties broken by shortest depth, then lexicographic order).
-    5. Return a Counter of surviving rules with their original GPU counts.
+    4. Return a Counter of surviving rules with their original GPU counts.
 
     Rules containing unsupported opcodes are bucketed into a single
     '__UNSUPPORTED__' group; one representative (highest count) is kept.
@@ -489,12 +550,8 @@ def minimize_by_signature(
     ----------
     rule_counter : Counter
         Raw GPU bloom-filter hit counts keyed by rule string.
-    base_words : list
-        Full list of base words loaded from the base wordlist.
-    sig_words : int
-        Number of probe words used to build each signature.
-    min_word_len : int
-        Minimum character length for probe words.
+    probe_words : list
+        Fixed list of words used to compute signatures.
 
     Returns
     -------
@@ -504,13 +561,9 @@ def minimize_by_signature(
     if not rule_counter:
         return Counter()
 
-    probe = _build_probe_set(base_words, sig_words, min_word_len)
-
     log_section("POST-PROCESSING — Signature-Based Functional Minimization")
     log_info(f"[MINIMIZE] Candidates  : {bold(str(len(rule_counter)))}")
-    log_info(f"[MINIMIZE] Probe words : {bold(str(len(probe)))}  "
-             f"(min length {min_word_len}+)")
-    log_debug(f"Probe set: {probe}")
+    log_info(f"[MINIMIZE] Probe words : {bold(str(len(probe_words)))}")
 
     # sig_map[signature] = list of (rule, gpu_count)
     sig_map: Dict[tuple, List[Tuple[str, int]]] = defaultdict(list)
@@ -526,7 +579,7 @@ def minimize_by_signature(
     ) as pbar:
         n_groups = 0
         for rule, gpu_count in rule_items:
-            sig = compute_rule_signature(rule, probe)
+            sig = compute_rule_signature(rule, probe_words)
             sig_map[sig].append((rule, gpu_count))
             n_groups = len(sig_map)
             pbar.update(1)
@@ -578,7 +631,7 @@ def minimize_by_signature(
 # ====================================================================
 
 # --------------------------------------------------------------------
-# GPU device helpers (from original)
+# GPU device helpers
 # --------------------------------------------------------------------
 def get_all_devices():
     devices = []
@@ -641,7 +694,7 @@ def get_max_allocation(device):
     except: return 1024**3
 
 # --------------------------------------------------------------------
-# Dynamic parameters (from original)
+# Dynamic parameters
 # --------------------------------------------------------------------
 def calculate_dynamic_parameters(base_count, target_count, device=None,
                                   target_hours=0.5, bloom_mb_override=None):
@@ -695,7 +748,7 @@ def calculate_dynamic_parameters(base_count, target_count, device=None,
     }
 
 # --------------------------------------------------------------------
-# GPU-compatible rules generator (from original)
+# GPU-compatible rules generator
 # --------------------------------------------------------------------
 class GPUCompatibleRulesGenerator:
     def __init__(self):
@@ -752,7 +805,7 @@ class GPUCompatibleRulesGenerator:
         return valid
 
 # --------------------------------------------------------------------
-# OpenCL kernel (from original)
+# OpenCL kernel
 # --------------------------------------------------------------------
 GPU_KERNEL_TEMPLATE = r"""
 #define MAX_WORD_LEN         {MAX_WORD_LEN}
@@ -906,7 +959,7 @@ __kernel void find_rule_chains_gpu(
 """
 
 # --------------------------------------------------------------------
-# GPU Engine (from original)
+# GPU Engine
 # --------------------------------------------------------------------
 class GPUEngine:
     def __init__(self, params):
@@ -1329,11 +1382,12 @@ class GPUEngine:
                                 e_cnt[_new_depth] += 1
 
         # ── Family F: Pure Append Special Chars ──────────────────────────
-        # depths 1–2  (capped by max_depth)
+        # depths 1–3  (capped by max_depth)
         # Covers the 15 most commonly appended special characters in real
         # passwords.  Depth 2 covers two-character suffixes (!!, !@, @!, …).
+        # Depth 3 covers three-character suffixes such as "!!!" or "!@#".
         f_cnt: Dict[int, int] = defaultdict(int)
-        for depth in range(1, min(2, max_depth) + 1):
+        for depth in range(1, min(3, max_depth) + 1):
             for combo in itertools.product(SPECIAL_CHARS_TOP, repeat=depth):
                 chain = ' '.join(f'${ch}' for ch in combo)
                 if HashcatRuleValidator.validate_rule_for_gpu(chain):
@@ -1341,11 +1395,12 @@ class GPUEngine:
                     f_cnt[depth] += 1
 
         # ── Family G: Pure Prepend Special Chars ─────────────────────────
-        # depths 1–2  (capped by max_depth)
+        # depths 1–3  (capped by max_depth)
         # Mirror of Family F but using the ^ (prepend) operator.
         # right-to-left order so the final string reads left-to-right.
+        # Depth 3 adds three-char prefixes such as "!!!" or "!@#".
         g_cnt: Dict[int, int] = defaultdict(int)
-        for depth in range(1, min(2, max_depth) + 1):
+        for depth in range(1, min(3, max_depth) + 1):
             for combo in itertools.product(SPECIAL_CHARS_TOP, repeat=depth):
                 # e.g. prepend "!@" → "^@ ^!"  (@ applied first, ! on top)
                 chain = ' '.join(f'^{ch}' for ch in reversed(combo))
@@ -1398,35 +1453,176 @@ class GPUEngine:
                         sbd[depth].add(pre)
                         i_cnt[depth] += 1
 
+        # ── Family J: Leet Substitutions (depths 1–2) ────────────────────
+        # Ten most common character→character leet substitutions, drawn from
+        # LEET_OPS (defined at module level).
+        #
+        # Depth 1: single leet op (e.g. "sa@" → "p@ssword" from "password").
+        #   ~10 seeds — negligible cost, extremely high practical value.
+        #
+        # Depth 2a — leet + digit/special append or prepend:
+        #   Each leet op combined with every digit/special append or prepend
+        #   from SPECIAL_CHARS_CORE.
+        #   10 leet × (10 $d + 10 ^d + 7 $sp + 7 ^sp) = 10 × 34 = 340 seeds
+        #   Catches "p@ssword1", "p@ssword!", "1p@ssword", etc.
+        #
+        # Depth 2b — double-leet chains:
+        #   Two distinct leet ops in sequence; covers passwords with multiple
+        #   simultaneous substitutions (e.g. "sa@ so0" → "p@ssw0rd").
+        #   10 × 9 = 90 seeds.
+        j_cnt: Dict[int, int] = defaultdict(int)
+
+        # Depth 1: pure leet substitutions
+        for op in LEET_OPS:
+            if HashcatRuleValidator.validate_rule_for_gpu(op):
+                sbd[1].add(op)
+                j_cnt[1] += 1
+
+        if max_depth >= 2:
+            leet_followup = (
+                [f'${d}' for d in digits] +
+                [f'^{d}' for d in digits] +
+                [f'${ch}' for ch in SPECIAL_CHARS_CORE] +
+                [f'^{ch}' for ch in SPECIAL_CHARS_CORE]
+            )
+            # 2a: leet + one append/prepend op
+            for leet_op in LEET_OPS:
+                for follow in leet_followup:
+                    chain = f"{leet_op} {follow}"
+                    if HashcatRuleValidator.validate_rule_for_gpu(chain):
+                        sbd[2].add(chain)
+                        j_cnt[2] += 1
+            # 2b: two distinct leet substitutions (double-leet)
+            for i_l, l1 in enumerate(LEET_OPS):
+                for l2 in LEET_OPS:
+                    if l1 != l2:
+                        chain = f"{l1} {l2}"
+                        if HashcatRuleValidator.validate_rule_for_gpu(chain):
+                            sbd[2].add(chain)
+                            j_cnt[2] += 1
+
+        # ── Family K: Double-Transform Chains (depth 2) ──────────────────
+        # All ordered pairs of pure transformation ops from transform_ops
+        # (l u c C t r d f E k K { } [ ]).  No digit or special-char
+        # appends; pure structural transforms only.
+        #
+        # depth 2: 15 × 15 = 225 pairs
+        # Covers patterns like "c r" (capitalize+reverse), "u d"
+        # (uppercase+duplicate), "t f" (toggle+fold), "E l" (title+lower),
+        # "c {" (capitalize+rotate-left), "l ]" (lowercase+drop-last), etc.
+        # None of these are generated by any other family, so there is
+        # zero overlap and full coverage gain.
+        k_cnt: Dict[int, int] = defaultdict(int)
+        if max_depth >= 2:
+            for t1 in transform_ops:
+                for t2 in transform_ops:
+                    chain = f"{t1} {t2}"
+                    if HashcatRuleValidator.validate_rule_for_gpu(chain):
+                        sbd[2].add(chain)
+                        k_cnt[2] += 1
+
+        # ── Family L: Special-before-Digit patterns (depths 2–3) ─────────
+        # Reverse orientation of Family I: the special character is placed
+        # BEFORE (not after) the digit sequence.
+        # Captures the "word!1", "word@12", "!1word", "@12word" class that
+        # Family I does not cover.
+        # Uses SPECIAL_CHARS_CORE (7 chars) to keep cardinality bounded.
+        #
+        # Append orientation:  $sp $d₁ … $dₙ  → word<sp><digits>
+        # Prepend orientation: ^dₙ … ^d₁ ^sp  → <digits><sp>word
+        #   (prepend last char first; applying ^sp last puts sp leftmost)
+        #
+        # depth 2: 7 sp × 10 d = 70 append + 70 prepend = 140 seeds
+        # depth 3: 7 sp × 100 dd = 700 append + 700 prepend = 1 400 seeds
+        l_cnt: Dict[int, int] = defaultdict(int)
+        for depth in range(2, min(3, max_depth) + 1):
+            n_digits = depth - 1
+            for sp in SPECIAL_CHARS_CORE:
+                for digit_combo in itertools.product(digits, repeat=n_digits):
+                    # ---- Append: $sp $d1 ... $dn  (e.g. "$! $1 $2" → "word!12")
+                    app = f'${sp} ' + ' '.join(f'${d}' for d in digit_combo)
+                    if HashcatRuleValidator.validate_rule_for_gpu(app):
+                        sbd[depth].add(app)
+                        l_cnt[depth] += 1
+                    # ---- Prepend: ^dn ... ^d1 ^sp  → "<digits><sp>word"
+                    # To get "12!word": apply ^! first, then ^2, then ^1.
+                    # Chain: "^! ^2 ^1"  (digits in reverse reading order,
+                    #                     special char last in the rule chain)
+                    pre = ' '.join(f'^{d}' for d in digit_combo) + f' ^{sp}'
+                    if HashcatRuleValidator.validate_rule_for_gpu(pre):
+                        sbd[depth].add(pre)
+                        l_cnt[depth] += 1
+
+        # ── Family M: Leet + Transform chains (depth 2) ──────────────────
+        # A leet substitution op paired with a structural transform op in
+        # both orderings (leet-then-transform and transform-then-leet).
+        #
+        # leet-then-transform: apply the substitution first, then transform
+        #   e.g. "sa@ c" → "p@ssword" → "P@ssword"  (leet then capitalise)
+        #   e.g. "so0 u" → "passw0rd" → "PASSW0RD"  (leet then upper)
+        # transform-then-leet: transform first, then substitute
+        #   e.g. "c sa@" → "Password" → "P@ssword"  (capitalise then leet)
+        #   e.g. "u so0" → "PASSWORD" → "PASSW0RD"  (upper then leet)
+        #
+        # depth 2: 10 leet × 15 transforms × 2 orderings = 300 seeds
+        # After dedup (a few orderings produce identical output on some
+        # words) the real count is typically ~280–295.
+        m_cnt: Dict[int, int] = defaultdict(int)
+        if max_depth >= 2:
+            for leet_op in LEET_OPS:
+                for t_op in transform_ops:
+                    # leet → transform
+                    chain_lt = f"{leet_op} {t_op}"
+                    if HashcatRuleValidator.validate_rule_for_gpu(chain_lt):
+                        sbd[2].add(chain_lt)
+                        m_cnt[2] += 1
+                    # transform → leet
+                    chain_tl = f"{t_op} {leet_op}"
+                    if HashcatRuleValidator.validate_rule_for_gpu(chain_tl):
+                        sbd[2].add(chain_tl)
+                        m_cnt[2] += 1
+
         # ── Debug summary ─────────────────────────────────────────────────
         c_total = sum(20 ** d for d in range(1, min(4, max_depth) + 1))
         log_debug(f"Seed families  max_depth={max_depth}")
-        log_debug("  A (pure ^)          : " +
+        log_debug("  A (pure ^)           : " +
                   ", ".join(f"d{d}={a_cnt[d]:,}" for d in sorted(a_cnt)) +
                   f"  [{sum(a_cnt.values()):,} total]")
-        log_debug("  B (pure $)          : " +
+        log_debug("  B (pure $)           : " +
                   ", ".join(f"d{d}={b_cnt[d]:,}" for d in sorted(b_cnt)) +
                   f"  [{sum(b_cnt.values()):,} total]")
-        log_debug(f"  C (mixed ^/$)       : [{c_total:,} total]")
-        log_debug("  D (transform+digit) : " +
+        log_debug(f"  C (mixed ^/$)        : [{c_total:,} total]")
+        log_debug("  D (transform+digit)  : " +
                   ", ".join(f"d{d}={d_cnt[d]:,}" for d in sorted(d_cnt)) +
                   f"  [{sum(d_cnt.values()):,} total]")
-        log_debug("  E (dates)           : " +
+        log_debug("  E (dates)            : " +
                   ", ".join(f"d{d}={e_cnt[d]:,}" for d in sorted(e_cnt)) +
                   f"  [{sum(e_cnt.values()):,} total]")
-        log_debug("  F (append special)  : " +
+        log_debug("  F (append special)   : " +
                   ", ".join(f"d{d}={f_cnt[d]:,}" for d in sorted(f_cnt)) +
                   f"  [{sum(f_cnt.values()):,} total]")
-        log_debug("  G (prepend special) : " +
+        log_debug("  G (prepend special)  : " +
                   ", ".join(f"d{d}={g_cnt[d]:,}" for d in sorted(g_cnt)) +
                   f"  [{sum(g_cnt.values()):,} total]")
-        log_debug("  H (transform+spec.) : " +
+        log_debug("  H (transform+spec.)  : " +
                   ", ".join(f"d{d}={h_cnt[d]:,}" for d in sorted(h_cnt)) +
                   f"  [{sum(h_cnt.values()):,} total]")
-        log_debug("  I (num+special)     : " +
+        log_debug("  I (num+special)      : " +
                   ", ".join(f"d{d}={i_cnt[d]:,}" for d in sorted(i_cnt)) +
                   f"  [{sum(i_cnt.values()):,} total]")
-        log_debug("  A∪…∪I (all seeds)   : " +
+        log_debug("  J (leet subs)        : " +
+                  ", ".join(f"d{d}={j_cnt[d]:,}" for d in sorted(j_cnt)) +
+                  f"  [{sum(j_cnt.values()):,} total]")
+        log_debug("  K (double transform) : " +
+                  ", ".join(f"d{d}={k_cnt[d]:,}" for d in sorted(k_cnt)) +
+                  f"  [{sum(k_cnt.values()):,} total]")
+        log_debug("  L (special-b-digit)  : " +
+                  ", ".join(f"d{d}={l_cnt[d]:,}" for d in sorted(l_cnt)) +
+                  f"  [{sum(l_cnt.values()):,} total]")
+        log_debug("  M (leet+transform)   : " +
+                  ", ".join(f"d{d}={m_cnt[d]:,}" for d in sorted(m_cnt)) +
+                  f"  [{sum(m_cnt.values()):,} total]")
+        log_debug("  A∪…∪M (all seeds)    : " +
                   ", ".join(f"d{d}={len(sbd[d]):,}" for d in sorted(sbd)) +
                   f"  [{sum(len(v) for v in sbd.values()):,} total]")
         return dict(sbd)
@@ -1648,7 +1844,7 @@ class GPUEngine:
                 except: pass
 
 # --------------------------------------------------------------------
-# GPU Extractor (from original)
+# GPU Extractor
 # --------------------------------------------------------------------
 class GPUExtractor:
     def __init__(self, base_count, target_count, max_depth, device_spec=None,
@@ -1745,7 +1941,7 @@ class GPUExtractor:
         # The prebuilt sbd is kept locally for reference but is not forwarded
         # to Phase 2 — seeds are never used as scaffolding in chain generation.
         if self.builtin_seeds:
-            log_section("PHASE S — Seed Extraction (numeric + special-char families A–I)")
+            log_section("PHASE S — Seed Extraction (numeric + special-char families A–M)")
             sbd = self.gpu_engine.build_numeric_seed_families(max_depth=self.max_depth)
             seed_hits = self.gpu_engine.run_seed_extraction_pass(
                 base_words, sbd, bloom_filter, rules_phase1)
@@ -1803,7 +1999,7 @@ class GPUExtractor:
         return validated
 
 # --------------------------------------------------------------------
-# Wordlist loader (from original)
+# Wordlist loader
 # --------------------------------------------------------------------
 def load_wordlist(filename: str) -> list:
     words = set()
@@ -1872,13 +2068,8 @@ def main() -> None:
                         dest=f'depth{i}_chains',
                         help=f'Override chain count for depth {i} (default: auto)')
 
-    # ---- Signature-based minimization ----------------------------
-    ap.add_argument('--sig-words',    type=int, default=DEFAULT_SIG_WORDS,
-                    help=f'Number of probe words for signature computation '
-                         f'(default: {DEFAULT_SIG_WORDS})')
-    ap.add_argument('--min-word-len', type=int, default=DEFAULT_MIN_WORD_LEN,
-                    help=f'Minimum word length for probe words '
-                         f'(default: {DEFAULT_MIN_WORD_LEN})')
+    # ---- Signature-based minimization (built-in probe set only) ---
+    # (Note: --sig-words and --min-word-len have been removed; built-in probe set is always used)
 
     # ---- Misc ----------------------------------------------------
     ap.add_argument('--allow-reject-rules', action='store_true',
@@ -1886,8 +2077,10 @@ def main() -> None:
     ap.add_argument('--no-builtin-seeds', action='store_true',
                     help='Disable the built-in seed families (Phase S: '
                          'pure prepend/append, mixed, transform+digit, date patterns, '
-                         'and special-char families F–I: append/prepend special chars, '
-                         'transform+special, number+special combos). '
+                         'special-char families F–I: append/prepend special chars, '
+                         'transform+special, number+special combos, and new families '
+                         'J–M: leet substitutions, double-transform, special-before-digit, '
+                         'leet+transform). '
                          'By default Phase S always runs; pass this flag to skip it '
                          'and rely solely on Phase 1 atomic rules and Phase 2 random chains.')
     ap.add_argument('--debug',        action='store_true',
@@ -1923,10 +2116,8 @@ def main() -> None:
     log_info(f"  target    : {bold(args.target_wordlist)}")
     log_info(f"  depth     : {bold(str(args.max_depth))}  |  "
              f"hours: {bold(str(args.target_hours))}  |  "
-             f"bloom: {bold(str(args.bloom_mb or BLOOM_FILTER_MAX_MB))}MB  |  "
-             f"sig_words: {bold(str(args.sig_words))}  "
-             f"min_len: {bold(str(args.min_word_len))}")
-    _bs_status = red('DISABLED (--no-builtin-seeds)') if args.no_builtin_seeds else green('enabled (families A–I)')
+             f"bloom: {bold(str(args.bloom_mb or BLOOM_FILTER_MAX_MB))}MB")
+    _bs_status = red('DISABLED (--no-builtin-seeds)') if args.no_builtin_seeds else green('enabled (families A–M)')
     log_info(f"  builtin seeds (Phase S) : {_bs_status}")
     if args.seed_rules:
         log_info(f"  seeds     : {bold(args.seed_rules)}  "
@@ -1955,12 +2146,10 @@ def main() -> None:
     log_debug(f"Raw counts: {len(raw_counts)} rules total")
     print()
 
-    # ---- Signature-based functional minimization -----------------
+    # ---- Signature-based functional minimization using built-in probe set ---
     final_counts = minimize_by_signature(
         raw_counts,
-        base_words,
-        sig_words    = args.sig_words,
-        min_word_len = args.min_word_len,
+        BUILTIN_PROBES,
     )
 
     # Always include the identity rule
@@ -1994,8 +2183,7 @@ def main() -> None:
         f.write(f"# GPU raw candidates      : {len(raw_counts):,}  "
                 f"(bloom hits, includes false positives)\n")
         f.write(f"# Post-processing         : signature-based minimization\n")
-        f.write(f"#   Probe words           : {args.sig_words}  "
-                f"(min length {args.min_word_len})\n")
+        f.write(f"#   Probe words           : {len(BUILTIN_PROBES)}  (built-in)\n")
         f.write(f"#   Equiv. rules removed  : {removed:,}\n")
         f.write("#\n")
         f.write(f"# Rules kept     : {final_rules:,}  ({depth_summary})\n")
