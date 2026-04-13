@@ -51,6 +51,43 @@ Phase S — Built-in Seed Families (A–M)
   Special chars — top-15 (F/G/H):  ! @ # $ % ^ & * ? . - _ + ( )
   Special chars — core-7  (I/L):   ! @ # $ % * ?
 
+Phase 3 — Genetic Algorithm Rule Evolution  (--genetic)
+  An optional evolutionary search that runs after Phase 2 and complements
+  random chain sampling with guided, coverage-driven optimisation.
+
+  Why it fits this project
+  ────────────────────────
+  • The fitness function (bloom-filter hits) is already computed by the
+    existing GPU chain kernel — no new GPU code is required.
+  • Phase 2 samples chains *uniformly at random* from the atomic-rule pool.
+    For depth ≥ 3 the search space is |pool|^depth (millions of candidates);
+    the GA focuses probability mass on high-hit-rate regions of that space.
+  • Hot atomic rules from Phase 1 seed the initial population, giving the GA
+    a strong head start rather than searching from scratch.
+  • All Phase-3 discoveries are merged into the global hit counter before
+    signature-based minimisation, so they benefit from the same deduplication
+    and sorting as Phase 1 and Phase 2 results.
+
+  Algorithm summary
+  ─────────────────
+  1. Initial population — 30 % depth-2 hot-rule combos, 30 % seeded deeper
+     chains, 40 % random — ensures both exploitation and exploration.
+  2. GPU-batch fitness evaluation — reuses _run_chain_kernel unchanged.
+  3. Tournament selection (k = 4) — low-pressure, maintains diversity.
+  4. One-point crossover (p = 0.80) — exchanges rule-token sub-sequences.
+  5. Mutation — replace / insert / delete one rule token (weights 60/20/20).
+  6. Elitism — top <elite_frac> individuals survive unchanged each generation.
+  7. Diversity guard — duplicate individuals are replaced by random chains.
+  8. Terminates when <--genetic-generations> is reached or the wall-clock
+     time budget (--target-hours remainder) is exhausted.
+
+  CLI flags
+  ─────────
+    --genetic                   Enable Phase 3 (default: disabled)
+    --genetic-generations N     Max generations (default: 50)
+    --genetic-pop N             Population size (default: 200)
+    --genetic-elite F           Elite fraction, e.g. 0.15 (default: 0.15)
+
 """
 
 import os
@@ -223,7 +260,7 @@ BUILTIN_PROBES: List[str] = [
     # ── typical password base words (len 7–9) ────────────────────────
     "letmein",          # len 7
     "welcome",          # len 7
-    "password",         # len 8  ← THE critical one missing in old sampling
+    "password",         # len 8
     "sunshine",         # len 8
     "football",         # len 8
     "baseball",         # len 8
@@ -613,22 +650,6 @@ def minimize_by_signature(
               f"kept={len(survivors)}, removed={removed}, sig_groups={n_groups}")
 
     return survivors
-
-
-# ====================================================================
-# ====================================================================
-#  PRESERVE THIS BLOCK FROM THE ORIGINAL rulest_v2.py
-#  (lines ~622 – ~1498 in the original file)
-#
-#  Copy-paste the following functions/classes verbatim:
-#
-#    def load_wordlist(...)
-#    class GPUExtractor:
-#        ...   (all methods)
-#
-#  Nothing in that block needs to be changed.
-# ====================================================================
-# ====================================================================
 
 # --------------------------------------------------------------------
 # GPU device helpers
@@ -1843,27 +1864,471 @@ class GPUEngine:
                 try: b.release()
                 except: pass
 
+# ====================================================================
+# --- PHASE 3 — GENETIC ALGORITHM RULE EVOLVER ---
+# ====================================================================
+#
+# Motivation
+# ----------
+# Phase 2 samples rule chains *uniformly at random* from the atomic-rule
+# pool.  For long chains (depth >= 3) the search space grows as
+# |pool|^depth, which makes random sampling extremely inefficient — most
+# candidates score zero hits.
+#
+# A genetic algorithm (GA) addresses this by directing the search: chains
+# that produce many bloom-filter hits ("high-fitness individuals") are
+# preferentially recombined and mutated, so successive generations
+# concentrate probability mass on promising regions of the rule space.
+#
+# Fitness function
+# ----------------
+# The fitness of a candidate chain is the number of unique base-word
+# transformations that pass the bloom filter — identical to the hit-count
+# already computed in Phases 1 and 2.  No new GPU infrastructure is
+# required; the existing `_run_chain_kernel` is reused directly.
+#
+# Algorithm
+# ---------
+# 1. Initial population  — hot Phase-1 rules seeded into depth-2 combos
+#                          plus random chains from the full rule pool.
+# 2. Fitness evaluation  — GPU batch via _run_chain_kernel.
+# 3. Tournament selection (k = 4)
+# 4. One-point crossover on rule-token lists (crossover_p = 0.80)
+# 5. Mutation            — replace / insert / delete one token
+# 6. Elitism             — top <elite_frac> carried unchanged
+# 7. Diversity guard     — duplicate individuals are re-seeded randomly
+# 8. Repeat until <generations> reached or wall-clock budget exhausted.
+#
+# Integration
+# -----------
+# Activated by --genetic flag.  Runs after Phase 2, consuming whatever
+# time remains from --target-hours.  Newly discovered chains are merged
+# into `all_counts` before signature minimisation.
+
+class GeneticRuleEvolver:
+    """
+    Phase 3 — Genetic Algorithm to evolve high-coverage hashcat rule chains.
+
+    Parameters
+    ----------
+    gpu_engine      : GPUEngine instance (provides _run_chain_kernel).
+    base_words      : List of base words to transform.
+    rule_pool       : Validated atomic rules (Phase-1 rule set).
+    max_depth       : Maximum rule chain length (tokens per chain).
+    pop_size        : Number of individuals in each generation.
+    elite_frac      : Fraction of the population kept unchanged (elites).
+    tournament_k    : Tournament size for parent selection.
+    crossover_p     : Probability that two parents exchange genetic material.
+    mut_replace_p   : Relative probability of a replace mutation.
+    mut_insert_p    : Relative probability of an insert mutation.
+    mut_delete_p    : Relative probability of a delete mutation.
+    """
+
+    def __init__(
+        self,
+        gpu_engine,
+        base_words: list,
+        rule_pool:  list,
+        max_depth:  int,
+        pop_size:       int   = 200,
+        elite_frac:     float = 0.15,
+        tournament_k:   int   = 4,
+        crossover_p:    float = 0.80,
+        mut_replace_p:  float = 0.60,
+        mut_insert_p:   float = 0.20,
+        mut_delete_p:   float = 0.20,
+    ):
+        self.gpu_engine   = gpu_engine
+        self.base_words   = base_words
+        self.rule_pool    = rule_pool
+        self.max_depth    = max(2, max_depth)
+        self.pop_size     = pop_size
+        self.elite_frac   = elite_frac
+        self.tournament_k = tournament_k
+        self.crossover_p  = crossover_p
+
+        # Normalise mutation probabilities so they always sum to 1.0
+        _total = mut_replace_p + mut_insert_p + mut_delete_p
+        if _total <= 0:
+            _total = 1.0
+        self._mut_weights = [
+            mut_replace_p / _total,
+            mut_insert_p  / _total,
+            mut_delete_p  / _total,
+        ]
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _random_chain(self, depth: int = 0) -> list:
+        """Return a random chain of atomic rules as a token list."""
+        if depth <= 0:
+            depth = random.randint(2, self.max_depth)
+        return [random.choice(self.rule_pool) for _ in range(depth)]
+
+    def _clamp(self, tokens: list) -> list:
+        """Ensure a token list has between 2 and max_depth elements."""
+        lo, hi = 2, self.max_depth
+        if len(tokens) < lo:
+            tokens = tokens + self._random_chain(lo - len(tokens))
+        return tokens[:hi]
+
+    # ------------------------------------------------------------------
+    # Population initialisation
+    # ------------------------------------------------------------------
+
+    def initial_population(self, hot_rules: list) -> list:
+        """
+        Build the initial population using three seeding strategies:
+
+        1. Depth-2 combos of the top-50 hot Phase-1 rules  (30 %)
+           These pairs are already "known good" atoms — crossing them
+           often finds useful depth-2 chains immediately.
+
+        2. Seeded deeper chains: one hot rule + random pool atoms  (30 %)
+           Biases depth-3+ search toward rules that actually hit targets.
+
+        3. Purely random chains from the full rule pool              (40 %)
+           Provides diversity and prevents premature convergence.
+        """
+        hot = hot_rules[:min(len(hot_rules), 50)]
+        pop_set: set = set()
+
+        n_hot    = int(self.pop_size * 0.30)
+        n_seeded = int(self.pop_size * 0.30)
+        # remainder filled by random
+
+        # 1 — depth-2 hot pairs
+        max_tries = n_hot * 20
+        tries = 0
+        while len(pop_set) < n_hot and tries < max_tries:
+            tries += 1
+            if len(hot) >= 2:
+                a, b = random.sample(hot, 2)
+            elif len(hot) == 1:
+                a = hot[0]
+                b = random.choice(self.rule_pool)
+            else:
+                break
+            pop_set.add((a, b))
+
+        # 2 — seeded deeper chains
+        max_tries = n_seeded * 20
+        tries = 0
+        while len(pop_set) < n_hot + n_seeded and tries < max_tries:
+            tries += 1
+            depth = random.randint(2, self.max_depth)
+            if hot:
+                tokens = [random.choice(hot)] + [
+                    random.choice(self.rule_pool) for _ in range(depth - 1)
+                ]
+                random.shuffle(tokens)
+            else:
+                tokens = self._random_chain(depth)
+            pop_set.add(tuple(tokens))
+
+        # 3 — random fill to pop_size
+        max_tries = self.pop_size * 20
+        tries = 0
+        while len(pop_set) < self.pop_size and tries < max_tries:
+            tries += 1
+            pop_set.add(tuple(self._random_chain()))
+
+        result = [list(ind) for ind in pop_set]
+
+        # Safety: pad to exactly pop_size if set was too sparse
+        while len(result) < self.pop_size:
+            result.append(self._random_chain())
+
+        return result[:self.pop_size]
+
+    # ------------------------------------------------------------------
+    # Fitness evaluation (GPU-batch)
+    # ------------------------------------------------------------------
+
+    def evaluate_population(self, population: list) -> dict:
+        """
+        Evaluate the entire population in batched GPU kernel calls.
+
+        Returns a dict {chain_string: hit_count}.
+        Invalid chains (fail the hashcat validator) score 0 but are kept
+        in the pool to maintain population diversity.
+        """
+        chain_strs   = [' '.join(tokens) for tokens in population]
+        valid_chains = [
+            c for c in chain_strs
+            if HashcatRuleValidator.validate_rule_for_gpu(c)
+        ]
+
+        # Initialise all scores to 0
+        hit_map: dict = {c: 0 for c in chain_strs}
+        if not valid_chains:
+            return hit_map
+
+        wsb = self.gpu_engine.params.get('WORD_SUB_BATCH',   20_000)
+        cbs = self.gpu_engine.params.get('CHAINS_PER_BATCH',  2_000)
+
+        batch_hits: Counter = Counter()
+        for ci in range(0, len(valid_chains), cbs):
+            cb = valid_chains[ci:ci + cbs]
+            for wi in range(0, len(self.base_words), wsb):
+                wb = self.base_words[wi:wi + wsb]
+                if wb:
+                    found = self.gpu_engine._run_chain_kernel(wb, cb)
+                    if found:
+                        batch_hits.update(found)
+            self.gpu_engine.queue.finish()
+
+        hit_map.update(batch_hits)
+        return hit_map
+
+    # ------------------------------------------------------------------
+    # Selection
+    # ------------------------------------------------------------------
+
+    def _tournament_select(self, fitness_list: list) -> list:
+        """
+        Tournament selection.
+
+        Randomly draw <tournament_k> individuals; return the token list of
+        the one with the highest fitness score.
+        """
+        k          = min(self.tournament_k, len(fitness_list))
+        contenders = random.sample(fitness_list, k)
+        winner, _  = max(contenders, key=lambda x: x[1])
+        return list(winner)
+
+    # ------------------------------------------------------------------
+    # Crossover
+    # ------------------------------------------------------------------
+
+    def _crossover(self, p1: list, p2: list) -> tuple:
+        """
+        One-point crossover on rule-token lists.
+
+        A random cut point is chosen independently for each parent.
+        p1[:cut1] + p2[cut2:] forms child 1; p2[:cut2] + p1[cut1:] forms
+        child 2.  Both offspring are clamped to [2, max_depth] tokens.
+
+        If crossover is skipped (random draw > crossover_p) the parents
+        are returned unchanged, ensuring the operation is conservative.
+        """
+        if len(p1) < 2 or len(p2) < 2 or random.random() > self.crossover_p:
+            return list(p1), list(p2)
+
+        cut1 = random.randint(1, len(p1) - 1)
+        cut2 = random.randint(1, len(p2) - 1)
+
+        child1 = self._clamp(p1[:cut1] + p2[cut2:])
+        child2 = self._clamp(p2[:cut2] + p1[cut1:])
+        return child1, child2
+
+    # ------------------------------------------------------------------
+    # Mutation
+    # ------------------------------------------------------------------
+
+    def _mutate(self, tokens: list) -> list:
+        """
+        Apply a single random mutation to a token list.
+
+        Three operators (weights normalised at init):
+          replace  — swap one token with a rule chosen from rule_pool
+          insert   — insert one rule at a random position
+                     (only if current length < max_depth)
+          delete   — remove one token
+                     (only if current length > 2)
+
+        If the selected operator cannot be applied (length constraint),
+        a replace mutation is performed as fallback.
+        """
+        tokens = list(tokens)
+        op     = random.choices(['replace', 'insert', 'delete'],
+                                weights=self._mut_weights)[0]
+
+        if op == 'replace':
+            idx         = random.randrange(len(tokens))
+            tokens[idx] = random.choice(self.rule_pool)
+
+        elif op == 'insert' and len(tokens) < self.max_depth:
+            idx = random.randint(0, len(tokens))
+            tokens.insert(idx, random.choice(self.rule_pool))
+
+        elif op == 'delete' and len(tokens) > 2:
+            idx = random.randrange(len(tokens))
+            tokens.pop(idx)
+
+        else:
+            # Fallback: replace
+            idx         = random.randrange(len(tokens))
+            tokens[idx] = random.choice(self.rule_pool)
+
+        return tokens
+
+    # ------------------------------------------------------------------
+    # Main evolution loop
+    # ------------------------------------------------------------------
+
+    def evolve(
+        self,
+        hot_rules:   list,
+        generations: int,
+        time_budget: float,
+    ) -> Counter:
+        """
+        Run the genetic algorithm for up to *generations* generations or
+        until *time_budget* seconds have elapsed (wall clock).
+
+        Parameters
+        ----------
+        hot_rules     : Phase-1 hit rules, sorted descending by hit count.
+        generations   : Hard cap on generation count.
+        time_budget   : Maximum wall-clock seconds for Phase 3.
+
+        Returns
+        -------
+        Counter
+            All discovered chains that passed the bloom filter, mapped to
+            their highest observed hit count across all generations.
+        """
+        if not self.rule_pool:
+            log_warn("[GA]   Rule pool is empty — skipping Phase 3.")
+            return Counter()
+
+        if time_budget <= 0:
+            log_warn("[GA]   No time budget remaining — skipping Phase 3.")
+            return Counter()
+
+        t_start = time.time()
+        all_new: Counter = Counter()
+        n_elite = max(1, int(self.pop_size * self.elite_frac))
+
+        log_info(
+            f"[GA]   pop={self.pop_size}  max_gen={generations}  "
+            f"elite={self.elite_frac:.0%}  budget={time_budget:.0f}s  "
+            f"pool={len(self.rule_pool):,} rules"
+        )
+
+        # --- Initialise population ---
+        pop = self.initial_population(hot_rules)
+        last_gen = 0
+
+        with tqdm(
+            total=generations,
+            desc=green("  Phase 3 "),
+            unit="gen",
+            ncols=88,
+            bar_format=(
+                "{l_bar}{bar}| {n_fmt}/{total_fmt} "
+                "[{elapsed}<{remaining}] {postfix}"
+            ),
+        ) as pbar:
+
+            for gen in range(generations):
+                last_gen = gen
+
+                # Time guard — checked at the start of every generation
+                if time.time() - t_start >= time_budget:
+                    log_debug(f"[GA]   Time budget exhausted at generation {gen}.")
+                    break
+
+                # --- Evaluate fitness ---
+                hit_map = self.evaluate_population(pop)
+
+                # Merge bloom hits into the running total
+                for chain_str, cnt in hit_map.items():
+                    if cnt > 0 and HashcatRuleValidator.validate_rule_for_gpu(chain_str):
+                        # Keep the highest hit count seen across all gens
+                        if cnt > all_new[chain_str]:
+                            all_new[chain_str] = cnt
+
+                # Build sorted (token_list, score) pairs for selection
+                fitness_list = sorted(
+                    [(tuple(ind), hit_map.get(' '.join(ind), 0)) for ind in pop],
+                    key=lambda x: -x[1],
+                )
+
+                best_score = fitness_list[0][1] if fitness_list else 0
+
+                # --- Elitism: carry top individuals unchanged ---
+                elites     = [list(ind) for ind, _ in fitness_list[:n_elite]]
+                next_pop   = list(elites)
+                next_set   = {tuple(e) for e in elites}
+
+                # --- Breed remainder via selection + crossover + mutation ---
+                max_breed_attempts = (self.pop_size - len(next_pop)) * 6
+                breed_attempts     = 0
+
+                while len(next_pop) < self.pop_size and breed_attempts < max_breed_attempts:
+                    breed_attempts += 1
+
+                    p1 = self._tournament_select(fitness_list)
+                    p2 = self._tournament_select(fitness_list)
+
+                    child1, child2 = self._crossover(p1, p2)
+                    child1 = self._mutate(child1)
+                    child2 = self._mutate(child2)
+
+                    for child in (child1, child2):
+                        key = tuple(child)
+                        if key not in next_set and len(next_pop) < self.pop_size:
+                            next_pop.append(child)
+                            next_set.add(key)
+
+                # --- Diversity fill: pad any remaining slots randomly ---
+                fill_attempts = 0
+                while len(next_pop) < self.pop_size and fill_attempts < self.pop_size * 4:
+                    fill_attempts += 1
+                    ind = tuple(self._random_chain())
+                    if ind not in next_set:
+                        next_pop.append(list(ind))
+                        next_set.add(ind)
+
+                pop = next_pop[:self.pop_size]
+
+                pbar.update(1)
+                pbar.set_postfix(
+                    {"best": cyan(str(best_score)), "new": cyan(str(len(all_new)))},
+                    refresh=False,
+                )
+
+        elapsed = time.time() - t_start
+        log_info(
+            f"[GA]   Evolution complete — "
+            f"{bold(green(str(len(all_new))))} unique chains passed bloom filter  "
+            f"({elapsed:.1f}s, {last_gen + 1} generation(s))"
+        )
+        log_debug(f"Phase 3 GA complete: {len(all_new)} new rules, elapsed={elapsed:.1f}s")
+        return all_new
+
+
 # --------------------------------------------------------------------
 # GPU Extractor
 # --------------------------------------------------------------------
 class GPUExtractor:
     def __init__(self, base_count, target_count, max_depth, device_spec=None,
                  target_hours=0.5, max_chains=None, seed_rules_file=None, bloom_mb=None,
-                 builtin_seeds=True):
-        self.base_count      = base_count
-        self.target_count    = target_count
-        self.max_depth       = max_depth
-        self.device_spec     = device_spec
-        self.max_chains      = max_chains
-        self.seed_rules_file = seed_rules_file
-        self.bloom_mb        = bloom_mb
-        self.builtin_seeds   = builtin_seeds
-        self.params          = calculate_dynamic_parameters(
+                 builtin_seeds=True,
+                 genetic=False, genetic_generations=50,
+                 genetic_pop=200, genetic_elite=0.15):
+        self.base_count          = base_count
+        self.target_count        = target_count
+        self.max_depth           = max_depth
+        self.device_spec         = device_spec
+        self.max_chains          = max_chains
+        self.seed_rules_file     = seed_rules_file
+        self.bloom_mb            = bloom_mb
+        self.builtin_seeds       = builtin_seeds
+        self.genetic             = genetic
+        self.genetic_generations = genetic_generations
+        self.genetic_pop         = genetic_pop
+        self.genetic_elite       = genetic_elite
+        self.params              = calculate_dynamic_parameters(
             base_count, target_count, None, target_hours, bloom_mb_override=bloom_mb)
         self.params['MAX_CHAIN_DEPTH'] = max_depth
-        self.rules_gen       = GPUCompatibleRulesGenerator()
-        self.gpu_engine      = GPUEngine(self.params)
-        self.validator       = HashcatRuleValidator()
+        self.rules_gen           = GPUCompatibleRulesGenerator()
+        self.gpu_engine          = GPUEngine(self.params)
+        self.validator           = HashcatRuleValidator()
 
     def load_seed_rules(self):
         if not self.seed_rules_file: return []
@@ -1993,6 +2458,55 @@ class GPUExtractor:
             all_counts.update(chains)
             log_debug(f"Phase 2 elapsed: {time.time()-ts:.1f}s")
 
+        # --- Phase 3: Genetic Algorithm Rule Evolution (optional) ---
+        if self.genetic and self.max_depth >= 2:
+            log_section("PHASE 3 — Genetic Algorithm Rule Evolution")
+
+            # Build the rule pool from Phase-1 validated rules.
+            # We use only the rules that the GPU validator accepts so that
+            # every individual in the population is always a legal chain.
+            rule_pool = HashcatRuleValidator.validate_rules_for_gpu(rules_phase1)
+
+            # Seed the GA with the hottest Phase-1 hits (most bloom hits first).
+            hot_rules = [
+                r for r, _ in sorted(
+                    single.items(), key=lambda kv: -kv[1]
+                )
+            ]
+
+            # Time remaining after Phase 1 + Phase S + Phase 2
+            t_now     = time.time()
+            remaining = max(0.0, self.params['TARGET_SECONDS'] - (t_now - t0))
+
+            if remaining < 5.0:
+                log_warn(
+                    f"[GA]   Only {remaining:.1f}s remaining — "
+                    "consider raising --target-hours for Phase 3."
+                )
+
+            evolver = GeneticRuleEvolver(
+                gpu_engine        = self.gpu_engine,
+                base_words        = base_words,
+                rule_pool         = rule_pool,
+                max_depth         = self.max_depth,
+                pop_size          = self.genetic_pop,
+                elite_frac        = self.genetic_elite,
+            )
+
+            ga_hits = evolver.evolve(
+                hot_rules   = hot_rules,
+                generations = self.genetic_generations,
+                time_budget = remaining,
+            )
+
+            before = len(all_counts)
+            all_counts.update(ga_hits)
+            new_from_ga = len(all_counts) - before
+            log_info(
+                f"[GA]   {bold(cyan(str(new_from_ga)))} net new rules added "
+                f"by Phase 3  ({bold(green(str(len(ga_hits))))} total GA hits)"
+            )
+
         validated = Counter({r: c for r,c in all_counts.items()
                              if HashcatRuleValidator.validate_rule_for_gpu(r)})
         log_debug(f"Post-validation: {len(validated)} rules from {len(all_counts)} raw")
@@ -2083,6 +2597,42 @@ def main() -> None:
                          'leet+transform). '
                          'By default Phase S always runs; pass this flag to skip it '
                          'and rely solely on Phase 1 atomic rules and Phase 2 random chains.')
+
+    # ---- Phase 3: Genetic Algorithm ----------------------------------
+    ga = ap.add_argument_group(
+        'Phase 3 — Genetic Algorithm',
+        'Optional evolutionary search that runs after Phase 2 and guides '
+        'chain generation toward high-coverage rules. '
+        'Activated with --genetic.'
+    )
+    ga.add_argument(
+        '--genetic', action='store_true',
+        help='Enable Phase 3 genetic algorithm rule evolution '
+             '(runs after Phase 2, uses remaining time budget).',
+    )
+    ga.add_argument(
+        '--genetic-generations', type=int, default=50,
+        metavar='N',
+        help='Maximum number of GA generations to run (default: 50). '
+             'Each generation performs a full GPU fitness evaluation of '
+             'the entire population, so larger values extend runtime.',
+    )
+    ga.add_argument(
+        '--genetic-pop', type=int, default=200,
+        metavar='N',
+        help='GA population size — number of rule chains per generation '
+             '(default: 200).  Larger populations improve coverage at the '
+             'cost of more GPU evaluations per generation.',
+    )
+    ga.add_argument(
+        '--genetic-elite', type=float, default=0.15,
+        metavar='F',
+        help='Fraction of the top-scoring individuals carried unchanged '
+             'into the next generation (default: 0.15 = 15 %%).  '
+             'Higher values stabilise convergence; lower values increase '
+             'diversity.',
+    )
+
     ap.add_argument('--debug',        action='store_true',
                     help='Enable verbose/debug output')
 
@@ -2122,6 +2672,18 @@ def main() -> None:
     if args.seed_rules:
         log_info(f"  seeds     : {bold(args.seed_rules)}  "
                  f"{dim('(singles -> Phase 1 + Phase 2 atoms | chains -> Phase 2 direct)')}")
+    if args.genetic:
+        # Validate --genetic-elite range
+        if not 0.0 < args.genetic_elite < 1.0:
+            log_error("--genetic-elite must be between 0.0 and 1.0 (exclusive).")
+            sys.exit(1)
+        log_info(
+            f"  {bold(green('Phase 3 GA'))} : "
+            f"enabled  |  "
+            f"pop={bold(str(args.genetic_pop))}  "
+            f"gen={bold(str(args.genetic_generations))}  "
+            f"elite={bold(f'{args.genetic_elite:.0%}')}"
+        )
     log_debug(f"Full args: {vars(args)}")
     print()
 
@@ -2136,7 +2698,12 @@ def main() -> None:
         len(base_words), len(target_words), args.max_depth,
         args.device, args.target_hours, args.max_chains,
         args.seed_rules, args.bloom_mb,
-        builtin_seeds=not args.no_builtin_seeds)
+        builtin_seeds        = not args.no_builtin_seeds,
+        genetic              = args.genetic,
+        genetic_generations  = args.genetic_generations,
+        genetic_pop          = args.genetic_pop,
+        genetic_elite        = args.genetic_elite,
+    )
 
     depth_overrides = {f'depth{i}_override': getattr(args, f'depth{i}_chains')
                        for i in range(2, 11)}
@@ -2179,6 +2746,11 @@ def main() -> None:
         f.write(f"# Target         : {os.path.basename(args.target_wordlist)}\n")
         f.write(f"# Depth          : 1–{args.max_depth}\n")
         f.write(f"# Bloom          : {args.bloom_mb or BLOOM_FILTER_MAX_MB} MB\n")
+        if args.genetic:
+            f.write(f"# Phase 3 GA     : enabled  "
+                    f"pop={args.genetic_pop}  "
+                    f"gen={args.genetic_generations}  "
+                    f"elite={args.genetic_elite:.0%}\n")
         f.write("#\n")
         f.write(f"# GPU raw candidates      : {len(raw_counts):,}  "
                 f"(bloom hits, includes false positives)\n")
@@ -2205,6 +2777,9 @@ def main() -> None:
              f"({elapsed/3600:.3f}h)")
     log_info(cyan(sep))
     log_info(f"  GPU raw candidates : {bold(str(len(raw_counts)))}")
+    if args.genetic:
+        log_info(f"  Phase 3 GA         : {bold(green('enabled'))}  "
+                 f"pop={args.genetic_pop}  gen={args.genetic_generations}")
     log_info(f"  Rules kept         : {bold(green(str(final_rules)))}  "
              f"{dim('('+depth_summary+')')}")
     log_info(f"  Rules removed      : {bold(red(str(removed)))}")
