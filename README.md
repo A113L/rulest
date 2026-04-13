@@ -18,6 +18,7 @@
 - [Architecture (v2)](#-architecture-v2)
   - [Extraction Pipeline](#extraction-pipeline)
 - [Built-in Seed Families (A–M)](#-built-in-seed-families)
+- [Phase 3 — Genetic Algorithm](#-phase-3--genetic-algorithm)
 - [Functional Minimization](#-functional-minimization)
 - [Rule Categories](#-rule-categories)
 - [GPU Command Support](#-gpu-command-support)
@@ -68,6 +69,7 @@ A complete redesign built around GPU efficiency, Hashcat compatibility, and inte
 - ✅ **Dynamic VRAM-aware** batch and budget sizing (scales with available VRAM; baseline 8 GB)
 - ✅ **Hot-rule biased** chain generation using Phase 1 results (60% hot-rule bias, configurable via `HOT_RULE_RATIO`)
 - ✅ **User seed rules** support via `--seed-rules` to guide chain exploration (30% budget allocated to extending seeds)
+- ✅ **Phase 3 Genetic Algorithm** (`--genetic`): optional evolutionary search that runs after Phase 2, guided by bloom-filter coverage — breeds high-scoring chains to find deep-chain patterns that random sampling misses
 - ✅ Per-depth chain budget overrides (depths 2–10)
 - ✅ Unlimited result cap (no global ceiling)
 - ✅ Full **hit counting** and frequency-ranked output
@@ -84,8 +86,9 @@ A complete redesign built around GPU efficiency, Hashcat compatibility, and inte
 | **Rule validation** | None — invalid rules passed to Hashcat | Full `HashcatRuleValidator` against GPU spec (max 31 ops) |
 | **Functional minimization** | ❌ Not implemented | ✅ Signature-based deduplication via `minimize_by_signature`; removes 20–60% of raw candidates |
 | **Rule set size** | ~2,700 static rules | 5,600+ GPU-validated Hashcat single rules across 9 categories |
-| **Search strategy** | Naive BFS — every rule applied blindly | Phase 1 single-rule sweep → Phase S built-in seed extraction → Phase 2 hot-biased chain generation |
+| **Search strategy** | Naive BFS — every rule applied blindly | Phase 1 single-rule sweep → Phase S built-in seed extraction → Phase 2 hot-biased chain generation → Phase 3 GA (optional) |
 | **Built-in seed families** | ❌ Not implemented | ✅ Thirteen families (A–M): numeric prepend/append, mixed, transform+digit, date patterns, special-char append/prepend/transform/combo (F–I), leet substitutions (J), double-transform chains (K), special-before-digit (L), leet+transform (M); run by default as a dedicated pass independent of `--max-depth`; disable with `--no-builtin-seeds` |
+| **Genetic algorithm** | ❌ Not implemented | ✅ Optional Phase 3 (`--genetic`): evolutionary search guided by bloom-filter hits; discovers deep-chain patterns that random Phase 2 sampling misses |
 | **Target lookup** | Python `set` (host RAM, per-result) | 16–256 MB Bloom filter uploaded once to GPU VRAM (FNV-1a, 4 hash functions) |
 | **Chain state** | Temp `.tmp` files on disk per depth | In-memory, GPU buffer-based with proper release and `gc.collect()` |
 | **Memory management** | Halve batch on OOM, no VRAM awareness | Dynamic sizing based on actual free VRAM estimate + 55% usage safety factor |
@@ -103,6 +106,8 @@ The core algorithmic difference matters at scale:
 **v1 BFS:** Every word × every rule at each depth level. At depth 2 with 2,700 rules and 100,000 base words: **270 million combinations per depth**, with no prioritization. State must be written to disk between depths, creating an I/O bottleneck. Rules that never produce hits are retried at every depth.
  
 **v2 Informed Generation:** Phase 1 identifies which individual rules ("hot rules") actually hit the target dictionary. Phase 2 then generates chains **biased 60% toward hot rules** (configurable via `HOT_RULE_RATIO`). An additional 30% of the budget extends known-good seed chains. This dramatically reduces wasted GPU cycles and finds effective multi-rule sequences far faster than exhaustive BFS.
+ 
+**Phase 3 GA (optional):** Where Phase 2 still samples randomly within the hot-rule-biased pool, the genetic algorithm *evolves* chains by recombining and mutating the highest-scoring ones each generation. This is particularly effective at depth ≥ 3 where the search space (`|pool|^depth`) is too large for exhaustive or purely random coverage.
  
 ---
  
@@ -159,7 +164,7 @@ usage: rulest_v2.py [options] base_wordlist target_wordlist
 | `--max-depth` | `2` | Maximum rule chain depth (1–31; depths >31 capped with a warning) |
 | `-o`, `--output` | `rulest_output.txt` | Output file path |
 | `--max-chains` | unlimited | Hard cap on total chains generated |
-| `--target-hours` | `0.5` | Time budget in hours; controls chain generation budget |
+| `--target-hours` | `0.5` | Time budget in hours; controls chain generation budget for Phase 2 and Phase 3 |
 | `--seed-rules` | None | File of user-supplied rules/chains. Single-rule seeds are injected into Phase 1 **and** used as Phase 2 chain atoms; multi-rule chain seeds are tested directly in Phase 2. Does not affect the built-in seed families (Phase S). |
 | `--list-devices` | — | Print all available OpenCL devices and exit |
 | `--device` | best GPU | Device index (e.g. `0`) or name substring (e.g. `NVIDIA`) |
@@ -170,6 +175,15 @@ usage: rulest_v2.py [options] base_wordlist target_wordlist
 | `--allow-reject-rules` | off | Include rejection rules (normally excluded as GPU-incompatible) |
 | `--no-builtin-seeds` | off | Disable the built-in seed families (Phase S). By default Phase S always runs; pass this flag to skip it entirely and rely solely on Phase 1 atomic rules and Phase 2 random chains. Useful for faster runs or when supplying all seeds via `--seed-rules`. Skips all thirteen families (A–M): numeric, date-pattern, special-character, leet substitution, double-transform, special-before-digit, and leet+transform. |
 | `--debug` | off | Enable verbose output (sets `VERBOSE = True` at runtime) |
+ 
+#### Phase 3 — Genetic Algorithm Arguments
+ 
+| Flag | Default | Description |
+|---|---|---|
+| `--genetic` | off | Enable Phase 3 genetic algorithm rule evolution. Runs after Phase 2, consuming the remaining time budget from `--target-hours`. Has no effect at `--max-depth 1` (chains require at least depth 2). |
+| `--genetic-generations` | `50` | Maximum number of GA generations. Each generation performs a full GPU fitness evaluation of the entire population, so larger values extend runtime proportionally. |
+| `--genetic-pop` | `200` | GA population size — number of rule chains evaluated per generation. Larger populations improve search coverage at the cost of more GPU evaluations per generation. |
+| `--genetic-elite` | `0.15` | Fraction of top-scoring individuals carried unchanged into the next generation (elitism). Must be strictly between 0.0 and 1.0. Higher values stabilise convergence; lower values increase diversity. |
  
 #### Legacy v1 Reference
  
@@ -195,7 +209,7 @@ usage: rulest.py -w WORDLIST [-b BASE_WORDLIST] [-d CHAIN_DEPTH]
 │  │                                               │  │
 │  │  ┌─────────────┐    ┌───────────────────────┐ │  │
 │  │  │ Bloom Filter│    │  OpenCL Kernel        │ │  │
-│  │  │ (16–256 MB   │    │  ┌─────────────────┐  │ │  │
+│  │  │ (16–256 MB  │    │  ┌─────────────────┐  │ │  │
 │  │  │  VRAM)      │    │  │find_single_rules│  │ │  │
 │  │  └─────────────┘    │  ├─────────────────┤  │ │  │
 │  │                     │  │find_rule_chains │  │ │  │
@@ -205,16 +219,21 @@ usage: rulest.py -w WORDLIST [-b BASE_WORDLIST] [-d CHAIN_DEPTH]
 │  │                                               │  │
 │  │  Phase S ────────▶  Built-in seed families   │  │
 │  │  (Families A–M;      direct extraction pass,  │  │
-│  │   default on;        depth 2–9 seeds;         │  │
+│  │   default on;        depth 2–9 seeds)         │  │
 │  │                                               │  │
 │  │  Phase 2 ────────▶  Informed chain generation │  │
 │  │  (hot-biased,        + seed extension         │  │
 │  │   VRAM-budgeted)                              │  │
+│  │                                               │  │
+│  │  Phase 3 ────────▶  GeneticRuleEvolver        │  │
+│  │  (--genetic;         evolve chains by fitness  │  │
+│  │   uses remaining     tournament select +       │  │
+│  │   time budget)       crossover + mutation      │  │
 │  └───────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────┘
          │
          ▼
-  HashcatRuleValidator  →  GPU-safe output (.rule file)
+  HashcatRuleValidator  →  minimize_by_signature  →  GPU-safe output (.rule file)
 ```
  
 ### Extraction Pipeline
@@ -232,6 +251,12 @@ Using Phase 1 hit data, chains are generated with a bias toward rules that alrea
 - **10%** is allocated to random exploration
  
 The remaining time budget (total `--target-hours` minus Phase 1 + Phase S duration) is split evenly across requested depths. User seed rules from `--seed-rules` are extended to deeper depths automatically.
+ 
+**Phase 3 — Genetic Algorithm** *(optional, `--genetic`)*
+An evolutionary search that runs after Phase 2 using whatever wall-clock time remains from `--target-hours`. See [Phase 3 — Genetic Algorithm](#-phase-3--genetic-algorithm) for full details.
+ 
+**Post-processing — Signature-Based Minimization**
+After all phases complete, every candidate rule is applied to the built-in probe set in pure Python. Rules producing identical outputs on all probe words are grouped; only the highest-GPU-hit representative per group survives. See [Functional Minimization](#-functional-minimization) for details.
  
 ### Bloom Filter
  
@@ -429,19 +454,111 @@ Every leet substitution op paired with every structural transform op in both ord
  
 | Family | Description | New in | Approx. seeds (d≥2) |
 |---|---|---|---|
-| A | Pure prepend digits | v2 | 11 100 |
-| B | Pure append digits | v2 | 11 100 |
-| C | Mixed prepend/append | v2 | ~168 000 |
-| D | Transform + digit/bracket | v2 | ~167 000 |
-| E | Date patterns | v2 | ~varies |
-| F | Append special chars | v2 | 3 600 |
-| G | Prepend special chars | v2| 3 600 |
-| H | Transform + special char | v2 | 13 950 |
-| I | Digit(s) + special char | v2 | 15 540 |
-| J | Leet substitutions | v2 | ~520 |
-| K | Double-transform | v2 | 225 |
-| L | Special-before-digit |v2 | 1 540 |
-| M | Leet + transform | v2 | ~300 |
+| A | Pure prepend digits | v1 | 11 100 |
+| B | Pure append digits | v1 | 11 100 |
+| C | Mixed prepend/append | v1 | ~168 000 |
+| D | Transform + digit/bracket | v1 | ~167 000 |
+| E | Date patterns | v1 | ~varies |
+| F | Append special chars | v1 → depth 3 added v2.1 | 3 600 |
+| G | Prepend special chars | v1 → depth 3 added v2.1 | 3 600 |
+| H | Transform + special char | v1 | 13 950 |
+| I | Digit(s) + special char | v1 | 15 540 |
+| J | Leet substitutions | **v2.1** | ~520 |
+| K | Double-transform | **v2.1** | 225 |
+| L | Special-before-digit | **v2.1** | 1 540 |
+| M | Leet + transform | **v2.1** | ~300 |
+ 
+---
+ 
+## 🧬 Phase 3 — Genetic Algorithm
+ 
+Phase 3 is an optional evolutionary search activated by `--genetic`. It runs **after Phase 2**, consuming whatever wall-clock time remains from `--target-hours`, and all results are merged into the global hit counter before signature minimization.
+ 
+### Why a Genetic Algorithm
+ 
+Phase 2 samples rule chains from a hot-rule-biased pool, but the sampling is still **random**: at chain depth 3 with 5 000 atomic rules the search space is `5 000³ = 125 billion` candidates. Even a well-biased random sampler cannot explore that space thoroughly in a fixed time budget.
+ 
+A genetic algorithm solves this by **directing** the search. Chains that produce many bloom-filter hits ("high-fitness individuals") are preferentially recombined and mutated, so successive generations concentrate probability mass on high-coverage regions of the rule space. The GA reuses the existing GPU chain kernel for fitness evaluation — no new OpenCL code is required.
+ 
+### Algorithm
+ 
+```
+Initial population
+  30 % — depth-2 combos of top-50 hot Phase-1 rules
+  30 % — seeded deeper chains (1 hot rule + random atoms)
+  40 % — purely random chains from the full rule pool
+
+For each generation:
+  1. Evaluate fitness   — _run_chain_kernel hit count per chain (GPU batch)
+  2. Merge hits         — new bloom-filter hits added to all_counts
+  3. Sort by score      — build ranked (chain, score) list
+  4. Elitism            — top elite_frac % copied unchanged to next generation
+  5. Tournament select  — draw k=4 contenders; highest score wins
+  6. One-point crossover — random cut on each parent's token list (p=0.80)
+  7. Mutation           — replace / insert / delete one token (60/20/20 %)
+  8. Diversity fill     — duplicate chains replaced by random individuals
+  9. Repeat until generations exhausted or wall-clock budget reached
+```
+ 
+### Population Initialisation
+ 
+The initial population is seeded from Phase 1 results to give the GA a strong starting point:
+ 
+| Slice | Strategy | Rationale |
+|---|---|---|
+| 30 % | Depth-2 combos of the top-50 hot rules | These pairs are already "known good" atoms — often produce immediate hits in generation 0 |
+| 30 % | Seeded deeper chains: 1 hot rule + random pool atoms (depth 2–max) | Biases depth-3+ search toward rules that actually hit targets, while maintaining structural variety |
+| 40 % | Purely random chains from the full rule pool | Prevents premature convergence; ensures the GA can discover patterns outside the hot-rule bias |
+ 
+### Crossover
+ 
+One-point crossover exchanges rule-token sub-sequences between two parents at independently chosen cut points:
+ 
+```
+parent 1:  [ c ]  [ $1 ]  [ $! ]  [ r ]
+                    ↑ cut1
+parent 2:  [ u ]  [ sa@ ]  [ so0 ]
+                              ↑ cut2
+
+child 1:   [ c ]  [ $1 ] + [ so0 ]          →  "c $1 so0"
+child 2:   [ u ]  [ sa@ ] + [ $! ]  [ r ]   →  "u sa@ $! r"
+```
+ 
+Both offspring are clamped to `[2, --max-depth]` tokens. If the crossover probability draw fails (20% of the time) both parents are passed unchanged, ensuring elitism is not undermined.
+ 
+### Mutation
+ 
+Each offspring undergoes exactly one mutation drawn from three operators with normalised weights (default 60/20/20):
+ 
+| Operator | Weight | Action | Constraint |
+|---|---|---|---|
+| **replace** | 60 % | Swap one random token with a rule drawn from the pool | Always applicable |
+| **insert** | 20 % | Insert one random rule at a random position | Only if `len < max_depth`; falls back to replace |
+| **delete** | 20 % | Remove one random token | Only if `len > 2`; falls back to replace |
+ 
+### Fitness and Hit Merging
+ 
+Fitness is the bloom-filter hit count returned by `_run_chain_kernel` when the chain is applied to all base words. This is exactly the same metric used in Phases 1 and 2, so all discoveries are directly comparable and merge cleanly into the existing counter. For each chain the **maximum hit count seen across all generations** is retained, which means a chain that scores highly in a later generation after mutation still contributes its best score to the final output.
+ 
+### Time Budget
+ 
+Phase 3 inherits the wall-clock budget framework already used by Phase 2. The available time is:
+ 
+```
+time_for_phase3 = target_hours × 3600  −  (elapsed for Phase 1 + Phase S + Phase 2)
+```
+ 
+If less than 5 seconds remain when Phase 3 starts, a warning is printed and the GA still runs (even one generation can add value). To guarantee Phase 3 has meaningful time, either increase `--target-hours` or reduce `--genetic-generations`/`--genetic-pop`.
+ 
+### Interaction with Other Phases
+ 
+| Setting | Effect on Phase 3 |
+|---|---|
+| `--max-depth 1` | Phase 3 is silently skipped (chains require depth ≥ 2) |
+| `--no-builtin-seeds` | Phase S is skipped; Phase 3 is unaffected |
+| `--seed-rules` | Seed singles appear in the rule pool available to the GA; chain seeds do not affect Phase 3 |
+| `--genetic-pop 400 --genetic-generations 100` | Doubles population and generation count; roughly doubles Phase 3 GPU time |
+| `--target-hours 3.0` | Provides more wall-clock budget for all phases; Phase 3 benefits proportionally |
  
 ---
  
@@ -463,7 +580,7 @@ After GPU extraction, `rulest_v2.py` applies a **signature-based functional mini
  
 ### Why It Matters
  
-GPU Bloom filter screening (Phase 1 & 2) can yield thousands of candidates where many are functionally identical — for example, `c` (capitalize first letter) and a chain `l c` applied to an already-lowercase word produce the same output. Without minimization, the output file contains duplicate work that inflates Hashcat's rule-testing time without adding new candidate passwords.
+GPU Bloom filter screening (Phase 1, 2 & 3) can yield thousands of candidates where many are functionally identical — for example, `c` (capitalize first letter) and a chain `l c` applied to an already-lowercase word produce the same output. Without minimization, the output file contains duplicate work that inflates Hashcat's rule-testing time without adding new candidate passwords.
  
 Minimization typically removes **20–60% of raw candidates** depending on chain depth and wordlist diversity, leaving a tighter, faster ruleset with no reduction in theoretical coverage.
  
@@ -545,6 +662,8 @@ These constants are defined at the top of `rulest_v2.py` and can be tuned for ad
 | `MAX_CHAIN_STRING_LEN` | `128` | Maximum chained rule string length in GPU buffers |
 | `MAX_HASHCAT_CHAIN` | `31` | Maximum number of rules in a single Hashcat chain |
  
+> Phase 3 GA parameters (`--genetic-pop`, `--genetic-generations`, `--genetic-elite`) are CLI-only and have no corresponding module-level constants.
+ 
 ---
  
 ## 📄 Output Format
@@ -558,6 +677,7 @@ These constants are defined at the top of `rulest_v2.py` and can be tuned for ad
 # Target         : target_plain.txt
 # Depth          : 1–3
 # Bloom          : 256 MB
+# Phase 3 GA     : enabled  pop=200  gen=50  elite=15%
 #
 # GPU raw candidates      : 9,214  (bloom hits, includes false positives)
 # Post-processing         : signature-based minimization
@@ -576,6 +696,7 @@ sa@ $0
 ...
 ```
  
+- The `# Phase 3 GA` header line is only written when `--genetic` is active
 - The identity rule (`:`) is always written first for Hashcat compatibility
 - Rules are sorted by hit frequency (descending), then by chain depth, then alphabetically
 - The header records both the raw Bloom candidate count and the post-minimization count, so you can see exactly how many equivalent rules were removed
@@ -597,6 +718,12 @@ sa@ $0
 | Limit total combinations | `--max-chains 500000` to cap generation before scaling |
 | Reduce terminal noise | Set `VERBOSE = False` in the script header or omit `--debug` |
 | Increase hot-rule aggressiveness | Raise `HOT_RULE_RATIO` toward `1.0` (reduces random exploration) |
+| Enable evolutionary search | Add `--genetic` — effective for depth ≥ 3 where random sampling is sparse |
+| Speed up GA per generation | Lower `--genetic-pop` (e.g. `100`) — fewer GPU evaluations per generation |
+| Improve GA convergence quality | Raise `--genetic-pop` (e.g. `500`) and `--genetic-generations` (e.g. `100`) |
+| Reduce GA premature convergence | Lower `--genetic-elite` (e.g. `0.05`) for more diversity each generation |
+| Stabilise GA on narrow targets | Raise `--genetic-elite` (e.g. `0.25`) to preserve top chains longer |
+| GA with a very short time budget | Reduce `--genetic-generations` to match available time; even 5–10 generations add value |
  
 ### VRAM Scaling Reference
  
@@ -612,12 +739,12 @@ sa@ $0
  
 **Basic single-depth extraction:**
 ```bash
-python rulest_v2.py rockyou.txt target_hashes_plain.txt -d 1 -o single_rules.txt
+python rulest_v2.py rockyou.txt target_hashes_plain.txt --max-depth 1 -o single_rules.txt
 ```
  
 **Deep chain search with a 2-hour budget:**
 ```bash
-python rulest_v2.py rockyou.txt target.txt -d 4 --target-hours 2.0 -o chains_deep.txt
+python rulest_v2.py rockyou.txt target.txt --max-depth 4 --target-hours 2.0 -o chains_deep.txt
 ```
  
 **Use a specific GPU and seed from a previous run:**
@@ -625,7 +752,7 @@ python rulest_v2.py rockyou.txt target.txt -d 4 --target-hours 2.0 -o chains_dee
 python rulest_v2.py base.txt target.txt \
   --device "RTX 3080" \
   --seed-rules single_rules.txt \
-  -d 3 --target-hours 1.0 \
+  --max-depth 3 --target-hours 1.0 \
   -o refined_chains.txt
 ```
  
@@ -636,7 +763,7 @@ python rulest_v2.py --list-devices
  
 **Override chain budget for specific depths:**
 ```bash
-python rulest_v2.py base.txt target.txt -d 5 \
+python rulest_v2.py base.txt target.txt --max-depth 5 \
   --depth2-chains 200000 \
   --depth3-chains 100000 \
   --depth4-chains 30000 \
@@ -644,23 +771,61 @@ python rulest_v2.py base.txt target.txt -d 5 \
   -o custom_budget.txt
 ```
  
+**Genetic algorithm — minimal invocation:**
+```bash
+# Enable Phase 3 with defaults (pop=200, gen=50, elite=15%)
+python rulest_v2.py base.txt target.txt \
+  --max-depth 3 \
+  --target-hours 1.5 \
+  --genetic \
+  -o evolved_rules.txt
+```
+ 
+**Genetic algorithm — tuned for deep chain discovery:**
+```bash
+# Larger population and more generations; needs extra time budget
+python rulest_v2.py rockyou.txt target.txt \
+  --max-depth 4 \
+  --target-hours 4.0 \
+  --genetic \
+  --genetic-pop 400 \
+  --genetic-generations 100 \
+  --genetic-elite 0.10 \
+  -o evolved_deep.txt
+```
+ 
+**Genetic algorithm — fast iteration on a small target:**
+```bash
+# Small pop + few generations when time is tight
+python rulest_v2.py base.txt target.txt \
+  --max-depth 3 \
+  --target-hours 0.5 \
+  --genetic \
+  --genetic-pop 100 \
+  --genetic-generations 20 \
+  -o quick_ga.txt
+```
+ 
 **Iterative refinement workflow:**
 ```bash
 # Pass 1 — fast sweep for single rules
-python rulest_v2.py rockyou.txt target.txt -d 1 --target-hours 0.25 -o pass1.txt
+python rulest_v2.py rockyou.txt target.txt --max-depth 1 --target-hours 0.25 -o pass1.txt
  
 # Pass 2 — chain from pass 1 results
-python rulest_v2.py rockyou.txt target.txt -d 3 --target-hours 1.0 \
+python rulest_v2.py rockyou.txt target.txt --max-depth 3 --target-hours 1.0 \
   --seed-rules pass1.txt -o pass2.txt
  
-# Pass 3 — deep dive seeded from pass 2
-python rulest_v2.py rockyou.txt target.txt -d 5 --target-hours 4.0 \
-  --seed-rules pass2.txt -o pass3_final.txt
+# Pass 3 — deep dive with GA seeded from pass 2
+python rulest_v2.py rockyou.txt target.txt --max-depth 5 --target-hours 4.0 \
+  --seed-rules pass2.txt \
+  --genetic --genetic-generations 75 --genetic-pop 300 \
+  -o pass3_final.txt
 ```
+ 
 **Skip built-in seed families (Phase S disabled):**
 ```bash
 # Faster run when you supply all seeds yourself and don't need families A–M
-python rulest_v2.py base.txt target.txt -d 3 --target-hours 1.0 \
+python rulest_v2.py base.txt target.txt --max-depth 3 --target-hours 1.0 \
   --seed-rules my_seeds.txt \
   --no-builtin-seeds \
   -o no_phase_s.txt
@@ -669,11 +834,22 @@ python rulest_v2.py base.txt target.txt -d 3 --target-hours 1.0 \
 **Benchmark Phase S contribution:**
 ```bash
 # With built-in seeds (default — families A–M)
-python rulest_v2.py base.txt target.txt -d 2 -o with_seeds.txt
+python rulest_v2.py base.txt target.txt --max-depth 2 -o with_seeds.txt
  
 # Without built-in seeds — compare output sizes to measure Phase S value
-python rulest_v2.py base.txt target.txt -d 2 --no-builtin-seeds -o without_seeds.txt
+python rulest_v2.py base.txt target.txt --max-depth 2 --no-builtin-seeds -o without_seeds.txt
 ```
+ 
+**Benchmark Phase 3 GA contribution:**
+```bash
+# Without GA — baseline
+python rulest_v2.py base.txt target.txt --max-depth 3 --target-hours 2.0 -o no_ga.txt
+ 
+# With GA — compare rule count and depth distribution
+python rulest_v2.py base.txt target.txt --max-depth 3 --target-hours 2.0 \
+  --genetic -o with_ga.txt
+```
+ 
 ---
  
 ## 📝 License
@@ -681,6 +857,7 @@ python rulest_v2.py base.txt target.txt -d 2 --no-builtin-seeds -o without_seeds
 MIT
  
 ## Credits
+
  
 MIT
  
