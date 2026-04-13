@@ -454,19 +454,19 @@ Every leet substitution op paired with every structural transform op in both ord
  
 | Family | Description | New in | Approx. seeds (d≥2) |
 |---|---|---|---|
-| A | Pure prepend digits | v1 | 11 100 |
-| B | Pure append digits | v1 | 11 100 |
-| C | Mixed prepend/append | v1 | ~168 000 |
-| D | Transform + digit/bracket | v1 | ~167 000 |
-| E | Date patterns | v1 | ~varies |
-| F | Append special chars | v1 → depth 3 added v2.1 | 3 600 |
-| G | Prepend special chars | v1 → depth 3 added v2.1 | 3 600 |
-| H | Transform + special char | v1 | 13 950 |
+| A | Pure prepend digits | v2 | 11 100 |
+| B | Pure append digits | v2 | 11 100 |
+| C | Mixed prepend/append | v2 | ~168 000 |
+| D | Transform + digit/bracket | v2 | ~167 000 |
+| E | Date patterns | v2 | ~varies |
+| F | Append special chars | v2 | 3 600 |
+| G | Prepend special chars | v2 | 3 600 |
+| H | Transform + special char | v2 | 13 950 |
 | I | Digit(s) + special char | v1 | 15 540 |
-| J | Leet substitutions | **v2.1** | ~520 |
-| K | Double-transform | **v2.1** | 225 |
-| L | Special-before-digit | **v2.1** | 1 540 |
-| M | Leet + transform | **v2.1** | ~300 |
+| J | Leet substitutions | v2 | ~520 |
+| K | Double-transform | v2 | 225 |
+| L | Special-before-digit | v2 | 1 540 |
+| M | Leet + transform | v2 | ~300 |
  
 ---
  
