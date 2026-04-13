@@ -857,9 +857,4 @@ python rulest_v2.py base.txt target.txt --max-depth 3 --target-hours 2.0 \
 MIT
  
 ## Credits
-
- 
-MIT
- 
-## Credits
 https://github.com/synacktiv/rulesfinder
