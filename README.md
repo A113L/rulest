@@ -462,7 +462,7 @@ Every leet substitution op paired with every structural transform op in both ord
 | F | Append special chars | v2 | 3 600 |
 | G | Prepend special chars | v2 | 3 600 |
 | H | Transform + special char | v2 | 13 950 |
-| I | Digit(s) + special char | v1 | 15 540 |
+| I | Digit(s) + special char | v2 | 15 540 |
 | J | Leet substitutions | v2 | ~520 |
 | K | Double-transform | v2 | 225 |
 | L | Special-before-digit | v2 | 1 540 |
@@ -486,7 +486,7 @@ A genetic algorithm solves this by **directing** the search. Chains that produce
 Initial population
   30 % — depth-2 combos of top-50 hot Phase-1 rules
   30 % — seeded deeper chains (1 hot rule + random atoms)
-  40 % — purely random chains from the full rule pool
+  40 % — Phase-S builtin seed families (A–M), or random fallback when --no-builtin-seeds
 
 For each generation:
   1. Evaluate fitness   — _run_chain_kernel hit count per chain (GPU batch)
@@ -508,7 +508,7 @@ The initial population is seeded from Phase 1 results to give the GA a strong st
 |---|---|---|
 | 30 % | Depth-2 combos of the top-50 hot rules | These pairs are already "known good" atoms — often produce immediate hits in generation 0 |
 | 30 % | Seeded deeper chains: 1 hot rule + random pool atoms (depth 2–max) | Biases depth-3+ search toward rules that actually hit targets, while maintaining structural variety |
-| 40 % | Purely random chains from the full rule pool | Prevents premature convergence; ensures the GA can discover patterns outside the hot-rule bias |
+| 40 % | Phase-S builtin seed families (A–M); falls back to random chains when `--no-builtin-seeds` is set | High-hit Phase S chains dramatically improve starting coverage; random fallback preserves diversity when seeds are disabled |
  
 ### Crossover
  
@@ -555,7 +555,7 @@ If less than 5 seconds remain when Phase 3 starts, a warning is printed and the 
 | Setting | Effect on Phase 3 |
 |---|---|
 | `--max-depth 1` | Phase 3 is silently skipped (chains require depth ≥ 2) |
-| `--no-builtin-seeds` | Phase S is skipped; Phase 3 is unaffected |
+| `--no-builtin-seeds` | Phase S is skipped; Phase 3's 40 % Phase-S population slice falls back to purely random chains |
 | `--seed-rules` | Seed singles appear in the rule pool available to the GA; chain seeds do not affect Phase 3 |
 | `--genetic-pop 400 --genetic-generations 100` | Doubles population and generation count; roughly doubles Phase 3 GPU time |
 | `--target-hours 3.0` | Provides more wall-clock budget for all phases; Phase 3 benefits proportionally |
@@ -857,4 +857,5 @@ python rulest_v2.py base.txt target.txt --max-depth 3 --target-hours 2.0 \
 MIT
  
 ## Credits
+
 https://github.com/synacktiv/rulesfinder
