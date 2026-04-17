@@ -10,6 +10,7 @@
 - [Scripts](#-scripts)
   - [rulest.py — v1 (BFS, Legacy)](#rulestpy--v1-bfs-legacy)
   - [rulest\_v2.py — v2 (Recommended)](#rulest_v2py--v2-recommended)
+- [What's New in v3 — Phase 3 GA Fixes](#-whats-new-in-v2--phase-3-ga-fixes)
 - [Why v2 Supersedes v1](#-why-v2-supersedes-v1)
 - [Requirements](#-requirements)
 - [Installation](#-installation)
@@ -69,13 +70,27 @@ A complete redesign built around GPU efficiency, Hashcat compatibility, and inte
 - ✅ **Dynamic VRAM-aware** batch and budget sizing (scales with available VRAM; baseline 8 GB)
 - ✅ **Hot-rule biased** chain generation using Phase 1 results (60% hot-rule bias, configurable via `HOT_RULE_RATIO`)
 - ✅ **User seed rules** support via `--seed-rules` to guide chain exploration (30% budget allocated to extending seeds)
-- ✅ **Phase 3 Genetic Algorithm** (`--genetic`): optional evolutionary search that runs after Phase 2, guided by bloom-filter coverage — breeds high-scoring chains to find deep-chain patterns that random sampling misses
+- ✅ **Phase 3 Genetic Algorithm** (`--genetic`): optional evolutionary search that runs after Phase 2, guided by novelty-weighted bloom-filter coverage — breeds chains that Phase 1/S/2 have not yet found; dedicated time reservation (20 % of `--target-hours`, min 120 s) guarantees the GA always runs; stagnation guard refreshes the bottom 30 % of the population after 5 flat generations
 - ✅ Per-depth chain budget overrides (depths 2–10)
 - ✅ Unlimited result cap (no global ceiling)
 - ✅ Full **hit counting** and frequency-ranked output
 - ✅ Multi-device listing and explicit device selection by index or name substring
 - ✅ Color-coded terminal output with live progress bars
 - ✅ Configurable verbosity via `VERBOSE` flag
+ 
+---
+ 
+## 🆕 What's New in v2 — Phase 3 GA Fixes
+ 
+Three root-cause bugs that caused Phase 3 to produce identical results with and without `--genetic` were identified and fixed:
+ 
+| Fix | Description |
+|---|---|
+| **Novelty-weighted fitness** | Chains not yet discovered by Phase 1/S/2 receive a **2x fitness bonus** during GA selection. Previously fitness was raw bloom hits, so already-known high-scorers dominated every generation and the GA just rediscovered Phase 2 results. |
+| **Unexplored-seed initial population** | The 40 % Phase-S fill slot now prefers seeds **absent from `known_rules`**. Previously it used top-hit Phase-S chains — all already in `all_counts` — so the GA started with a population of mostly-known rules. Depth-3+ bias (70 %) is also applied to seeded and fill portions when `--max-depth >= 3`. |
+| **Dedicated time reservation** | Phase 3 now reserves **20 % of `--target-hours`** (min 120 s) from Phase 2's budget before Phase 2 begins. Previously the GA ran on leftover time; with the default `--target-hours 0.5` Phase 2 consumed everything and Phase 3 was silently skipped. |
+| **Stagnation guard** | If best fitness does not improve for 5 consecutive generations, the bottom 30 % of the population is replaced with fresh random chains (depth-3+ biased). |
+| **Depth-2 warning** | When `--max-depth 2`, the GA emits a warning: Phase 2 already exhaustively covers depth-2, so the GA cannot add new rules at that depth. Use `--max-depth 3` or higher. |
  
 ---
  
@@ -88,7 +103,7 @@ A complete redesign built around GPU efficiency, Hashcat compatibility, and inte
 | **Rule set size** | ~2,700 static rules | 5,600+ GPU-validated Hashcat single rules across 9 categories |
 | **Search strategy** | Naive BFS — every rule applied blindly | Phase 1 single-rule sweep → Phase S built-in seed extraction → Phase 2 hot-biased chain generation → Phase 3 GA (optional) |
 | **Built-in seed families** | ❌ Not implemented | ✅ Thirteen families (A–M): numeric prepend/append, mixed, transform+digit, date patterns, special-char append/prepend/transform/combo (F–I), leet substitutions (J), double-transform chains (K), special-before-digit (L), leet+transform (M); run by default as a dedicated pass independent of `--max-depth`; disable with `--no-builtin-seeds` |
-| **Genetic algorithm** | ❌ Not implemented | ✅ Optional Phase 3 (`--genetic`): evolutionary search guided by bloom-filter hits; discovers deep-chain patterns that random Phase 2 sampling misses |
+| **Genetic algorithm** | ❌ Not implemented | ✅ Optional Phase 3 (`--genetic`): novelty-weighted evolutionary search (2× fitness bonus for chains not yet in known_rules) with dedicated time reservation (20 % of `--target-hours`, min 120 s) and stagnation-triggered population refresh; discovers deep-chain patterns that random Phase 2 sampling misses |
 | **Target lookup** | Python `set` (host RAM, per-result) | 16–256 MB Bloom filter uploaded once to GPU VRAM (FNV-1a, 4 hash functions) |
 | **Chain state** | Temp `.tmp` files on disk per depth | In-memory, GPU buffer-based with proper release and `gc.collect()` |
 | **Memory management** | Halve batch on OOM, no VRAM awareness | Dynamic sizing based on actual free VRAM estimate + 55% usage safety factor |
@@ -107,7 +122,7 @@ The core algorithmic difference matters at scale:
  
 **v2 Informed Generation:** Phase 1 identifies which individual rules ("hot rules") actually hit the target dictionary. Phase 2 then generates chains **biased 60% toward hot rules** (configurable via `HOT_RULE_RATIO`). An additional 30% of the budget extends known-good seed chains. This dramatically reduces wasted GPU cycles and finds effective multi-rule sequences far faster than exhaustive BFS.
  
-**Phase 3 GA (optional):** Where Phase 2 still samples randomly within the hot-rule-biased pool, the genetic algorithm *evolves* chains by recombining and mutating the highest-scoring ones each generation. This is particularly effective at depth ≥ 3 where the search space (`|pool|^depth`) is too large for exhaustive or purely random coverage.
+**Phase 3 GA (optional):** Where Phase 2 still samples randomly within the hot-rule-biased pool, the genetic algorithm *evolves* chains by recombining and mutating the highest-scoring ones each generation. A **2× novelty bonus** is applied to chains not already discovered by Phase 1/S/2, so selection pressure drives the population toward genuinely new territory rather than re-converging on known results. A **20 % time reservation** (minimum 120 s) ensures the GA always receives a meaningful budget rather than whatever Phase 2 leaves behind. This is particularly effective at depth ≥ 3 where the search space (`|pool|^depth`) is too large for exhaustive or purely random coverage.
  
 ---
  
@@ -180,7 +195,7 @@ usage: rulest_v2.py [options] base_wordlist target_wordlist
  
 | Flag | Default | Description |
 |---|---|---|
-| `--genetic` | off | Enable Phase 3 genetic algorithm rule evolution. Runs after Phase 2, consuming the remaining time budget from `--target-hours`. Has no effect at `--max-depth 1` (chains require at least depth 2). |
+| `--genetic` | off | Enable Phase 3 genetic algorithm rule evolution. A dedicated time budget of 20 % of `--target-hours` (min 120 s) is reserved for Phase 3 before Phase 2 begins. Has no effect at `--max-depth 1` (chains require at least depth 2); emits a warning at `--max-depth 2` since Phase 2 already covers depth-2 exhaustively — use `--max-depth 3` or higher for meaningful GA output. |
 | `--genetic-generations` | `50` | Maximum number of GA generations. Each generation performs a full GPU fitness evaluation of the entire population, so larger values extend runtime proportionally. |
 | `--genetic-pop` | `200` | GA population size — number of rule chains evaluated per generation. Larger populations improve search coverage at the cost of more GPU evaluations per generation. |
 | `--genetic-elite` | `0.15` | Fraction of top-scoring individuals carried unchanged into the next generation (elitism). Must be strictly between 0.0 and 1.0. Higher values stabilise convergence; lower values increase diversity. |
@@ -226,9 +241,10 @@ usage: rulest.py -w WORDLIST [-b BASE_WORDLIST] [-d CHAIN_DEPTH]
 │  │   VRAM-budgeted)                              │  │
 │  │                                               │  │
 │  │  Phase 3 ────────▶  GeneticRuleEvolver        │  │
-│  │  (--genetic;         evolve chains by fitness  │  │
-│  │   uses remaining     tournament select +       │  │
-│  │   time budget)       crossover + mutation      │  │
+│  │  (--genetic;         novelty-weighted fitness   │  │
+│  │   reserved 20 %      (2× bonus for new chains)  │  │
+│  │   time budget;       tournament select +         │  │
+│  │   stagnation guard)  crossover + mutation        │  │
 │  └───────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────┘
          │
@@ -253,7 +269,7 @@ Using Phase 1 hit data, chains are generated with a bias toward rules that alrea
 The remaining time budget (total `--target-hours` minus Phase 1 + Phase S duration) is split evenly across requested depths. User seed rules from `--seed-rules` are extended to deeper depths automatically.
  
 **Phase 3 — Genetic Algorithm** *(optional, `--genetic`)*
-An evolutionary search that runs after Phase 2 using whatever wall-clock time remains from `--target-hours`. See [Phase 3 — Genetic Algorithm](#-phase-3--genetic-algorithm) for full details.
+An evolutionary search that runs after Phase 2. A dedicated budget of **20 % of `--target-hours`** (minimum 120 s) is reserved for Phase 3 before Phase 2 begins, so the GA is always guaranteed a meaningful run. Fitness is novelty-weighted: chains not already present in the Phase 1/S/2 results receive a 2× multiplier, driving the population toward genuinely new discoveries. A stagnation guard replaces the bottom 30 % of the population with fresh random chains if the best score does not improve for 5 consecutive generations. See [Phase 3 — Genetic Algorithm](#-phase-3--genetic-algorithm) for full details.
  
 **Post-processing — Signature-Based Minimization**
 After all phases complete, every candidate rule is applied to the built-in probe set in pure Python. Rules producing identical outputs on all probe words are grouped; only the highest-GPU-hit representative per group survives. See [Functional Minimization](#-functional-minimization) for details.
@@ -472,7 +488,7 @@ Every leet substitution op paired with every structural transform op in both ord
  
 ## 🧬 Phase 3 — Genetic Algorithm
  
-Phase 3 is an optional evolutionary search activated by `--genetic`. It runs **after Phase 2**, consuming whatever wall-clock time remains from `--target-hours`, and all results are merged into the global hit counter before signature minimization.
+Phase 3 is an optional evolutionary search activated by `--genetic`. It runs **after Phase 2**, with a **dedicated time reservation of 20 % of `--target-hours`** (minimum 120 s) that is subtracted from Phase 2's budget before Phase 2 begins — guaranteeing the GA always runs with meaningful time rather than only leftover scraps. All results are merged into the global hit counter before signature minimization.
  
 ### Why a Genetic Algorithm
  
@@ -485,19 +501,23 @@ A genetic algorithm solves this by **directing** the search. Chains that produce
 ```
 Initial population
   30 % — depth-2 combos of top-50 hot Phase-1 rules
-  30 % — seeded deeper chains (1 hot rule + random atoms)
-  40 % — Phase-S builtin seed families (A–M), or random fallback when --no-builtin-seeds
+  30 % — seeded deeper chains (1 hot rule + random atoms, biased depth 3+ when max_depth ≥ 3)
+  40 % — unexplored Phase-S chains (NOT already in known_rules); fallback to random when
+          --no-builtin-seeds is set or all Phase-S seeds are already known
 
 For each generation:
-  1. Evaluate fitness   — _run_chain_kernel hit count per chain (GPU batch)
-  2. Merge hits         — new bloom-filter hits added to all_counts
-  3. Sort by score      — build ranked (chain, score) list
-  4. Elitism            — top elite_frac % copied unchanged to next generation
-  5. Tournament select  — draw k=4 contenders; highest score wins
-  6. One-point crossover — random cut on each parent's token list (p=0.80)
-  7. Mutation           — replace / insert / delete one token (60/20/20 %)
-  8. Diversity fill     — duplicate chains replaced by random individuals
-  9. Repeat until generations exhausted or wall-clock budget reached
+  1. Evaluate fitness   — _run_chain_kernel raw hit count per chain (GPU batch)
+  2. Apply novelty bonus — chains NOT in known_rules (Phase 1/S/2 results) score × 2
+  3. Merge raw hits     — raw (un-multiplied) counts added to all_counts
+  4. Sort by eff. score — build ranked (chain, effective_score) list
+  5. Stagnation check  — if best score unchanged for 5 gens: replace bottom 30 % with
+                          fresh random chains (depth 3+ biased), restart stagnation counter
+  6. Elitism            — top elite_frac % copied unchanged to next generation
+  7. Tournament select  — draw k=4 contenders; highest effective score wins
+  8. One-point crossover — random cut on each parent's token list (p=0.80)
+  9. Mutation           — replace / insert / delete one token (60/20/20 %)
+ 10. Diversity fill     — duplicate chains replaced by random individuals (depth 3+ biased)
+ 11. Repeat until generations exhausted or wall-clock budget reached
 ```
  
 ### Population Initialisation
@@ -507,8 +527,8 @@ The initial population is seeded from Phase 1 results to give the GA a strong st
 | Slice | Strategy | Rationale |
 |---|---|---|
 | 30 % | Depth-2 combos of the top-50 hot rules | These pairs are already "known good" atoms — often produce immediate hits in generation 0 |
-| 30 % | Seeded deeper chains: 1 hot rule + random pool atoms (depth 2–max) | Biases depth-3+ search toward rules that actually hit targets, while maintaining structural variety |
-| 40 % | Phase-S builtin seed families (A–M); falls back to random chains when `--no-builtin-seeds` is set | High-hit Phase S chains dramatically improve starting coverage; random fallback preserves diversity when seeds are disabled |
+| 30 % | Seeded deeper chains: 1 hot rule + random pool atoms; **70 % probability of depth 3+** when `--max-depth ≥ 3` | Biases toward depth regions that Phase 2's random sampling undercovers, while maintaining structural variety |
+| 40 % | **Unexplored** Phase-S chains (NOT already in `known_rules`), sorted by hit count; known seeds used as fallback; pads with depth-3+-biased random chains if pool is exhausted; falls back to pure random when `--no-builtin-seeds` is set | Prioritises genuinely new starting points; avoids re-seeding the GA with rules Phase 2 already found |
  
 ### Crossover
  
@@ -536,30 +556,60 @@ Each offspring undergoes exactly one mutation drawn from three operators with no
 | **insert** | 20 % | Insert one random rule at a random position | Only if `len < max_depth`; falls back to replace |
 | **delete** | 20 % | Remove one random token | Only if `len > 2`; falls back to replace |
  
-### Fitness and Hit Merging
- 
-Fitness is the bloom-filter hit count returned by `_run_chain_kernel` when the chain is applied to all base words. This is exactly the same metric used in Phases 1 and 2, so all discoveries are directly comparable and merge cleanly into the existing counter. For each chain the **maximum hit count seen across all generations** is retained, which means a chain that scores highly in a later generation after mutation still contributes its best score to the final output.
- 
+### Fitness, Novelty Weighting, and Hit Merging
+
+Fitness used for GA selection is a **novelty-weighted bloom-filter hit count**:
+
+| Chain status | Fitness multiplier | Rationale |
+|---|---|---|
+| **Not yet in `known_rules`** (Phase 1/S/2) | **x 2** (novelty bonus) | Drives selection toward unexplored territory |
+| **Already in `known_rules`** | x 1 (raw hits) | Still valid as crossover/mutation scaffolding |
+
+The raw (un-multiplied) hit count is what gets stored in `all_counts` and written to the output file, so the frequency column reflects true GPU hits rather than inflated fitness scores.
+
+For each chain the **maximum raw hit count seen across all generations** is retained, so a chain that scores highly in a later generation after mutation still contributes its best score to the final output.
+
+The `known_rules` set is built from all rules already discovered by Phase 1, Phase S, and Phase 2 immediately before the GA starts. Chains discovered by the GA itself are **not** added to `known_rules` mid-run — the novelty bonus persists for any rule that was genuinely new at Phase 3 start.
+
+The terminal log and final summary report both the total GA hits and the **genuinely novel** count (chains absent from `known_rules` at start), making it easy to confirm Phase 3 is adding new coverage rather than rediscovering Phase 2 results.
+
 ### Time Budget
- 
-Phase 3 inherits the wall-clock budget framework already used by Phase 2. The available time is:
- 
+
+Phase 3 uses a **dedicated reserved budget** rather than only leftover time:
+
 ```
-time_for_phase3 = target_hours × 3600  −  (elapsed for Phase 1 + Phase S + Phase 2)
+reserved_for_ga = max(120 s,  target_hours x 3600 x 0.20)
+phase2_budget   = target_hours x 3600  -  elapsed_p1_ps  -  reserved_for_ga
+ga_budget       = reserved_for_ga  +  max(0, unused_phase2_time)
 ```
- 
-If less than 5 seconds remain when Phase 3 starts, a warning is printed and the GA still runs (even one generation can add value). To guarantee Phase 3 has meaningful time, either increase `--target-hours` or reduce `--genetic-generations`/`--genetic-pop`.
- 
+
+The 20 % reservation is subtracted from Phase 2's budget before Phase 2 begins, so Phase 3 is always guaranteed at least 120 s (or 20 % of the total budget, whichever is larger). Any Phase 2 time that goes unused (e.g. because all chains were tested quickly) is added on top.
+
+This eliminates the previous failure mode where Phase 2 consumed the entire time budget and Phase 3 was silently skipped with 0 seconds remaining.
+
+### Stagnation Guard
+
+If the best effective fitness score does not improve for **5 consecutive generations**, the stagnation guard fires:
+
+1. The bottom 30 % of the population (beyond the elite) is discarded.
+2. Fresh random chains fill those slots, biased toward depth 3+ when `--max-depth >= 3`.
+3. The stagnation counter resets.
+
+This prevents the GA from burning its remaining budget re-evaluating the same elites with no escape from a local optimum.
+
 ### Interaction with Other Phases
- 
+
 | Setting | Effect on Phase 3 |
 |---|---|
-| `--max-depth 1` | Phase 3 is silently skipped (chains require depth ≥ 2) |
-| `--no-builtin-seeds` | Phase S is skipped; Phase 3's 40 % Phase-S population slice falls back to purely random chains |
+| `--max-depth 1` | Phase 3 is silently skipped (chains require depth >= 2) |
+| `--max-depth 2` | Phase 3 emits a warning: Phase 2 already covers depth-2 exhaustively; use `--max-depth 3+` for meaningful GA output |
+| `--no-builtin-seeds` | Phase S is skipped; Phase 3's 40 % fill slot falls back to depth-3+-biased random chains |
 | `--seed-rules` | Seed singles appear in the rule pool available to the GA; chain seeds do not affect Phase 3 |
 | `--genetic-pop 400 --genetic-generations 100` | Doubles population and generation count; roughly doubles Phase 3 GPU time |
-| `--target-hours 3.0` | Provides more wall-clock budget for all phases; Phase 3 benefits proportionally |
- 
+| `--target-hours 3.0` | Increases the total budget; the 20 % reservation scales proportionally (min 120 s floor) |
+| Short `--target-hours` (e.g. `0.5`) | Reservation is `max(120 s, 108 s) = 120 s`; Phase 2 runs on the remaining ~240 s |
+
+
 ---
  
 ## 🔬 Functional Minimization
@@ -718,12 +768,14 @@ sa@ $0
 | Limit total combinations | `--max-chains 500000` to cap generation before scaling |
 | Reduce terminal noise | Set `VERBOSE = False` in the script header or omit `--debug` |
 | Increase hot-rule aggressiveness | Raise `HOT_RULE_RATIO` toward `1.0` (reduces random exploration) |
-| Enable evolutionary search | Add `--genetic` — effective for depth ≥ 3 where random sampling is sparse |
+| Enable evolutionary search | Add `--genetic` with `--max-depth 3` or higher — Phase 3 adds no value at depth 2 since Phase 2 already covers it exhaustively |
+| Guarantee GA time budget | The 20 % reservation is automatic; raise `--target-hours` to give both Phase 2 and Phase 3 more headroom |
 | Speed up GA per generation | Lower `--genetic-pop` (e.g. `100`) — fewer GPU evaluations per generation |
 | Improve GA convergence quality | Raise `--genetic-pop` (e.g. `500`) and `--genetic-generations` (e.g. `100`) |
-| Reduce GA premature convergence | Lower `--genetic-elite` (e.g. `0.05`) for more diversity each generation |
+| Reduce GA premature convergence | Lower `--genetic-elite` (e.g. `0.05`) for more diversity each generation; stagnation guard fires after 5 flat gens automatically |
 | Stabilise GA on narrow targets | Raise `--genetic-elite` (e.g. `0.25`) to preserve top chains longer |
-| GA with a very short time budget | Reduce `--genetic-generations` to match available time; even 5–10 generations add value |
+| Maximise novel rule discovery | Use `--max-depth 4` or higher with GA — novelty bonus (2×) is most impactful in large unexplored depth regions |
+| GA with a very short time budget | Even with the 120 s floor, reduce `--genetic-generations` (e.g. 10) to run more focused generations within the reserved time |
  
 ### VRAM Scaling Reference
  
@@ -774,6 +826,8 @@ python rulest_v2.py base.txt target.txt --max-depth 5 \
 **Genetic algorithm — minimal invocation:**
 ```bash
 # Enable Phase 3 with defaults (pop=200, gen=50, elite=15%)
+# 20 % of --target-hours (18 min) is reserved for Phase 3 before Phase 2 begins
+# Check the "[GA] genuinely new" line in the output to verify novel rule discovery
 python rulest_v2.py base.txt target.txt \
   --max-depth 3 \
   --target-hours 1.5 \
@@ -845,8 +899,9 @@ python rulest_v2.py base.txt target.txt --max-depth 2 --no-builtin-seeds -o with
 # Without GA — baseline
 python rulest_v2.py base.txt target.txt --max-depth 3 --target-hours 2.0 -o no_ga.txt
  
-# With GA — compare rule count and depth distribution
-python rulest_v2.py base.txt target.txt --max-depth 3 --target-hours 2.0 \
+ 
+# With GA — compare rule count, depth distribution, and "genuinely novel" count in the log
+# Note: GA reserves 20 % of total time (24 min) before Phase 2 begins
   --genetic -o with_ga.txt
 ```
  
@@ -857,5 +912,6 @@ python rulest_v2.py base.txt target.txt --max-depth 3 --target-hours 2.0 \
 MIT
  
 ## Credits
+
 
 https://github.com/synacktiv/rulesfinder
