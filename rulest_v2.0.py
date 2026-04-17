@@ -1988,10 +1988,24 @@ class GeneticRuleEvolver:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _random_chain(self, depth: int = 0) -> list:
-        """Return a random chain of atomic rules as a token list."""
+    def _random_chain(self, depth: int = 0, bias_deep: bool = False) -> list:
+        """
+        Return a random chain of atomic rules as a token list.
+
+        If bias_deep is True and self.max_depth >= 3, depth is chosen with
+        70% probability from [3, max_depth] and 30% from [2, max_depth]
+        uniformly. This helps the GA explore deeper chains that Phase 2
+        barely touches.
+        """
         if depth <= 0:
-            depth = random.randint(2, self.max_depth)
+            if bias_deep and self.max_depth >= 3:
+                # 70% deep (depth >=3), 30% any depth (including depth 2)
+                if random.random() < 0.7:
+                    depth = random.randint(3, self.max_depth)
+                else:
+                    depth = random.randint(2, self.max_depth)
+            else:
+                depth = random.randint(2, self.max_depth)
         return [random.choice(self.rule_pool) for _ in range(depth)]
 
     def _clamp(self, tokens: list) -> list:
@@ -2001,11 +2015,20 @@ class GeneticRuleEvolver:
             tokens = tokens + self._random_chain(lo - len(tokens))
         return tokens[:hi]
 
+    def _random_novel_chain(self, known_set: set) -> list:
+        """Generate a random chain not already in known_set (with deep bias)."""
+        for _ in range(100):   # limit attempts
+            chain = self._random_chain(bias_deep=True)
+            if ' '.join(chain) not in known_set:
+                return chain
+        # fallback – return something even if known (better than nothing)
+        return self._random_chain(bias_deep=True)
+
     # ------------------------------------------------------------------
     # Population initialisation
     # ------------------------------------------------------------------
 
-    def initial_population(self, hot_rules: list) -> list:
+    def initial_population(self, hot_rules: list, known_rules_set: set) -> list:
         """
         Build the initial population using three seeding strategies:
 
@@ -2021,6 +2044,9 @@ class GeneticRuleEvolver:
            disabled (or produced no hits) this portion falls back to
            pure random. This is the key v2 improvement over the original
            uniform random seeding.
+
+        known_rules_set: set of rule strings already discovered in Phase 1/S/2.
+                         Used to avoid re-discovering known chains.
         """
         hot = hot_rules[:min(len(hot_rules), 50)]
         pop_set: set = set()
@@ -2043,7 +2069,7 @@ class GeneticRuleEvolver:
                 break
             pop_set.add((a, b))
 
-        # 2 — seeded deeper chains
+        # 2 — seeded deeper chains (bias deep if possible)
         max_tries = n_seeded * 20
         tries = 0
         while len(pop_set) < n_hot + n_seeded and tries < max_tries:
@@ -2055,33 +2081,34 @@ class GeneticRuleEvolver:
                 ]
                 random.shuffle(tokens)
             else:
-                tokens = self._random_chain(depth)
+                tokens = self._random_chain(depth, bias_deep=True)
             pop_set.add(tuple(tokens))
 
         # 3 — Phase S seeds (replaces original 40 % random) or fallback
         n_fill = int(self.pop_size * 0.40)
         fill_set: set = set()
 
+        # Prefer Phase S chains that are NOT already known
         if self.seed_chains_sorted:
-            log_debug(f"[GA]   Using {min(n_fill, len(self.seed_chains_sorted)):,} "
-                      f"Phase-S seed chains (top hit-count) for initial population (40 %)")
-            # Take top hit-count Phase S chains, oversample to allow depth filtering
-            top_candidates = self.seed_chains_sorted[:max(n_fill * 3, 100)]
-            selected = random.sample(top_candidates, k=min(n_fill, len(top_candidates)))
-            for sc_str in selected:
-                tokens = sc_str.split()
-                if 2 <= len(tokens) <= self.max_depth:
-                    fill_set.add(tuple(tokens))
-            # If insufficient valid seeds (depth filtering), pad with random
-            while len(fill_set) < n_fill:
-                fill_set.add(tuple(self._random_chain()))
-        else:
-            # Phase S disabled or produced zero hits — pure random fallback
-            max_tries = n_fill * 20
-            tries = 0
-            while len(fill_set) < n_fill and tries < max_tries:
-                tries += 1
-                fill_set.add(tuple(self._random_chain()))
+            # filter out already known
+            novel_seeds = [s for s in self.seed_chains_sorted if s not in known_rules_set]
+            # also ensure depth >=2 and <= max_depth
+            novel_seeds = [s for s in novel_seeds
+                           if 2 <= len(s.split()) <= self.max_depth]
+            # take up to n_fill*3 as candidates to sample from
+            candidate_pool = novel_seeds[:max(n_fill * 3, 100)]
+            if candidate_pool:
+                selected = random.sample(candidate_pool, k=min(n_fill, len(candidate_pool)))
+                for sc_str in selected:
+                    tokens = sc_str.split()
+                    if 2 <= len(tokens) <= self.max_depth:
+                        fill_set.add(tuple(tokens))
+                log_debug(f"[GA]   Using {len(selected)} novel Phase-S seeds for "
+                          f"initial population (40% slot)")
+        # If we don't have enough novel Phase S seeds, pad with random novel chains
+        while len(fill_set) < n_fill:
+            rand_chain = self._random_novel_chain(known_rules_set)
+            fill_set.add(tuple(rand_chain))
 
         for ind in fill_set:
             pop_set.add(ind)
@@ -2090,19 +2117,23 @@ class GeneticRuleEvolver:
 
         # Safety: pad to exactly pop_size if set was too sparse (deduplication / depth filtering)
         while len(result) < self.pop_size:
-            result.append(self._random_chain())
+            result.append(self._random_novel_chain(known_rules_set))
 
         return result[:self.pop_size]
 
     # ------------------------------------------------------------------
-    # Fitness evaluation (GPU-batch)
+    # Fitness evaluation (GPU-batch) with novelty bonus
     # ------------------------------------------------------------------
 
-    def evaluate_population(self, population: list) -> dict:
+    def evaluate_population(self, population: list, known_set: set) -> dict:
         """
         Evaluate the entire population in batched GPU kernel calls.
 
-        Returns a dict {chain_string: hit_count}.
+        Returns a dict {chain_string: (hit_count, fitness_score)} where
+        fitness_score = hit_count * (2 if chain not in known_set else 1).
+        The fitness score is used for selection; the hit_count is stored
+        separately for later merging.
+
         Invalid chains (fail the hashcat validator) score 0 but are kept
         in the pool to maintain population diversity.
         """
@@ -2115,7 +2146,8 @@ class GeneticRuleEvolver:
         # Initialise all scores to 0
         hit_map: dict = {c: 0 for c in chain_strs}
         if not valid_chains:
-            return hit_map
+            # No valid chains, return zero fitness
+            return {c: (0, 0) for c in chain_strs}
 
         wsb = self.gpu_engine.params.get('WORD_SUB_BATCH',   20_000)
         cbs = self.gpu_engine.params.get('CHAINS_PER_BATCH',  2_000)
@@ -2132,7 +2164,16 @@ class GeneticRuleEvolver:
             self.gpu_engine.queue.finish()
 
         hit_map.update(batch_hits)
-        return hit_map
+
+        # Apply novelty bonus: 2× multiplier for chains not in known_set
+        result = {}
+        for chain, hits in hit_map.items():
+            if chain not in known_set:
+                fitness = hits * 2
+            else:
+                fitness = hits
+            result[chain] = (hits, fitness)
+        return result
 
     # ------------------------------------------------------------------
     # Selection
@@ -2217,6 +2258,24 @@ class GeneticRuleEvolver:
         return tokens
 
     # ------------------------------------------------------------------
+    # Stagnation handling
+    # ------------------------------------------------------------------
+
+    def _replace_stagnant(self, population: list, fitness_list: list,
+                          known_set: set, n_replace: int) -> list:
+        """
+        Replace the worst n_replace individuals with fresh random chains
+        (preferably novel). Used when no fitness improvement for 5 gens.
+        """
+        # Keep elites (already at front of fitness_list)
+        survivors = population[:self.pop_size - n_replace]
+        new_individuals = []
+        for _ in range(n_replace):
+            new_ind = self._random_novel_chain(known_set)
+            new_individuals.append(new_ind)
+        return survivors + new_individuals
+
+    # ------------------------------------------------------------------
     # Main evolution loop
     # ------------------------------------------------------------------
 
@@ -2225,6 +2284,7 @@ class GeneticRuleEvolver:
         hot_rules:   list,
         generations: int,
         time_budget: float,
+        known_rules_set: set,
     ) -> Counter:
         """
         Run the genetic algorithm for up to *generations* generations or
@@ -2235,6 +2295,7 @@ class GeneticRuleEvolver:
         hot_rules     : Phase-1 hit rules, sorted descending by hit count.
         generations   : Hard cap on generation count.
         time_budget   : Maximum wall-clock seconds for Phase 3.
+        known_rules_set: Set of rule strings already discovered (Phase 1/S/2).
 
         Returns
         -------
@@ -2261,8 +2322,10 @@ class GeneticRuleEvolver:
         )
 
         # --- Initialise population ---
-        pop = self.initial_population(hot_rules)
+        pop = self.initial_population(hot_rules, known_rules_set)
         last_gen = 0
+        best_score = 0
+        no_improve_count = 0
 
         with tqdm(
             total=generations,
@@ -2283,23 +2346,40 @@ class GeneticRuleEvolver:
                     log_debug(f"[GA]   Time budget exhausted at generation {gen}.")
                     break
 
-                # --- Evaluate fitness ---
-                hit_map = self.evaluate_population(pop)
+                # --- Evaluate fitness (with novelty bonus) ---
+                hit_fitness_map = self.evaluate_population(pop, known_rules_set)
 
                 # Merge bloom hits into the running total
-                for chain_str, cnt in hit_map.items():
-                    if cnt > 0 and HashcatRuleValidator.validate_rule_for_gpu(chain_str):
+                for chain_str, (hits, _) in hit_fitness_map.items():
+                    if hits > 0 and HashcatRuleValidator.validate_rule_for_gpu(chain_str):
                         # Keep the highest hit count seen across all gens
-                        if cnt > all_new[chain_str]:
-                            all_new[chain_str] = cnt
+                        if hits > all_new[chain_str]:
+                            all_new[chain_str] = hits
 
-                # Build sorted (token_list, score) pairs for selection
+                # Build sorted (token_list, fitness_score) pairs for selection
                 fitness_list = sorted(
-                    [(tuple(ind), hit_map.get(' '.join(ind), 0)) for ind in pop],
+                    [(tuple(ind), hit_fitness_map.get(' '.join(ind), (0,0))[1])
+                     for ind in pop],
                     key=lambda x: -x[1],
                 )
 
-                best_score = fitness_list[0][1] if fitness_list else 0
+                current_best = fitness_list[0][1] if fitness_list else 0
+
+                # --- Stagnation check ---
+                if current_best <= best_score:
+                    no_improve_count += 1
+                else:
+                    no_improve_count = 0
+                    best_score = current_best
+
+                if no_improve_count >= 5 and self.pop_size >= 10:
+                    # Replace bottom 30% of population with fresh random chains
+                    n_replace = max(1, int(self.pop_size * 0.3))
+                    pop = self._replace_stagnant(pop, fitness_list, known_rules_set, n_replace)
+                    no_improve_count = 0
+                    log_debug(f"[GA]   Stagnation detected: replaced bottom {n_replace} individuals")
+                    # Re-evaluate immediately in next iteration
+                    continue
 
                 # --- Elitism: carry top individuals unchanged ---
                 elites     = [list(ind) for ind, _ in fitness_list[:n_elite]]
@@ -2326,11 +2406,11 @@ class GeneticRuleEvolver:
                             next_pop.append(child)
                             next_set.add(key)
 
-                # --- Diversity fill: pad any remaining slots randomly ---
+                # --- Diversity fill: pad any remaining slots with novel chains ---
                 fill_attempts = 0
                 while len(next_pop) < self.pop_size and fill_attempts < self.pop_size * 4:
                     fill_attempts += 1
-                    ind = tuple(self._random_chain())
+                    ind = tuple(self._random_novel_chain(known_rules_set))
                     if ind not in next_set:
                         next_pop.append(list(ind))
                         next_set.add(ind)
@@ -2339,7 +2419,7 @@ class GeneticRuleEvolver:
 
                 pbar.update(1)
                 pbar.set_postfix(
-                    {"best": cyan(str(best_score)), "new": cyan(str(len(all_new)))},
+                    {"best": cyan(str(current_best)), "new": cyan(str(len(all_new)))},
                     refresh=False,
                 )
 
@@ -2476,8 +2556,20 @@ class GPUExtractor:
         # Seeds are not used as scaffolding or building blocks here.
         if self.max_depth > 1:
             log_section("PHASE 2 — Rule Chain Search")
-            remaining = max(0, self.params['TARGET_SECONDS'] - (ts-t0))
-            budget    = remaining * self.params['EST_COMBOS_PER_SEC'] * TIME_SAFETY_FACTOR
+            remaining_before_phase2 = max(0, self.params['TARGET_SECONDS'] - (ts - t0))
+            # Reserve 20% (min 120s) of total target time for Phase 3 if GA is enabled
+            if self.genetic:
+                phase3_budget = max(120, 0.20 * self.params['TARGET_SECONDS'])
+                # But do not exceed remaining time
+                phase3_budget = min(phase3_budget, remaining_before_phase2)
+                phase2_remaining = max(0, remaining_before_phase2 - phase3_budget)
+                log_info(f"[P2]   Reserving {phase3_budget:.1f}s for Phase 3 GA, "
+                         f"Phase 2 gets {phase2_remaining:.1f}s")
+            else:
+                phase2_remaining = remaining_before_phase2
+                phase3_budget = 0.0
+
+            budget    = phase2_remaining * self.params['EST_COMBOS_PER_SEC'] * TIME_SAFETY_FACTOR
             depths    = list(range(2, self.max_depth+1))
             depth_budgets = ({d: int(budget/len(depths)/(len(base_words)*d)) for d in depths}
                              if budget > 0 and base_words and depths
@@ -2502,18 +2594,27 @@ class GPUExtractor:
 
             log_info(f"[P2]   depth 2–{self.max_depth} | "
                      + " | ".join(f"d{d}:{v:,}" for d,v in depth_budgets.items()))
-            log_debug(f"Remaining time budget: {remaining:.1f}s")
+            log_debug(f"Remaining time budget for Phase 2: {phase2_remaining:.1f}s")
 
             chains = self.gpu_engine.process_all_words_chain_rules(
                 base_words, rules_phase1, self.max_depth, bloom_filter, single,
                 seed_chains=all_seeds, prebuilt_sbd=sbd)
             all_counts.update(chains)
             log_debug(f"Phase 2 elapsed: {time.time()-ts:.1f}s")
+        else:
+            # Phase 2 skipped, budget for Phase 3 is whatever is left after Phase S
+            if self.genetic:
+                phase2_remaining = 0.0
+                phase3_budget = max(0, self.params['TARGET_SECONDS'] - (time.time() - t0))
+            else:
+                phase3_budget = 0.0
 
         # --- Phase 3: Genetic Algorithm Rule Evolution (optional) ---
         if self.genetic and self.max_depth >= 2:
             log_section("PHASE 3 — Genetic Algorithm Rule Evolution")
-
+            if self.max_depth == 2:
+                log_warn("[GA]   --max-depth=2, Phase 2 already exhaustively tests all depth-2 chains. "
+                         "Consider --max-depth 3 or higher for Phase 3 to be useful.")
             # Build the rule pool from Phase-1 validated rules.
             # We use only the rules that the GPU validator accepts so that
             # every individual in the population is always a legal chain.
@@ -2528,7 +2629,8 @@ class GPUExtractor:
 
             # Time remaining after Phase 1 + Phase S + Phase 2
             t_now     = time.time()
-            remaining = max(0.0, self.params['TARGET_SECONDS'] - (t_now - t0))
+            # Use the pre-reserved budget (or whatever is left)
+            remaining = max(0.0, phase3_budget)
 
             if remaining < 5.0:
                 log_warn(
@@ -2546,10 +2648,12 @@ class GPUExtractor:
                 seed_hits         = seed_hits,   # v2: Phase S results now feed the 40 % seeding slot
             )
 
+            known_rules_set = set(all_counts.keys())
             ga_hits = evolver.evolve(
                 hot_rules   = hot_rules,
                 generations = self.genetic_generations,
                 time_budget = remaining,
+                known_rules_set = known_rules_set,
             )
 
             before = len(all_counts)
@@ -2858,4 +2962,3 @@ def main() -> None:
 
 if __name__ == '__main__':
     main()
-
