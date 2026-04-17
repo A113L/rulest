@@ -6,18 +6,18 @@ Extracts hashcat rules/chains by comparing a base wordlist against a target
 wordlist.  GPU bloom filter screening (Phase 1: single rules, Phase 2: chains)
 is followed by signature-based functional minimization.
 
-Key feature: built‑in probe set for functional minimisation.
+Key feature: built-in probe set for functional minimisation.
   Rules are deduplicated by their functional signature — the tuple of outputs
-  produced when applied to a fixed hand‑curated set of probe words.  Rules that
+  produced when applied to a fixed hand-curated set of probe words.  Rules that
   produce identical outputs on every probe word are considered functionally
-  equivalent; only the one with the highest GPU hit‑count is retained.
-  The built‑in probe set covers short words (including "password"), mixed case,
-  words with digits/specials, and repeated‑char words – no external wordlist
+  equivalent; only the one with the highest GPU hit-count is retained.
+  The built-in probe set covers short words (including "password"), mixed case,
+  words with digits/specials, and repeated-char words – no external wordlist
   is required for accurate minimisation.
 
 Phase S — Built-in Seed Families (A–M)
   Thirteen seed families are always tested via a dedicated GPU chain-kernel
-  pass, independent of the random-chain time budget:
+  pass, independent of the random-chain time budget (unless --no-builtin-seeds).
 
   Numeric families
     A  Pure Prepend digits           (depths 1–4)
@@ -64,14 +64,22 @@ Phase 3 — Genetic Algorithm Rule Evolution  (--genetic)
     the GA focuses probability mass on high-hit-rate regions of that space.
   • Hot atomic rules from Phase 1 seed the initial population, giving the GA
     a strong head start rather than searching from scratch.
+  • **Improvement (v2)**: the original 40 % purely random portion of the
+    initial population is now replaced by high-hit chains from Phase S
+    (families A–M) when builtin seeds are enabled. This dramatically
+    improves starting coverage while gracefully falling back to random
+    when --no-builtin-seeds is used.
   • All Phase-3 discoveries are merged into the global hit counter before
     signature-based minimisation, so they benefit from the same deduplication
     and sorting as Phase 1 and Phase 2 results.
 
   Algorithm summary
   ─────────────────
-  1. Initial population — 30 % depth-2 hot-rule combos, 30 % seeded deeper
-     chains, 40 % random — ensures both exploitation and exploration.
+  1. Initial population — 30 % depth-2 hot-rule combos (Phase 1),
+     30 % seeded deeper chains (Phase 1 hot + random),
+     40 % Phase-S builtin seed families (A–M) or random fallback
+     — ensures both exploitation and exploration with far better
+     starting coverage when seeds are active.
   2. GPU-batch fitness evaluation — reuses _run_chain_kernel unchanged.
   3. Tournament selection (k = 4) — low-pressure, maintains diversity.
   4. One-point crossover (p = 0.80) — exchanges rule-token sub-sequences.
@@ -87,7 +95,6 @@ Phase 3 — Genetic Algorithm Rule Evolution  (--genetic)
     --genetic-generations N     Max generations (default: 50)
     --genetic-pop N             Population size (default: 200)
     --genetic-elite F           Elite fraction, e.g. 0.15 (default: 0.15)
-
 """
 
 import os
@@ -165,7 +172,7 @@ BANNER = f"""{green(bold('''
  ██████╗ ██╗   ██╗██╗     ███████╗███████╗████████╗
  ██╔══██╗██║   ██║██║     ██╔════╝██╔════╝╚══██╔══╝
  ██████╔╝██║   ██║██║     █████╗  ███████╗   ██║
- ██╔══██╗██║   ██║██║     ██╔══╝  ╚════██║   ██║
+ ██╔══██╗██║   ██║██║     ██══╝  ╚════██║   ██║
  ██║  ██║╚██████╔╝███████╗███████╗███████║   ██║
  ╚═╝  ╚═╝ ╚═════╝ ╚══════╝╚══════╝╚══════╝   ╚═╝'''))}{C.END}
   {dim('GPU-Compatible Hashcat Rules Engine')}
@@ -577,7 +584,7 @@ def minimize_by_signature(
     2. Group rules that share the same signature — they are functionally
        equivalent on the probe set.
     3. Within each group, keep the rule with the **highest GPU hit-count**
-       (ties broken by shortest depth, then lexicographic order).
+       (ties broken by shortest chain depth, then lexicographic order).
     4. Return a Counter of surviving rules with their original GPU counts.
 
     Rules containing unsupported opcodes are bucketed into a single
@@ -1904,6 +1911,12 @@ class GPUEngine:
 # Activated by --genetic flag.  Runs after Phase 2, consuming whatever
 # time remains from --target-hours.  Newly discovered chains are merged
 # into `all_counts` before signature minimisation.
+#
+# v2 improvement: the original 40 % purely random portion of the initial
+# population is now replaced by high-hit chains from Phase S (families A–M)
+# when builtin seeds are enabled. This dramatically improves starting
+# coverage while gracefully falling back to random when --no-builtin-seeds
+# is used.
 
 class GeneticRuleEvolver:
     """
@@ -1922,6 +1935,11 @@ class GeneticRuleEvolver:
     mut_replace_p   : Relative probability of a replace mutation.
     mut_insert_p    : Relative probability of an insert mutation.
     mut_delete_p    : Relative probability of a delete mutation.
+    seed_hits       : Optional Counter of Phase-S seed chains (high-hit
+                      chains from families A–M). If provided, the original
+                      40 % random portion of the initial population is
+                      replaced by top-scoring Phase-S chains. Falls back
+                      gracefully when Phase S is disabled.
     """
 
     def __init__(
@@ -1937,6 +1955,7 @@ class GeneticRuleEvolver:
         mut_replace_p:  float = 0.60,
         mut_insert_p:   float = 0.20,
         mut_delete_p:   float = 0.20,
+        seed_hits: Optional[Counter] = None,
     ):
         self.gpu_engine   = gpu_engine
         self.base_words   = base_words
@@ -1956,6 +1975,14 @@ class GeneticRuleEvolver:
             mut_insert_p  / _total,
             mut_delete_p  / _total,
         ]
+
+        # v2: Phase S seed chains replace the original 40 % random portion
+        self.seed_hits = seed_hits or Counter()
+        self.seed_chains_sorted: List[str] = [
+            r for r, _ in sorted(
+                self.seed_hits.items(), key=lambda kv: -kv[1]
+            )
+        ] if self.seed_hits else []
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -1989,15 +2016,18 @@ class GeneticRuleEvolver:
         2. Seeded deeper chains: one hot rule + random pool atoms  (30 %)
            Biases depth-3+ search toward rules that actually hit targets.
 
-        3. Purely random chains from the full rule pool              (40 %)
-           Provides diversity and prevents premature convergence.
+        3. Phase-S builtin seed families (A–M) — high-hit chains from
+           the dedicated seed extraction pass (40 %). If Phase S is
+           disabled (or produced no hits) this portion falls back to
+           pure random. This is the key v2 improvement over the original
+           uniform random seeding.
         """
         hot = hot_rules[:min(len(hot_rules), 50)]
         pop_set: set = set()
 
         n_hot    = int(self.pop_size * 0.30)
         n_seeded = int(self.pop_size * 0.30)
-        # remainder filled by random
+        # remainder (40 %) filled by Phase S or random
 
         # 1 — depth-2 hot pairs
         max_tries = n_hot * 20
@@ -2028,16 +2058,37 @@ class GeneticRuleEvolver:
                 tokens = self._random_chain(depth)
             pop_set.add(tuple(tokens))
 
-        # 3 — random fill to pop_size
-        max_tries = self.pop_size * 20
-        tries = 0
-        while len(pop_set) < self.pop_size and tries < max_tries:
-            tries += 1
-            pop_set.add(tuple(self._random_chain()))
+        # 3 — Phase S seeds (replaces original 40 % random) or fallback
+        n_fill = int(self.pop_size * 0.40)
+        fill_set: set = set()
+
+        if self.seed_chains_sorted:
+            log_debug(f"[GA]   Using {min(n_fill, len(self.seed_chains_sorted)):,} "
+                      f"Phase-S seed chains (top hit-count) for initial population (40 %)")
+            # Take top hit-count Phase S chains, oversample to allow depth filtering
+            top_candidates = self.seed_chains_sorted[:max(n_fill * 3, 100)]
+            selected = random.sample(top_candidates, k=min(n_fill, len(top_candidates)))
+            for sc_str in selected:
+                tokens = sc_str.split()
+                if 2 <= len(tokens) <= self.max_depth:
+                    fill_set.add(tuple(tokens))
+            # If insufficient valid seeds (depth filtering), pad with random
+            while len(fill_set) < n_fill:
+                fill_set.add(tuple(self._random_chain()))
+        else:
+            # Phase S disabled or produced zero hits — pure random fallback
+            max_tries = n_fill * 20
+            tries = 0
+            while len(fill_set) < n_fill and tries < max_tries:
+                tries += 1
+                fill_set.add(tuple(self._random_chain()))
+
+        for ind in fill_set:
+            pop_set.add(ind)
 
         result = [list(ind) for ind in pop_set]
 
-        # Safety: pad to exactly pop_size if set was too sparse
+        # Safety: pad to exactly pop_size if set was too sparse (deduplication / depth filtering)
         while len(result) < self.pop_size:
             result.append(self._random_chain())
 
@@ -2405,6 +2456,7 @@ class GPUExtractor:
         # are skipped here since Phase 1 already covered them).
         # The prebuilt sbd is kept locally for reference but is not forwarded
         # to Phase 2 — seeds are never used as scaffolding in chain generation.
+        seed_hits = Counter()   # will be passed to Phase 3 GA
         if self.builtin_seeds:
             log_section("PHASE S — Seed Extraction (numeric + special-char families A–M)")
             sbd = self.gpu_engine.build_numeric_seed_families(max_depth=self.max_depth)
@@ -2491,6 +2543,7 @@ class GPUExtractor:
                 max_depth         = self.max_depth,
                 pop_size          = self.genetic_pop,
                 elite_frac        = self.genetic_elite,
+                seed_hits         = seed_hits,   # v2: Phase S results now feed the 40 % seeding slot
             )
 
             ga_hits = evolver.evolve(
@@ -2805,3 +2858,4 @@ def main() -> None:
 
 if __name__ == '__main__':
     main()
+
