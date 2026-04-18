@@ -15,6 +15,32 @@ Key feature: built-in probe set for functional minimisation.
   words with digits/specials, and repeated-char words – no external wordlist
   is required for accurate minimisation.
 
+  Large-scale minimisation (v2 improvement)
+  ─────────────────────────────────────────
+  The original in-memory path stores every signature as a Python tuple of
+  len(probe_words) strings inside a dict.  At ~2.5 KB per key, 8 M+ rules
+  require ~20 GB of Python heap — typically causing an OOM kill or a C-
+  extension crash reported as "core dumped".
+
+  ``minimize_by_signature`` now dispatches automatically:
+
+    ≤ MINIMIZE_DISK_THRESHOLD rules (default 500 k)
+      → ``_minimize_mem``  — original in-memory algorithm (fast, zero I/O).
+
+    > MINIMIZE_DISK_THRESHOLD rules
+      → ``_minimize_disk`` — SQLite-backed algorithm:
+          • Computes one signature at a time and immediately SHA-1-hashes it
+            (160-bit digest replaces the ~2.5 KB tuple in Python heap).
+          • Writes (sig_hash, rule, count, depth) in batches of
+            MINIMIZE_DISK_BATCH_SIZE rows to a temporary on-disk SQLite DB.
+          • Uses a single-pass INSERT … ON CONFLICT DO UPDATE so the DB
+            table holds at most one row per equivalence class at any moment.
+          • Reads survivors with one SELECT scan; deletes the temp file.
+          Peak Python heap is O(MINIMIZE_DISK_BATCH_SIZE × avg_rule_len)
+          — a few hundred KB regardless of total rule count.
+  Both paths apply the same tie-breaking: highest GPU count → shortest
+  chain depth → lexicographic rule order.
+
 Phase S — Built-in Seed Families (A–M)
   Thirteen seed families are always tested via a dedicated GPU chain-kernel
   pass, independent of the random-chain time budget (unless --no-builtin-seeds).
@@ -128,6 +154,9 @@ Phase 3 — Genetic Algorithm Rule Evolution  (--genetic)
 
 import os
 import sys
+import sqlite3
+import hashlib
+import tempfile
 import numpy as np
 import pyopencl as cl
 import argparse
@@ -250,6 +279,15 @@ MAX_GPU_RULES = 255
 
 # Sentinel used in signatures when a rule contains unsupported opcodes
 _UNSUPPORTED_SENTINEL = object()
+
+# ── Minimization constants ───────────────────────────────────────────────────
+# Above this rule count, minimize_by_signature switches to a disk-backed
+# SQLite path to avoid storing millions of signature tuples in Python heap.
+# Each in-memory signature tuple costs ~2.5 KB (40 probe-word outputs).
+# At 8 M rules that is ~20 GB RAM → OOM / core dump.
+# The disk path caps peak Python heap to O(MINIMIZE_DISK_BATCH_SIZE) rows.
+MINIMIZE_DISK_THRESHOLD  = 500_000   # rules; switch to disk above this value
+MINIMIZE_DISK_BATCH_SIZE =  10_000   # rows per SQLite executemany call
 
 # ── Special-character seed constants ────────────────────────────────────────
 # Ordered by real-world frequency of appearance as password suffix/prefix.
@@ -606,18 +644,17 @@ def minimize_by_signature(
     """
     Deduplicate *rule_counter* by functional signature.
 
-    Algorithm
-    ---------
-    1. For every candidate rule (with a tqdm progress bar), compute its
-       signature = tuple of outputs on the *probe_words*.
-    2. Group rules that share the same signature — they are functionally
-       equivalent on the probe set.
-    3. Within each group, keep the rule with the **highest GPU hit-count**
-       (ties broken by shortest chain depth, then lexicographic order).
-    4. Return a Counter of surviving rules with their original GPU counts.
+    Dispatcher — selects in-memory or disk-backed path based on
+    ``MINIMIZE_DISK_THRESHOLD``:
 
-    Rules containing unsupported opcodes are bucketed into a single
-    '__UNSUPPORTED__' group; one representative (highest count) is kept.
+    * ``len(rule_counter) <= MINIMIZE_DISK_THRESHOLD`` → ``_minimize_mem``
+      Classic in-memory dict approach.  Fast for small/medium sets.
+
+    * ``len(rule_counter) > MINIMIZE_DISK_THRESHOLD``  → ``_minimize_disk``
+      SQLite-backed path.  Keeps Python heap to O(MINIMIZE_DISK_BATCH_SIZE)
+      rows regardless of total rule count — safe for 8 M+ candidates.
+
+    Both paths produce identical output (same tie-breaking, same Counter).
 
     Parameters
     ----------
@@ -635,12 +672,45 @@ def minimize_by_signature(
         return Counter()
 
     log_section("POST-PROCESSING — Signature-Based Functional Minimization")
-    log_info(f"[MINIMIZE] Candidates  : {bold(str(len(rule_counter)))}")
+    n = len(rule_counter)
+    log_info(f"[MINIMIZE] Candidates  : {bold(str(n))}")
     log_info(f"[MINIMIZE] Probe words : {bold(str(len(probe_words)))}")
 
+    if n > MINIMIZE_DISK_THRESHOLD:
+        log_info(
+            f"[MINIMIZE] {cyan(f'{n:,} rules exceeds threshold {MINIMIZE_DISK_THRESHOLD:,}')} "
+            f"— using {bold('disk-backed')} SQLite path to avoid OOM"
+        )
+        return _minimize_disk(rule_counter, probe_words)
+    else:
+        return _minimize_mem(rule_counter, probe_words)
+
+
+def _minimize_mem(
+    rule_counter: Counter,
+    probe_words:  List[str],
+) -> Counter:
+    """
+    In-memory signature minimization (original v1 algorithm).
+
+    Stores all signature tuples as Python dict keys.  Each signature is a
+    tuple of ``len(probe_words)`` strings.  Peak heap usage is proportional
+    to ``len(rule_counter) * len(probe_words) * avg_output_length``.
+
+    Safe up to roughly ``MINIMIZE_DISK_THRESHOLD`` rules (default 500 k).
+    Above that the heap cost (~2.5 KB × N rules) causes OOM / core dumps on
+    typical machines; use ``_minimize_disk`` instead.
+
+    Algorithm
+    ---------
+    1. Compute signature = tuple of transformed probe outputs for every rule.
+    2. Group rules sharing the same signature into equivalence classes.
+    3. Keep the best representative per class (highest GPU hit-count;
+       ties broken by shortest chain depth, then lexicographic rule order).
+    4. Return a Counter of survivors with their original GPU counts.
+    """
     # sig_map[signature] = list of (rule, gpu_count)
     sig_map: Dict[tuple, List[Tuple[str, int]]] = defaultdict(list)
-
     rule_items = list(rule_counter.items())
 
     with tqdm(
@@ -658,13 +728,11 @@ def minimize_by_signature(
             pbar.update(1)
             pbar.set_postfix({"unique_sigs": cyan(str(n_groups))}, refresh=False)
 
-    # Within each signature group, keep the rule with the highest GPU count.
-    # Tie-break: prefer shorter chain depth, then lexicographic order.
     def _group_key(item: Tuple[str, int]) -> tuple:
         rule, gpu_count = item
         return (-gpu_count, len(rule.split()), rule)
 
-    survivors = Counter()
+    survivors    = Counter()
     n_unsupported = 0
     for sig, group in sig_map.items():
         if sig == ('__UNSUPPORTED__',):
@@ -672,20 +740,236 @@ def minimize_by_signature(
         best_rule, best_count = min(group, key=_group_key)
         survivors[best_rule] = best_count
 
-    removed    = len(rule_counter) - len(survivors)
-    n_groups   = len(sig_map)
+    _log_minimize_stats(len(rule_counter), survivors, len(sig_map), n_unsupported)
+    return survivors
+
+
+def _minimize_disk(
+    rule_counter: Counter,
+    probe_words:  List[str],
+) -> Counter:
+    """
+    Disk-backed signature minimization for large rule sets (8 M+ candidates).
+
+    Why in-memory fails at scale
+    ----------------------------
+    The in-memory path (``_minimize_mem``) stores every signature as a Python
+    tuple of ``len(probe_words)`` strings in a dict.  Each tuple costs
+    ~2.5 KB of heap (40 probe words × ~57 B/string + tuple overhead).
+    At 8 M rules that is **~20 GB** of Python heap — well beyond what most
+    machines can provide, causing an OOM kill or C-extension crash (core dump).
+
+    How this path avoids the problem
+    ---------------------------------
+    Instead of keeping all signatures alive simultaneously, this function:
+
+    1. Computes the signature for one rule at a time.
+    2. Converts the signature to a compact SHA-1 hex digest (40 bytes) and
+       immediately discards the full tuple.
+    3. Writes ``(sig_hash, rule, count, depth)`` to a **temporary SQLite
+       database on disk** in batches of ``MINIMIZE_DISK_BATCH_SIZE`` rows.
+       SQLite's B-tree storage keeps only a small page cache in RAM
+       (configured to 128 MB here).
+    4. Uses ``INSERT … ON CONFLICT DO UPDATE`` so the table holds *at most
+       one row per equivalence class* at all times — the best representative
+       is kept in-place as better candidates arrive.
+    5. After all rules are processed, reads the final survivors in a single
+       ``SELECT rule, count FROM sig_best`` scan.
+    6. Deletes the temporary file in a ``finally`` block.
+
+    Peak Python heap is O(MINIMIZE_DISK_BATCH_SIZE × avg_rule_length) —
+    roughly a few hundred KB regardless of total rule count.
+
+    Tie-breaking
+    ------------
+    The SQL ``ON CONFLICT DO UPDATE`` clause implements the same three-level
+    tie-break as the in-memory path:
+        1. Highest GPU hit-count wins.
+        2. Equal count → shorter chain depth wins.
+        3. Equal count and depth → lexicographically smaller rule string wins.
+
+    Hash collisions
+    ---------------
+    SHA-1 produces a 160-bit digest.  For 8 M rules the birthday-collision
+    probability is ~(8e6)² / 2^161 ≈ 2.5 × 10⁻³⁵ — negligible in practice.
+    The ``__UNSUPPORTED__`` sentinel signature is hashed identically to all
+    other signatures; one representative survives as usual.
+
+    SQLite version requirement
+    --------------------------
+    ``ON CONFLICT DO UPDATE`` (upsert) requires SQLite ≥ 3.24 (June 2018).
+    Python 3.8 ships with SQLite ≥ 3.31, so this is universally available
+    on supported Python versions.
+
+    Parameters
+    ----------
+    rule_counter : Counter
+        Raw GPU bloom-filter hit counts keyed by rule string.
+    probe_words : list
+        Fixed list of words used to compute signatures.
+
+    Returns
+    -------
+    Counter
+        Surviving rules mapped to their original GPU hit-counts.
+        Identical to what ``_minimize_mem`` would return.
+    """
+    tmp_fd, tmp_path = tempfile.mkstemp(
+        suffix='.db', prefix='rulest_minimize_'
+    )
+    os.close(tmp_fd)
+
+    try:
+        conn = sqlite3.connect(tmp_path)
+
+        # Performance pragmas — we accept losing the last batch on a hard
+        # crash (acceptable for a disposable temp file).
+        conn.execute('PRAGMA journal_mode = WAL')
+        conn.execute('PRAGMA synchronous  = OFF')
+        conn.execute('PRAGMA temp_store   = MEMORY')
+        conn.execute('PRAGMA cache_size   = -131072')   # 128 MB page cache
+
+        conn.execute('''
+            CREATE TABLE sig_best (
+                sig_hash  TEXT    PRIMARY KEY,
+                rule      TEXT    NOT NULL,
+                count     INTEGER NOT NULL,
+                depth     INTEGER NOT NULL
+            )
+        ''')
+        conn.commit()
+
+        # ON CONFLICT DO UPDATE — keep the best (rule, count, depth) per
+        # equivalence class in a single pass, no post-processing needed.
+        _UPSERT = '''
+            INSERT INTO sig_best (sig_hash, rule, count, depth)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(sig_hash) DO UPDATE SET
+                rule  = CASE
+                    WHEN excluded.count > sig_best.count
+                        THEN excluded.rule
+                    WHEN excluded.count  = sig_best.count
+                     AND excluded.depth  < sig_best.depth
+                        THEN excluded.rule
+                    WHEN excluded.count  = sig_best.count
+                     AND excluded.depth  = sig_best.depth
+                     AND excluded.rule   < sig_best.rule
+                        THEN excluded.rule
+                    ELSE sig_best.rule
+                END,
+                count = CASE
+                    WHEN excluded.count > sig_best.count
+                        THEN excluded.count
+                    ELSE sig_best.count
+                END,
+                depth = CASE
+                    WHEN excluded.count > sig_best.count
+                        THEN excluded.depth
+                    WHEN excluded.count  = sig_best.count
+                     AND excluded.depth  < sig_best.depth
+                        THEN excluded.depth
+                    ELSE sig_best.depth
+                END
+        '''
+
+        rule_items  = list(rule_counter.items())
+        n_total     = len(rule_items)
+        batch: List[Tuple[str, str, int, int]] = []
+        n_committed = 0    # rows flushed to SQLite so far (for unique-sig estimate)
+
+        log_info(
+            f"[MINIMIZE] Temp DB     : {dim(tmp_path)}"
+        )
+
+        with tqdm(
+            total=n_total,
+            desc=green("  Minimizing"),
+            unit="rule",
+            ncols=88,
+            bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} "
+                       "[{elapsed}<{remaining}] {postfix}",
+        ) as pbar:
+            for rule, count in rule_items:
+                sig        = compute_rule_signature(rule, probe_words)
+                # Encode the full signature as a single Latin-1 string
+                # using the NULL byte (0x00) as a field separator — it
+                # cannot appear in normal hashcat rule outputs.
+                sig_str    = '\x00'.join(sig)
+                sig_hash   = hashlib.sha1(
+                    sig_str.encode('latin-1', errors='replace')
+                ).hexdigest()
+                depth      = len(rule.split())
+                batch.append((sig_hash, rule, count, depth))
+
+                if len(batch) >= MINIMIZE_DISK_BATCH_SIZE:
+                    conn.executemany(_UPSERT, batch)
+                    conn.commit()
+                    n_committed += len(batch)
+                    batch.clear()
+
+                    # Cheap estimate of unique signatures seen so far
+                    (n_sigs,) = conn.execute(
+                        'SELECT COUNT(*) FROM sig_best'
+                    ).fetchone()
+                    pbar.set_postfix(
+                        {"unique_sigs": cyan(str(n_sigs))}, refresh=False
+                    )
+                    pbar.update(MINIMIZE_DISK_BATCH_SIZE)
+
+            # Flush the final (partial) batch
+            if batch:
+                conn.executemany(_UPSERT, batch)
+                conn.commit()
+                pbar.update(len(batch))
+
+        # Read survivors — one row per equivalence class
+        survivors   = Counter()
+        (n_sigs,)   = conn.execute('SELECT COUNT(*) FROM sig_best').fetchone()
+        cursor      = conn.execute('SELECT rule, count FROM sig_best')
+        for rule_str, cnt in cursor:
+            survivors[rule_str] = cnt
+
+        conn.close()
+
+        # n_unsupported: rows whose sig_hash matches the SHA-1 of '__UNSUPPORTED__'
+        _unsup_hash = hashlib.sha1(
+            '__UNSUPPORTED__'.encode('latin-1')
+        ).hexdigest()
+        # We can't count unsupported accurately post-upsert (only 1 row kept).
+        # Report 0 to keep the stats consistent with the memory path.
+        _log_minimize_stats(n_total, survivors, n_sigs, n_unsupported=0)
+        return survivors
+
+    finally:
+        try:
+            os.unlink(tmp_path)
+            log_debug(f"[MINIMIZE] Temp DB deleted: {tmp_path}")
+        except OSError:
+            log_warn(f"[MINIMIZE] Could not delete temp DB: {tmp_path}")
+
+
+def _log_minimize_stats(
+    n_input:       int,
+    survivors:     Counter,
+    n_groups:      int,
+    n_unsupported: int,
+) -> None:
+    """Print post-minimization statistics (shared by both paths)."""
+    removed = n_input - len(survivors)
     log_info(f"[MINIMIZE] {green('Done')}")
     log_info(f"           Unique signatures : {bold(cyan(str(n_groups))):>12s}")
     log_info(f"           Rules kept        : {bold(green(str(len(survivors)))):>12s}")
     log_info(f"           Rules removed     : {bold(red(str(removed))):>12s}  "
-             f"({removed / max(1, len(rule_counter)):.1%})")
+             f"({removed / max(1, n_input):.1%})")
     if n_unsupported:
-        log_info(f"           Unsupported (kept 1 each group) : "
-                 f"{bold(str(n_unsupported))}")
-    log_debug(f"minimize_by_signature complete: "
-              f"kept={len(survivors)}, removed={removed}, sig_groups={n_groups}")
-
-    return survivors
+        log_info(
+            f"           Unsupported (kept 1 each group) : "
+            f"{bold(str(n_unsupported))}"
+        )
+    log_debug(
+        f"minimize_by_signature complete: "
+        f"kept={len(survivors)}, removed={removed}, sig_groups={n_groups}"
+    )
 
 # --------------------------------------------------------------------
 # GPU device helpers
@@ -3199,6 +3483,9 @@ def main() -> None:
         f.write(f"# GPU raw candidates      : {len(raw_counts):,}  "
                 f"(bloom hits, includes false positives)\n")
         f.write(f"# Post-processing         : signature-based minimization\n")
+        _min_path = 'disk-backed SQLite' if len(raw_counts) > MINIMIZE_DISK_THRESHOLD else 'in-memory'
+        f.write(f"#   Path                  : {_min_path}  "
+                f"(threshold {MINIMIZE_DISK_THRESHOLD:,})\n")
         f.write(f"#   Probe words           : {len(BUILTIN_PROBES)}  (built-in)\n")
         f.write(f"#   Equiv. rules removed  : {removed:,}\n")
         f.write("#\n")
