@@ -10,7 +10,7 @@
 - [Scripts](#-scripts)
   - [rulest.py — v1 (BFS, Legacy)](#rulestpy--v1-bfs-legacy)
   - [rulest\_v2.py — v2 (Recommended)](#rulest_v2py--v2-recommended)
-- [What's New in v3 — Phase 3 GA Fixes](#-whats-new-in-v2--phase-3-ga-fixes)
+- [What's New in v2 — Phase 3 GA Fixes](#-whats-new-in-v2--phase-3-ga-fixes)
 - [Why v2 Supersedes v1](#-why-v2-supersedes-v1)
 - [Requirements](#-requirements)
 - [Installation](#-installation)
