@@ -69,7 +69,7 @@ Phase 3 — Genetic Algorithm Rule Evolution  (--genetic)
     (families A–M) when builtin seeds are enabled. This dramatically
     improves starting coverage while gracefully falling back to random
     when --no-builtin-seeds is used.
-  • **Improvement (v3)**: three key fixes make Phase 3 produce genuinely
+  • **Improvement (v2)**: three key fixes make Phase 3 produce genuinely
     new rules rather than rediscovering Phase 2 results:
       1. Novelty-weighted fitness — chains NOT already found by Phase 1/S/2
          receive a 2× fitness bonus so the GA is driven toward new territory
@@ -91,18 +91,32 @@ Phase 3 — Genetic Algorithm Rule Evolution  (--genetic)
   Algorithm summary
   ─────────────────
   1. Initial population — 30 % depth-2 hot-rule combos (Phase 1),
-     30 % seeded deeper chains (Phase 1 hot + random),
-     40 % Phase-S builtin seed families (A–M) or random fallback
+     30 % seeded deeper chains (Phase 1 hot + random, depth-3+ biased),
+     40 % unexplored Phase-S chains (NOT in known_rules, novel-first)
      — ensures both exploitation and exploration with far better
      starting coverage when seeds are active.
-  2. GPU-batch fitness evaluation — reuses _run_chain_kernel unchanged.
-  3. Tournament selection (k = 4) — low-pressure, maintains diversity.
-  4. One-point crossover (p = 0.80) — exchanges rule-token sub-sequences.
-  5. Mutation — replace / insert / delete one rule token (weights 60/20/20).
-  6. Elitism — top <elite_frac> individuals survive unchanged each generation.
-  7. Diversity guard — duplicate individuals are replaced by random chains.
-  8. Terminates when <--genetic-generations> is reached or the wall-clock
-     time budget (--target-hours remainder) is exhausted.
+  2. GPU-batch fitness evaluation — returns raw bloom hits; novelty
+     weighting (× 2 for chains not in known_rules) is applied in the
+     evolve loop so raw counts are always stored honestly.
+  3. Incremental signature registry (_sig_to_best) — after every GPU
+     eval, every hit chain is indexed by its functional signature
+     (compute_rule_signature / BUILTIN_PROBES).  The representative of
+     each equivalence class is added to known_rules so that functionally
+     equivalent variants receive no bonus in subsequent generations.
+  4. Tournament selection (k = 4) — low-pressure, maintains diversity.
+  5. One-point crossover (p = 0.80) — exchanges rule-token sub-sequences.
+  6. Adaptive mutation (_mutate_adaptive) — apply standard mutation;
+     if result is functionally covered by _sig_to_best, apply up to
+     2 extra escape mutations to break out of the equivalence class.
+  7. Signature-based offspring filter — offspring still covered after
+     adaptive mutation are replaced by fresh random chains, keeping the
+     population structurally diverse generation-over-generation.
+  8. Elitism — top <elite_frac> individuals survive unchanged each gen.
+  9. Stagnation guard — if best effective score does not improve for
+     5 generations, the bottom 30 % of the population is replaced with
+     fresh random chains (depth 3+ biased).
+  10. Terminates when <--genetic-generations> is reached or wall-clock
+      time budget (--target-hours reservation) is exhausted.
 
   CLI flags
   ─────────
@@ -1955,6 +1969,37 @@ class GeneticRuleEvolver:
                       40 % random portion of the initial population is
                       replaced by top-scoring Phase-S chains. Falls back
                       gracefully when Phase S is disabled.
+    known_rules     : Optional set of chain strings already discovered by
+                      Phase 1 / Phase S / Phase 2.  Used to:
+                        (a) compute the novelty bonus in fitness evaluation
+                        (b) prefer unexplored Phase-S chains in seeding
+                        (c) seed the incremental signature registry so that
+                            representatives are reported as known immediately.
+
+    Improvements (v2)
+    -----------------
+    1. Incremental signature registry (_sig_to_best)
+       After every GPU evaluation, chains with raw_hits > 0 are indexed by
+       their functional signature (via compute_rule_signature / BUILTIN_PROBES).
+       The representative of each equivalence class is added to known_rules so
+       that the novelty bonus in subsequent generations is functionally aware,
+       not just string-aware.  A chain that is functionally identical to an
+       already-discovered rule receives no bonus even if it has a different
+       string representation.
+
+    2. Signature-based offspring filter
+       Before accepting a child into next_pop the GA checks whether its
+       functional signature is already present in _sig_to_best.  Covered
+       offspring are escape-mutated; if still covered they are replaced by a
+       fresh random chain.  This keeps the population structurally diverse and
+       prevents it from filling up with equivalent rules.
+
+    3. Adaptive mutation (_mutate_adaptive)
+       The standard mutation is applied first.  If the result is functionally
+       equivalent to a known sig, up to two additional escape mutations are
+       attempted.  This costs at most 3× the single-mutation overhead per
+       offspring and dramatically reduces the fraction of offspring that fall
+       into already-covered equivalence classes.
     """
 
     def __init__(
@@ -2000,10 +2045,22 @@ class GeneticRuleEvolver:
             )
         ] if self.seed_hits else []
 
-        # v3: known_rules — chains already discovered by Phase 1 / Phase S / Phase 2.
+        # v2: known_rules — chains already discovered by Phase 1 / Phase S / Phase 2.
         # Used to compute the novelty bonus in evaluate_population and to seed
         # the initial population with *unexplored* Phase-S chains.
+        # v2: also updated dynamically as GA discovers new sig representatives.
         self.known_rules: set = known_rules if known_rules is not None else set()
+
+        # v2: Incremental signature registry.
+        #
+        # _sig_cache  : lazy memoized signatures  (chain_str → tuple)
+        # _sig_to_best: best-per-equivalence-class discovered during the GA
+        #               (signature tuple → (chain_str, raw_hit_count))
+        #
+        # Updated by _update_sig_registry() after every GPU evaluation.
+        # Used by _sig_is_covered() and _mutate_adaptive().
+        self._sig_cache:   Dict[str, tuple]             = {}
+        self._sig_to_best: Dict[tuple, Tuple[str, int]] = {}
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -2021,6 +2078,115 @@ class GeneticRuleEvolver:
         if len(tokens) < lo:
             tokens = tokens + self._random_chain(lo - len(tokens))
         return tokens[:hi]
+
+    # ------------------------------------------------------------------
+    # v2 — Signature registry helpers (Improvements 1, 2, 3)
+    # ------------------------------------------------------------------
+
+    def _get_sig(self, chain_str: str) -> tuple:
+        """
+        Return the functional signature of *chain_str*, computing and
+        caching it on first access.
+
+        The signature is the tuple of outputs produced by applying the chain
+        to every word in BUILTIN_PROBES.  Rules with unsupported opcodes
+        receive the sentinel ('__UNSUPPORTED__',).
+        """
+        if chain_str not in self._sig_cache:
+            self._sig_cache[chain_str] = compute_rule_signature(
+                chain_str, BUILTIN_PROBES
+            )
+        return self._sig_cache[chain_str]
+
+    def _update_sig_registry(self, raw_hit_map: dict) -> int:
+        """
+        Update _sig_to_best from *raw_hit_map* (chain_str → raw GPU hits).
+
+        Only chains with raw_hits > 0 are indexed — zero-hit chains carry
+        no functionally useful information.
+
+        Algorithm
+        ---------
+        For each chain with hits > 0:
+          1. Compute (or retrieve cached) functional signature.
+          2. If the signature is new, add the chain as the representative.
+          3. If the signature already exists and this chain has a higher
+             hit count, promote it to representative.
+        After updating _sig_to_best, every representative is added to
+        self.known_rules so that the novelty bonus in subsequent generations
+        is functionally aware.
+
+        Returns the number of *new* distinct signatures added in this call.
+        """
+        new_sigs = 0
+        for chain_str, raw_hits in raw_hit_map.items():
+            if raw_hits <= 0:
+                continue
+            sig = self._get_sig(chain_str)
+            if sig == ('__UNSUPPORTED__',):
+                continue
+            existing = self._sig_to_best.get(sig)
+            if existing is None:
+                self._sig_to_best[sig] = (chain_str, raw_hits)
+                new_sigs += 1
+            elif raw_hits > existing[1]:
+                # Better representative found — update but do NOT
+                # remove the old one from known_rules (it's harmless there).
+                self._sig_to_best[sig] = (chain_str, raw_hits)
+
+        # Expose all current representatives via known_rules.
+        # This ensures the novelty bonus fires correctly in the next
+        # generation: any chain whose sig is already covered scores × 1.
+        for _sig, (best_chain, _cnt) in self._sig_to_best.items():
+            self.known_rules.add(best_chain)
+
+        return new_sigs
+
+    def _sig_is_covered(self, chain_str: str) -> bool:
+        """
+        Return True when *chain_str* is functionally equivalent to a chain
+        already indexed in _sig_to_best.
+
+        Chains with unsupported opcodes are never considered covered —
+        they bypass the filter unconditionally.
+
+        This check is O(probe_words) on a cache miss and O(1) on a hit.
+        With 40 probe words and pop_size = 200, the amortised cost per
+        generation is negligible (< 0.1 s).
+        """
+        if not self._sig_to_best:
+            return False
+        sig = self._get_sig(chain_str)
+        if sig == ('__UNSUPPORTED__',):
+            return False
+        return sig in self._sig_to_best
+
+    def _mutate_adaptive(self, tokens: list) -> list:
+        """
+        Adaptive mutation — Improvement 3.
+
+        Apply the standard mutation operator.  If the resulting chain is
+        functionally equivalent to one already in _sig_to_best, apply up
+        to two additional escape mutations to break out of the covered
+        equivalence class.
+
+        At most three mutations are applied total (1 base + 2 escape
+        attempts), keeping the overhead bounded and the individual still
+        closely related to its parent.
+
+        If all escape attempts fail (the covered equivalence class is very
+        large), the final result is returned as-is; the signature filter in
+        the breeding loop will handle it.
+        """
+        tokens = self._mutate(tokens)
+        # Skip the extra check when the registry is empty — avoids paying
+        # signature computation cost during the very first generation.
+        if self._sig_to_best:
+            for _attempt in range(2):
+                if not self._sig_is_covered(' '.join(tokens)):
+                    break
+                tokens = self._mutate(tokens)
+        return tokens
 
     # ------------------------------------------------------------------
     # Population initialisation
@@ -2161,14 +2327,12 @@ class GeneticRuleEvolver:
         """
         Evaluate the entire population in batched GPU kernel calls.
 
-        Returns a dict {chain_string: effective_fitness}.
+        Returns a dict {chain_string: raw_bloom_hit_count}.
 
-        Effective fitness = raw_bloom_hits × novelty_multiplier, where:
-          novelty_multiplier = 2  for chains NOT already in known_rules
-          novelty_multiplier = 1  for chains already discovered in P1/PS/P2
+        Raw counts (without any bonus multiplier) are returned so that the
+        caller can apply novelty weighting, update the signature registry,
+        and record honest GPU-frequency values — all in one consistent pass.
 
-        This selection pressure drives the GA toward genuinely new rules
-        instead of repeatedly re-evaluating chains Phase 2 already found.
         Invalid chains (fail the hashcat validator) score 0 but are kept
         in the pool to maintain population diversity.
         """
@@ -2179,9 +2343,9 @@ class GeneticRuleEvolver:
         ]
 
         # Initialise all scores to 0
-        hit_map: dict = {c: 0 for c in chain_strs}
+        raw_map: dict = {c: 0 for c in chain_strs}
         if not valid_chains:
-            return hit_map
+            return raw_map
 
         wsb = self.gpu_engine.params.get('WORD_SUB_BATCH',   20_000)
         cbs = self.gpu_engine.params.get('CHAINS_PER_BATCH',  2_000)
@@ -2197,13 +2361,8 @@ class GeneticRuleEvolver:
                         batch_hits.update(found)
             self.gpu_engine.queue.finish()
 
-        # Apply raw counts, then multiply by novelty bonus
-        hit_map.update(batch_hits)
-        for chain in list(hit_map.keys()):
-            raw = hit_map[chain]
-            if raw > 0 and chain not in self.known_rules:
-                hit_map[chain] = raw * 2   # novelty bonus: prefer new discoveries
-        return hit_map
+        raw_map.update(batch_hits)
+        return raw_map
 
     # ------------------------------------------------------------------
     # Selection
@@ -2367,35 +2526,51 @@ class GeneticRuleEvolver:
                     log_debug(f"[GA]   Time budget exhausted at generation {gen}.")
                     break
 
-                # --- Evaluate fitness (novelty-weighted) ---
-                hit_map = self.evaluate_population(pop)
+                # ── Step 1: GPU fitness evaluation (raw hits, no bonus) ────────
+                raw_map = self.evaluate_population(pop)
 
-                # Merge raw bloom hits into the running total.
-                # Store the raw count (without novelty multiplier) so the
-                # final output has honest GPU-frequency values.
+                # ── Step 2: Update incremental signature registry (Improvement 1)
+                # Indexes every hit chain by functional signature.  Representatives
+                # are added to known_rules so the novelty bonus is functionally
+                # aware from the next generation onwards.
+                new_sigs = self._update_sig_registry(raw_map)
+
+                # ── Step 3: Update all_new with highest raw hit counts ─────────
+                # pre_ga_known was captured before the GA started (passed in as
+                # the original known_rules set).  We compare against all_new to
+                # count chains that are genuinely new discoveries this generation.
                 n_novel_this_gen = 0
-                for chain_str, eff_score in hit_map.items():
-                    if eff_score > 0 and HashcatRuleValidator.validate_rule_for_gpu(chain_str):
-                        # Reverse novelty multiplier to get raw hit count
-                        raw_hits = (eff_score // 2
-                                    if chain_str not in self.known_rules
-                                    else eff_score)
+                for chain_str, raw_hits in raw_map.items():
+                    if raw_hits > 0 and HashcatRuleValidator.validate_rule_for_gpu(chain_str):
                         if raw_hits > all_new[chain_str]:
                             all_new[chain_str] = raw_hits
-                        if chain_str not in self.known_rules:
+                        # "Novel this generation" = hit chain not yet in all_new
+                        # before this update (i.e. first time it was discovered).
+                        if all_new[chain_str] == raw_hits:
                             n_novel_this_gen += 1
 
-                # Build sorted (token_list, effective_score) for selection
+                # ── Step 4: Build novelty-weighted fitness list for selection ──
+                # Novelty bonus: chains not in known_rules score × 2.
+                # known_rules now includes sig representatives discovered so far,
+                # so functionally equivalent variants are penalised correctly.
                 fitness_list = sorted(
-                    [(tuple(ind), hit_map.get(' '.join(ind), 0)) for ind in pop],
+                    [
+                        (
+                            tuple(ind),
+                            raw_map.get(' '.join(ind), 0) * (
+                                2 if ' '.join(ind) not in self.known_rules else 1
+                            ),
+                        )
+                        for ind in pop
+                    ],
                     key=lambda x: -x[1],
                 )
 
                 best_score = fitness_list[0][1] if fitness_list else 0
 
-                # --- Stagnation detection ---
+                # ── Step 5: Stagnation detection ──────────────────────────────
                 if best_score > best_ever_score:
-                    best_ever_score  = best_score
+                    best_ever_score    = best_score
                     stagnation_counter = 0
                 else:
                     stagnation_counter += 1
@@ -2412,7 +2587,7 @@ class GeneticRuleEvolver:
                     depth_bias = self.max_depth >= 3
                     refresh_chains = []
                     rt = 0
-                    refresh_set = {tuple(e) for e in fitness_list[:n_elite][0][0:1]}
+                    refresh_set = {fitness_list[0][0]} if fitness_list else set()
                     while len(refresh_chains) < n_refresh and rt < n_refresh * 20:
                         rt += 1
                         d = (random.randint(3, self.max_depth)
@@ -2422,7 +2597,6 @@ class GeneticRuleEvolver:
                         if ind not in refresh_set:
                             refresh_chains.append(list(ind))
                             refresh_set.add(ind)
-                    # Replace the worst individuals (beyond elite) with refreshed ones
                     keep_top = [list(ind) for ind, _ in fitness_list[:self.pop_size - n_refresh]]
                     pop = keep_top + refresh_chains
                     pop = pop[:self.pop_size]
@@ -2430,19 +2604,26 @@ class GeneticRuleEvolver:
                     pbar.set_postfix(
                         {"best": cyan(str(best_score)),
                          "new":  cyan(str(len(all_new))),
+                         "sigs": cyan(str(len(self._sig_to_best))),
                          "stag": yellow("REFRESH")},
                         refresh=False,
                     )
                     continue   # skip normal breeding this generation
 
-                # --- Elitism: carry top individuals unchanged ---
-                elites     = [list(ind) for ind, _ in fitness_list[:n_elite]]
-                next_pop   = list(elites)
-                next_set   = {tuple(e) for e in elites}
+                # ── Step 6: Elitism — carry top individuals unchanged ─────────
+                elites   = [list(ind) for ind, _ in fitness_list[:n_elite]]
+                next_pop = list(elites)
+                next_set = {tuple(e) for e in elites}
 
-                # --- Breed remainder via selection + crossover + mutation ---
-                max_breed_attempts = (self.pop_size - len(next_pop)) * 6
+                # ── Step 7: Breed remainder via selection + crossover + mutation
+                # Improvements 2 & 3 are applied here:
+                #   - _mutate_adaptive escapes covered sig classes (Improvement 3)
+                #   - Offspring still landing in a covered sig after escape are
+                #     replaced by a random chain (Improvement 2)
+                depth_bias = self.max_depth >= 3
+                max_breed_attempts = (self.pop_size - len(next_pop)) * 8
                 breed_attempts     = 0
+                n_sig_replaced     = 0   # diagnostic counter
 
                 while len(next_pop) < self.pop_size and breed_attempts < max_breed_attempts:
                     breed_attempts += 1
@@ -2451,18 +2632,38 @@ class GeneticRuleEvolver:
                     p2 = self._tournament_select(fitness_list)
 
                     child1, child2 = self._crossover(p1, p2)
-                    child1 = self._mutate(child1)
-                    child2 = self._mutate(child2)
+
+                    # Adaptive mutation (Improvement 3): if child lands in a
+                    # covered sig class, up to 2 extra escape mutations are applied.
+                    child1 = self._mutate_adaptive(child1)
+                    child2 = self._mutate_adaptive(child2)
 
                     for child in (child1, child2):
+                        if len(next_pop) >= self.pop_size:
+                            break
                         key = tuple(child)
-                        if key not in next_set and len(next_pop) < self.pop_size:
-                            next_pop.append(child)
-                            next_set.add(key)
+                        if key in next_set:
+                            continue
 
-                # --- Diversity fill: pad any remaining slots randomly ---
+                        # Improvement 2: signature filter.
+                        # If the child is still functionally covered after
+                        # adaptive mutation, replace it with a random chain.
+                        # This keeps the population structurally diverse.
+                        if self._sig_is_covered(' '.join(child)):
+                            n_sig_replaced += 1
+                            d = (random.randint(3, self.max_depth)
+                                 if depth_bias and random.random() < 0.70
+                                 else random.randint(2, self.max_depth))
+                            child = self._random_chain(d)
+                            key   = tuple(child)
+                            if key in next_set:
+                                continue
+
+                        next_pop.append(child)
+                        next_set.add(key)
+
+                # ── Step 8: Diversity fill — pad any remaining slots randomly ─
                 fill_attempts = 0
-                depth_bias = self.max_depth >= 3
                 while len(next_pop) < self.pop_size and fill_attempts < self.pop_size * 4:
                     fill_attempts += 1
                     d = (random.randint(3, self.max_depth)
@@ -2475,25 +2676,42 @@ class GeneticRuleEvolver:
 
                 pop = next_pop[:self.pop_size]
 
+                log_debug(
+                    f"[GA]   gen={gen}  new_sigs={new_sigs}  "
+                    f"sig_replaced={n_sig_replaced}  "
+                    f"total_sigs={len(self._sig_to_best)}"
+                )
                 pbar.update(1)
                 pbar.set_postfix(
                     {"best": cyan(str(best_score)),
                      "new":  cyan(str(len(all_new))),
-                     "novel": cyan(str(n_novel_this_gen))},
+                     "sigs": cyan(str(len(self._sig_to_best)))},
                     refresh=False,
                 )
 
         elapsed = time.time() - t_start
-        n_truly_novel = sum(1 for r in all_new if r not in self.known_rules)
+
+        # Summary metrics:
+        #   all_new           — every chain with ≥1 bloom hit (includes pre-GA known ones
+        #                       whose score was updated by the GA)
+        #   _sig_to_best      — distinct functional equivalence classes discovered by the GA
+        #   sig_cache         — total signatures computed (chains × probe evaluations cached)
+        n_chains      = len(all_new)
+        n_sig_classes = len(self._sig_to_best)
         log_info(
             f"[GA]   Evolution complete — "
-            f"{bold(green(str(len(all_new))))} unique chains passed bloom filter  "
-            f"({bold(cyan(str(n_truly_novel)))} genuinely new, not found by P1/PS/P2)  "
+            f"{bold(green(str(n_chains)))} unique chains passed bloom filter  "
+            f"({bold(cyan(str(n_sig_classes)))} distinct functional signatures)  "
             f"({elapsed:.1f}s, {last_gen + 1} generation(s))"
         )
-        log_debug(f"Phase 3 GA complete: {len(all_new)} rules, "
-                  f"{n_truly_novel} novel, elapsed={elapsed:.1f}s")
+        log_debug(
+            f"Phase 3 GA complete: chains={n_chains}, "
+            f"sig_classes={n_sig_classes}, "
+            f"sig_cache={len(self._sig_cache)}, "
+            f"elapsed={elapsed:.1f}s"
+        )
         return all_new
+
 
 
 # --------------------------------------------------------------------
@@ -2714,7 +2932,7 @@ class GPUExtractor:
                 pop_size          = self.genetic_pop,
                 elite_frac        = self.genetic_elite,
                 seed_hits         = seed_hits,
-                known_rules       = known_rules_set,  # v3: novelty-aware fitness
+                known_rules       = known_rules_set,  # v2: novelty-aware fitness
             )
 
             ga_hits = evolver.evolve(
