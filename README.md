@@ -916,7 +916,7 @@ python rulest_v2.py base.txt target.txt --max-depth 3 --target-hours 2.0 -o no_g
  
 # With GA — compare rule count, depth distribution, and "genuinely novel" count in the log
 # Note: GA reserves 20 % of total time (24 min) before Phase 2 begins
-  --genetic -o with_ga.txt
+python rulest_v2.py base.txt target.txt --max-depth 3 --target-hours 2.0 --genetic -o with_ga.txt
 ```
  
 ---
