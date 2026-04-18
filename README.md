@@ -628,6 +628,17 @@ After GPU extraction, `rulest_v2.py` applies a **signature-based functional mini
  
 5. **Write the minimized ruleset.** Surviving rules are written to the output file sorted by GPU frequency (descending). The file header records the probe word count and how many equivalent rules were removed.
  
+### Large-Scale Minimization (Disk-Backed Path)
+
+For large runs that produce more than **500,000 raw candidates** (`MINIMIZE_DISK_THRESHOLD`), `minimize_by_signature` automatically switches from the in-memory algorithm to a **SQLite-backed path** to avoid OOM conditions:
+
+| Condition | Path | Peak heap |
+|---|---|---|
+| ≤ 500,000 rules | `_minimize_mem` — in-memory dict of signature tuples | ~2.5 KB × rule count |
+| > 500,000 rules | `_minimize_disk` — SQLite temp DB with SHA-1-hashed signatures | O(batch size) — a few hundred KB regardless of rule count |
+
+The disk path computes each rule's signature, immediately SHA-1-hashes it (replacing the ~2.5 KB tuple with a 160-bit digest), and writes rows in batches of `MINIMIZE_DISK_BATCH_SIZE` (default 10,000) to a temporary SQLite database using an `INSERT … ON CONFLICT DO UPDATE` so only one row per equivalence class is ever stored. Survivors are read back in a single `SELECT` scan and the temp file is deleted. Both paths apply identical tie-breaking: highest GPU hit count → shortest chain depth → lexicographic rule order. The path used is recorded in the output file header (`# Path : in-memory` or `# Path : disk-backed SQLite`).
+
 ### Why It Matters
  
 GPU Bloom filter screening (Phase 1, 2 & 3) can yield thousands of candidates where many are functionally identical — for example, `c` (capitalize first letter) and a chain `l c` applied to an already-lowercase word produce the same output. Without minimization, the output file contains duplicate work that inflates Hashcat's rule-testing time without adding new candidate passwords.
@@ -711,6 +722,8 @@ These constants are defined at the top of `rulest_v2.py` and can be tuned for ad
 | `MAX_OUTPUT_LEN` | `512` | Maximum transformed word output length in GPU buffers |
 | `MAX_CHAIN_STRING_LEN` | `128` | Maximum chained rule string length in GPU buffers |
 | `MAX_HASHCAT_CHAIN` | `31` | Maximum number of rules in a single Hashcat chain |
+| `MINIMIZE_DISK_THRESHOLD` | `500,000` | Rule count above which `minimize_by_signature` switches from in-memory to the disk-backed SQLite path |
+| `MINIMIZE_DISK_BATCH_SIZE` | `10,000` | Rows per `executemany` batch in the SQLite minimization path |
  
 > Phase 3 GA parameters (`--genetic-pop`, `--genetic-generations`, `--genetic-elite`) are CLI-only and have no corresponding module-level constants.
  
@@ -731,7 +744,8 @@ These constants are defined at the top of `rulest_v2.py` and can be tuned for ad
 #
 # GPU raw candidates      : 9,214  (bloom hits, includes false positives)
 # Post-processing         : signature-based minimization
-#   Probe words           : 38  (built-in)
+#   Path                  : in-memory  (threshold 500,000)
+#   Probe words           : 37  (built-in)
 #   Equiv. rules removed  : 4,393
 #
 # Rules kept     : 4,821  (d1:3104  d2:1512  d3:205)
@@ -912,6 +926,5 @@ python rulest_v2.py base.txt target.txt --max-depth 3 --target-hours 2.0 -o no_g
 MIT
  
 ## Credits
-
 
 https://github.com/synacktiv/rulesfinder
