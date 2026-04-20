@@ -77,6 +77,64 @@ Phase S — Built-in Seed Families (A–M)
   Special chars — top-15 (F/G/H):  ! @ # $ % ^ & * ? . - _ + ( )
   Special chars — core-7  (I/L):   ! @ # $ % * ?
 
+Phase 0 — Token-Strip Rule Extraction  (--token-strip)
+  An optional CPU-only pre-pass that extracts rules empirically by
+  decomposing target passwords into their constituent token categories
+  and building hashcat rule chains that reconstruct each password from
+  a base-wordlist stem.
+
+  Five extraction modes
+  ─────────────────────
+  LETTER MODE  (primary when letters ≥ digits)
+    Boundary = digits + specials → prepend/append ops.
+    Middle   = letters + leet   → case-transform + leet-substitution ops.
+    Covers:  "Password123!", "P@ssw0rd", "ADMIN2024"
+
+  DIGIT MODE   (primary when digits > letters — dynamic boundary)
+    Boundary = letters + specials → prepend/append ops.
+    Middle   = pure digit string → looked up verbatim in base wordlist.
+    Covers:  "abc2024" (stem "2024"), "123456xyz" (stem "123456")
+    Selects which characters become ^/$ rules based on word composition
+    so common numeric-base passwords are found regardless of orientation.
+
+  REVERSE MODE (chain prefix 'r')
+    The middle segment is reversed before stem lookup and case/leet decode.
+    Covers:  "drowssap!" → stem "password", rule "r $!"
+
+  DELETE-EDGE MODE (chain prefix '[' or ']')
+    One non-boundary character is stripped from start ('[') or end (']')
+    before running the normal letter-mode extraction.
+
+  DUPLICATE / FOLD MODE (chain 'd' or 'f')
+    Detects passwords built by duplicating ('d': stem+stem) or folding
+    ('f': stem+reverse(stem)) a base-wordlist word.
+
+  Toggle-chain seeds (separate, direct injection into Phase 2)
+  ─────────────────────────────────────────────────────────────
+  Deterministic T0..TN chains (sequential, even-position, odd-position)
+  combined with every core leet op are generated independently of stem
+  lookups and injected directly into Phase S sbd + Phase 2 seed pool.
+  Captures high-frequency patterns observed in practice:
+    "T0 T1 T2 T3 T4 T5 T6 T7 se3"  →  mixed-case + e→3 on 8-char words
+    "T0 T2 T4 T6 sa@"               →  alternating toggle + a→@
+
+  Phase S injection
+  ─────────────────
+  All Phase 0 chains (from all modes) are injected into the Phase S
+  seed-by-depth (sbd) pool before the GPU sweep.  Depth slots not present
+  in sbd (e.g. depth 10 with --max-depth 10) are created automatically.
+
+  Single-rule discoveries are merged into the Phase 1 atomic-rule pool;
+  multi-rule chains are forwarded to Phase 2 as seed chains.
+
+  CLI flags
+  ─────────
+    --token-strip                 Enable Phase 0 (default: disabled)
+    --token-strip-min-stem N      Minimum stem length (default: 4)
+    --token-strip-max-prefix N    Max boundary prefix/suffix length (default: 4)
+    --token-strip-min-leet-amb N  Max ambiguous leet positions per word
+                                  (default: 3; limits branching for '1')
+
 Phase 3 — Genetic Algorithm Rule Evolution  (--genetic)
   An optional evolutionary search that runs after Phase 2 and complements
   random chain sampling with guided, coverage-driven optimisation.
@@ -167,7 +225,7 @@ from tqdm import tqdm
 import time
 import math
 import random
-from typing import Dict, Set, Tuple, Optional, List
+from typing import Dict, Set, Tuple, Optional, List, Iterator
 import gc
 import datetime
 
@@ -313,6 +371,42 @@ LEET_SUBS: List[Tuple[str, str]] = [
 ]
 # Pre-built hashcat rule strings derived from LEET_SUBS (e.g. "sa@").
 LEET_OPS: List[str] = [f's{orig}{rep}' for orig, rep in LEET_SUBS]
+
+# ── Token-Strip constants (Phase 0) ──────────────────────────────────────────
+# Leet decode table used in Phase 0 to reverse substitutions found in target
+# passwords.  Each entry is (encoded_char, base_char, hashcat_sub_rule).
+# Multiple entries may share the same encoded_char (e.g. '1' → 'i' or 'l').
+TOKEN_STRIP_LEET_TABLE: List[Tuple[str, str, str]] = [
+    ('@', 'a', 'sa@'),   # p@ssword  ← password
+    ('3', 'e', 'se3'),   # s3cur1ty  ← security
+    ('0', 'o', 'so0'),   # passw0rd  ← password
+    ('1', 'i', 'si1'),   # pass1word ← passiword  (ambiguous: also 'l')
+    ('1', 'l', 'sl1'),   # 1eet      ← leet
+    ('5', 's', 'ss5'),   # pa55word  ← password
+    ('$', 's', 'ss$'),   # pa$$word  ← password
+    ('7', 't', 'st7'),   # 7error    ← terror
+    ('4', 'a', 'sa4'),   # p4ssword  ← password
+    ('!', 'i', 'si!'),   # pass!word ← passiword
+]
+
+# Per-char lookup: encoded_char → [(base_char, rule_str), ...]
+_TOKEN_STRIP_LEET_BY_CHAR: Dict[str, List[Tuple[str, str]]] = defaultdict(list)
+for _ts_enc, _ts_base, _ts_rule in TOKEN_STRIP_LEET_TABLE:
+    _TOKEN_STRIP_LEET_BY_CHAR[_ts_enc].append((_ts_base, _ts_rule))
+
+# Set of characters that can be leet-decoded inside a middle segment
+TOKEN_STRIP_LEET_CHARS: Set[str] = set(_TOKEN_STRIP_LEET_BY_CHAR.keys())
+
+# Characters allowed in boundary prefix/suffix positions (digits + common specials)
+# Used in LETTER mode: letters form the stem, digits/specials are boundary (^/$).
+TOKEN_STRIP_BOUNDARY: Set[str] = set('0123456789!@#$%^&*?.-_+()')
+
+# Boundary set for DIGIT mode: letters + specials form the boundary (^/$),
+# pure digit sequences form the stem.  Selected when target word has more
+# digits than letters — common for passwords like "123abc456" or "abc2024".
+TOKEN_STRIP_ALPHA_BOUNDARY: Set[str] = (
+    set(string.ascii_letters) | set('!@#$%^&*?.-_+()')
+)
 
 # ====================================================================
 # --- BUILT-IN PROBE SET (hand‑curated, covers all important cases) ---
@@ -970,6 +1064,738 @@ def _log_minimize_stats(
         f"minimize_by_signature complete: "
         f"kept={len(survivors)}, removed={removed}, sig_groups={n_groups}"
     )
+
+# ====================================================================
+# --- PHASE 0 — TOKEN-STRIP RULE EXTRACTION ---
+# ====================================================================
+
+def _hashcat_title_case(s: str) -> str:
+    """
+    Simulate hashcat's 'E' (title-case) rule on an all-lowercase string.
+    Capitalises the first letter and any letter immediately following a
+    space, hyphen, or underscore.
+    """
+    result    = list(s)
+    cap_next  = True
+    for i, c in enumerate(result):
+        if cap_next and 'a' <= c <= 'z':
+            result[i] = c.upper()
+            cap_next   = False
+        if c in (' ', '-', '_'):
+            cap_next = True
+    return ''.join(result)
+
+
+def _infer_case_rules(cased_stem: str) -> List[List[str]]:
+    """
+    Given a string of letters (possibly mixed case), return all candidate
+    lists of hashcat case-transform ops that convert ``cased_stem.lower()``
+    into ``cased_stem``.
+
+    Candidates are ordered from shortest to longest so callers can try
+    the cheapest option first.  Each inner list is one complete set of ops
+    (e.g. ``['c']`` or ``['T0', 'T3']``).
+
+    Returns an empty list if no pattern can be expressed within positions
+    0–9 (hashcat's positional-op limit).
+    """
+    stem_lower = cased_stem.lower()
+
+    if cased_stem == stem_lower:
+        return [[]]                           # already lowercase — no op needed
+
+    candidates: List[List[str]] = []
+
+    # ── Single-op patterns (depth 1) ──────────────────────────────────────────
+    # u — uppercase all
+    if cased_stem == stem_lower.upper():
+        candidates.append(['u'])
+
+    # c — capitalize (first char upper, rest lower)
+    if (len(cased_stem) >= 1
+            and cased_stem[0] == cased_stem[0].upper()
+            and cased_stem[1:] == cased_stem[1:].lower()):
+        candidates.append(['c'])
+
+    # C — lowercase first char, uppercase rest
+    if (len(cased_stem) >= 1
+            and cased_stem[0] == cased_stem[0].lower()
+            and cased_stem[1:] == cased_stem[1:].upper()):
+        candidates.append(['C'])
+
+    # t — toggle every character's case
+    toggled = ''.join(c.lower() if c.isupper() else c.upper() for c in stem_lower)
+    if cased_stem == toggled:
+        candidates.append(['t'])
+
+    # E — title case (first letter of each word)
+    if cased_stem == _hashcat_title_case(stem_lower):
+        candidates.append(['E'])
+
+    # ── Per-position TN ops (depth N) ─────────────────────────────────────────
+    # TN toggles position N.  Only positions 0–9 are addressable.
+    # Only emit TN ops when no single-op candidate (u/c/C/t/E) already
+    # covers the pattern — TN ops are a fallback for irregular mixed-case
+    # patterns that can't be expressed more compactly.
+    if not candidates:
+        uppercase_positions = [i for i, c in enumerate(cased_stem)
+                               if c != stem_lower[i]]    # differs from lowercase
+        if uppercase_positions and all(p <= 9 for p in uppercase_positions):
+            tn_ops = [f'T{p}' for p in uppercase_positions]
+            candidates.append(tn_ops)
+
+    return candidates
+
+
+def _leet_decode_variants(
+    middle: str,
+    max_ambiguous: int = 3,
+) -> Iterator[Tuple[str, frozenset]]:
+    """
+    Yield ``(decoded, leet_rules)`` pairs for every way to replace leet
+    characters in *middle* with their base-letter equivalents.
+
+    decoded    : *middle* with leet chars substituted by letters (may still
+                 contain uppercase letters from the original).
+    leet_rules : ``frozenset`` of hashcat ``s`` rule strings applied.
+
+    Only yields variants whose decoded form consists entirely of ASCII
+    letters (a-z, A-Z) — non-decodable chars abort the generator.
+
+    The branching factor is capped at *max_ambiguous* positions that have
+    more than one possible mapping (e.g. ``'1'`` → ``'i'`` or ``'l'``).
+    """
+    # Abort early if any char is not a letter and not a known leet char
+    for ch in middle:
+        if not ch.isalpha() and ch not in TOKEN_STRIP_LEET_CHARS:
+            return
+
+    # Find leet positions and their candidate decodings
+    leet_positions: List[Tuple[int, str, List[Tuple[str, str]]]] = []
+    for i, ch in enumerate(middle):
+        if ch in TOKEN_STRIP_LEET_CHARS:
+            options = _TOKEN_STRIP_LEET_BY_CHAR[ch]  # [(base_char, rule_str), ...]
+            leet_positions.append((i, ch, options))
+
+    if not leet_positions:
+        # No leet chars — yield as-is (already all letters due to guard above)
+        yield (middle, frozenset())
+        return
+
+    # Limit combinatorial explosion from ambiguous positions
+    n_ambiguous = sum(1 for _, _, opts in leet_positions if len(opts) > 1)
+    if n_ambiguous > max_ambiguous:
+        return
+
+    # Enumerate all combinations of decodings
+    choices_per_pos = [opts for _, _, opts in leet_positions]
+    for combo in itertools.product(*choices_per_pos):
+        decoded  = list(middle)
+        rules    = set()
+        for (pos, _orig, _opts), (base_ch, rule_str) in zip(leet_positions, combo):
+            decoded[pos] = base_ch
+            rules.add(rule_str)
+        decoded_str = ''.join(decoded)
+        if all(ch.isalpha() for ch in decoded_str):
+            yield (decoded_str, frozenset(rules))
+
+
+def _decode_middle(
+    middle: str,
+    max_ambiguous: int = 3,
+) -> Iterator[Tuple[str, frozenset, List[List[str]]]]:
+    """
+    Yield ``(stem, leet_rules, case_candidates)`` triples for every way
+    to decode the *middle* segment of a target password.
+
+    stem            : all-lowercase base string to look up in the wordlist
+    leet_rules      : ``frozenset`` of ``s`` rule strings for leet subs
+    case_candidates : list of lists — each inner list is one set of case-
+                      transform ops that converts *stem* into the cased
+                      form of *middle* after leet decoding
+    """
+    for leet_decoded, leet_rules in _leet_decode_variants(middle, max_ambiguous):
+        # leet_decoded is all ASCII letters (a-z / A-Z)
+        cased_stem      = leet_decoded
+        stem            = cased_stem.lower()
+        case_candidates = _infer_case_rules(cased_stem)
+        if not case_candidates:
+            case_candidates = [[]]   # fall back: no case op (stem stays lowercase)
+        yield (stem, leet_rules, case_candidates)
+
+
+def _rule_chain_orderings(
+    case_ops:    List[str],
+    leet_ops:    List[str],
+    prepend_ops: List[str],
+    append_ops:  List[str],
+    leading_ops: Optional[List[str]] = None,
+) -> List[List[str]]:
+    """
+    Return candidate rule-chain orderings for the four op groups.
+
+    leading_ops   : optional fixed prefix (e.g. ['r'], ['d'], ['[']) that is
+                    prepended to every ordering unchanged.
+
+    Canonical ordering : [leading] case → leet → prepend → append
+    Alternative 1      : [leading] leet → case → prepend → append
+    Alternative 2      : [leading] prepend → case → leet → append
+
+    All orderings are verified by the caller via py_apply_chain.
+    """
+    lead = leading_ops or []
+    seen: Set[tuple] = set()
+    result: List[List[str]] = []
+
+    def _add(ops: List[str]) -> None:
+        full = lead + ops
+        key  = tuple(full)
+        if key not in seen:
+            seen.add(key)
+            result.append(full)
+
+    _add(case_ops + leet_ops + prepend_ops + append_ops)          # canonical
+    if case_ops and leet_ops:
+        _add(leet_ops + case_ops + prepend_ops + append_ops)       # leet-first
+    if prepend_ops and (case_ops or leet_ops):
+        _add(prepend_ops + case_ops + leet_ops + append_ops)       # prefix-first
+
+    return result
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Internal helpers called by extract_token_strip_rules
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _boundary_scan(
+    word:           str,
+    boundary_chars: Set[str],
+    max_prefix_len: int,
+    max_suffix_len: int,
+    min_stem_len:   int,
+) -> List[Tuple[str, str, str]]:
+    """
+    Return (prefix, middle, suffix) triples from *word* where:
+      • prefix  consists entirely of *boundary_chars* (length 0..max_prefix_len)
+      • suffix  consists entirely of *boundary_chars* (length 0..max_suffix_len)
+      • middle  contains at least *min_stem_len* characters
+
+    The boundary scan terminates early (break) as soon as a non-boundary
+    character is encountered, matching the left-to-right scanning order used
+    in the original extraction.
+    """
+    wlen    = len(word)
+    triples: List[Tuple[str, str, str]] = []
+    for p in range(0, min(max_prefix_len + 1, wlen + 1)):
+        if p > 0 and word[p - 1] not in boundary_chars:
+            break
+        for s in range(0, min(max_suffix_len + 1, wlen - p + 1)):
+            if s == 0:
+                mid = word[p:]
+                suf = ''
+            else:
+                mid = word[p: wlen - s]
+                suf = word[wlen - s:]
+            if s > 0 and word[wlen - s] not in boundary_chars:
+                break
+            if len(mid) >= min_stem_len:
+                triples.append((word[:p], mid, suf))
+    return triples
+
+
+def _chains_from_middle(
+    middle:          str,
+    prefix:          str,
+    suffix:          str,
+    base_set:        Set[str],
+    max_depth:       int,
+    min_stem_len:    int,
+    max_leet_amb:    int,
+    leading_ops:     Optional[List[str]] = None,
+) -> Set[str]:
+    """
+    Try to build rule chains that transform a base-wordlist stem into *middle*
+    (after prepend/append boundary ops from *prefix*/*suffix* are applied).
+
+    Handles leet decoding and case inference.  Verifies every candidate chain
+    against the original target via py_apply_chain.
+    """
+    # The full original target word is always prefix + middle + suffix.
+    # py_apply_chain(chain, stem) must equal this exactly.
+    target_word = prefix + middle + suffix
+
+    lead      = leading_ops or []
+    lead_depth = len(lead)
+
+    prepend_ops: List[str] = [f'^{c}' for c in reversed(prefix)]
+    append_ops:  List[str] = [f'${c}' for c in suffix]
+    boundary_depth = len(prepend_ops) + len(append_ops)
+
+    found: Set[str] = set()
+
+    for stem, leet_rules, case_candidates in _decode_middle(middle, max_leet_amb):
+        if len(stem) < min_stem_len or stem not in base_set:
+            continue
+        leet_ops: List[str] = sorted(leet_rules)
+        for case_ops in case_candidates:
+            transform_depth = len(case_ops) + len(leet_ops)
+            total = lead_depth + transform_depth + boundary_depth
+            if total > max_depth:
+                continue
+            for ops in _rule_chain_orderings(
+                case_ops, leet_ops, prepend_ops, append_ops,
+                leading_ops=lead,
+            ):
+                if not ops or len(ops) > max_depth:
+                    continue
+                chain = ' '.join(ops)
+                if not HashcatRuleValidator.validate_rule_for_gpu(chain):
+                    continue
+                if py_apply_chain(chain, stem) == target_word:
+                    found.add(chain)
+    return found
+
+
+def _extract_letter_mode(
+    word:           str,
+    base_set:       Set[str],
+    max_depth:      int,
+    min_stem_len:   int,
+    max_prefix_len: int,
+    max_suffix_len: int,
+    max_leet_amb:   int,
+) -> Set[str]:
+    """
+    LETTER MODE (original behaviour).
+    Boundary chars = digits + specials; middle = letters (+ leet).
+    Reconstructs target passwords of the form:
+        [digits/specials] STEM [digits/specials]
+    where STEM is a (possibly case-transformed / leet-substituted) word
+    from the base wordlist.
+    """
+    found: Set[str] = set()
+    for prefix, middle, suffix in _boundary_scan(
+        word, TOKEN_STRIP_BOUNDARY, max_prefix_len, max_suffix_len, min_stem_len
+    ):
+        found |= _chains_from_middle(
+            middle, prefix, suffix, base_set,
+            max_depth, min_stem_len, max_leet_amb,
+        )
+    return found
+
+
+def _extract_digit_mode(
+    word:           str,
+    base_set:       Set[str],
+    max_depth:      int,
+    min_stem_len:   int,
+    max_prefix_len: int,
+    max_suffix_len: int,
+) -> Set[str]:
+    """
+    DIGIT MODE (new, dynamic boundary).
+    Boundary chars = letters + specials; middle = pure digit sequence.
+    Used when the target word contains more digits than letters, e.g.:
+        "abc2024"  → stem "2024", boundary "abc" → rule '^c ^b ^a'
+        "12345abc" → stem "12345", boundary "abc" → rule '$a $b $c'
+    The digit sequence is looked up verbatim in the base wordlist (common
+    numeric passwords such as "123456" appear in rockyou-style lists).
+    No leet or case transforms apply to a pure-digit middle segment.
+    """
+    found: Set[str] = set()
+    for prefix, middle, suffix in _boundary_scan(
+        word, TOKEN_STRIP_ALPHA_BOUNDARY, max_prefix_len, max_suffix_len, min_stem_len
+    ):
+        if not middle.isdigit():
+            continue
+        if middle not in base_set:
+            continue
+        prepend_ops: List[str] = [f'^{c}' for c in reversed(prefix)]
+        append_ops:  List[str] = [f'${c}' for c in suffix]
+        total = len(prepend_ops) + len(append_ops)
+        if total == 0 or total > max_depth:
+            continue
+        chain = ' '.join(prepend_ops + append_ops)
+        if HashcatRuleValidator.validate_rule_for_gpu(chain):
+            if py_apply_chain(chain, middle) == word:
+                found.add(chain)
+    return found
+
+
+def _extract_reverse_mode(
+    word:           str,
+    base_set:       Set[str],
+    max_depth:      int,
+    min_stem_len:   int,
+    max_prefix_len: int,
+    max_suffix_len: int,
+    max_leet_amb:   int,
+) -> Set[str]:
+    """
+    REVERSE MODE — chain starts with 'r'.
+    Checks whether the middle segment of the target, when reversed, decodes
+    to a base-wordlist stem.  Handles leet and case transforms on the
+    reversed middle, combined with boundary prepend/append ops.
+
+    Example:
+        target  "drowssap!"   stem "password" → rule  'r $!'
+        target  "1drowssap"   stem "password" → rule  'r ^1'
+        target  "3DROWSSAP"   stem "password" → rule  'r u se3'
+    """
+    found: Set[str] = set()
+    if max_depth < 1:
+        return found
+    for prefix, middle, suffix in _boundary_scan(
+        word, TOKEN_STRIP_BOUNDARY, max_prefix_len, max_suffix_len, min_stem_len
+    ):
+        rev_middle = middle[::-1]
+        found |= _chains_from_middle(
+            rev_middle, prefix, suffix, base_set,
+            max_depth, min_stem_len, max_leet_amb,
+            leading_ops=['r'],
+        )
+    return found
+
+
+def _extract_duplicate_mode(
+    word:         str,
+    base_set:     Set[str],
+    max_depth:    int,
+    min_stem_len: int,
+) -> Set[str]:
+    """
+    DUPLICATE / FOLD MODE — detect passwords formed by duplicating or folding
+    a base-wordlist word, optionally with leading/trailing boundary ops.
+
+    'd' (duplicate)  : stem → stem+stem
+        e.g. "passwordpassword" from "password"  → rule 'd'
+    'f' (fold)        : stem → stem+reverse(stem)
+        e.g. "passworddrowssap" from "password"  → rule 'f'
+    """
+    found:  Set[str] = set()
+    wlen   = len(word)
+
+    for op, builder in (
+        ('d', lambda s: s + s),
+        ('f', lambda s: s + s[::-1]),
+    ):
+        for half in range(min_stem_len, wlen // 2 + 1):
+            stem_cand = word[:half]
+            expected  = builder(stem_cand)
+            if expected == word and stem_cand in base_set:
+                chain = op
+                if HashcatRuleValidator.validate_rule_for_gpu(chain):
+                    if py_apply_chain(chain, stem_cand) == word:
+                        found.add(chain)
+    return found
+
+
+def _extract_delete_edge_mode(
+    word:           str,
+    base_set:       Set[str],
+    max_depth:      int,
+    min_stem_len:   int,
+    max_prefix_len: int,
+    max_suffix_len: int,
+    max_leet_amb:   int,
+) -> Set[str]:
+    """
+    DELETE-EDGE MODE — chain starts with '[' (delete first) or ']' (delete last).
+    Useful when the target word has one extra character at the start or end
+    that does not fit the normal boundary model.
+
+    Example:
+        target "Xpassword!"  stem "password" — the 'X' prefix char is not a
+        typical boundary digit/special.  Trying '[' on 'Xpassword' after
+        stripping the '!' suffix finds the stem.
+    """
+    found: Set[str] = set()
+    if max_depth < 1 or len(word) < min_stem_len + 1:
+        return found
+    for op, trimmed in (('[', word[1:]), (']', word[:-1])):
+        for prefix, middle, suffix in _boundary_scan(
+            trimmed, TOKEN_STRIP_BOUNDARY,
+            max_prefix_len, max_suffix_len, min_stem_len
+        ):
+            # The full original word must be reconstructed:
+            # op transforms "prefix+middle+suffix_in_trimmed" which came from
+            # original word.  py_apply_chain(chain, stem) == word handles this.
+            found |= _chains_from_middle(
+                middle, prefix, suffix, base_set,
+                max_depth, min_stem_len, max_leet_amb,
+                leading_ops=[op],
+            )
+    return found
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Toggle-chain seed generator (T0..TN patterns for Phase 2 injection)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _generate_toggle_chain_seeds(max_depth: int) -> List[str]:
+    """
+    Generate T-position toggle chains for direct injection into Phase 2 as
+    seed chains.  These are NOT derived from stem lookups — they are
+    deterministic patterns that the empirical evidence shows produce large
+    numbers of Phase-2 hits when used as seed scaffolding.
+
+    Patterns generated
+    ──────────────────
+    1. Sequential  T0 T1 … TN   (N = 0..min(9, max_depth-1))
+       Toggles the first N+1 characters.  Combined with every leet op.
+
+    2. Even-position  T0 T2 T4 T6 T8
+       Toggles even positions.  Combined with every leet op.
+
+    3. Odd-position   T1 T3 T5 T7 T9
+       Toggles odd positions.  Combined with every leet op.
+
+    4. Single T0 prepended to every leet op (depth 2, highest utility per
+       observation: "T0 se3", "T0 si1", "T0 sa@", …).
+
+    Leet ops combined
+    ─────────────────
+    Each toggle base pattern is paired with:
+      • every single leet op (depth base+1)
+      • the two most common double-leet combos: se3+si1, sa@+so0 (depth base+2)
+
+    All chains are validated via HashcatRuleValidator before being included.
+    """
+    LEET_OPS = ['sa@', 'se3', 'so0', 'si1', 'sl1', 'ss5', 'ss$', 'st7', 'sa4', 'si!']
+    DOUBLE_LEET = [('se3', 'si1'), ('se3', 'sl1'), ('sa@', 'so0'), ('ss5', 'so0'),
+                   ('si1', 'so0'), ('se3', 'so0'), ('ss$', 'se3'), ('sa4', 'sl1')]
+
+    seeds: Set[str] = set()
+
+    def _add(ops: List[str]) -> None:
+        if not ops or len(ops) > max_depth:
+            return
+        chain = ' '.join(ops)
+        if HashcatRuleValidator.validate_rule_for_gpu(chain):
+            seeds.add(chain)
+
+    # ── 1. Sequential T0 T1 … TN ──────────────────────────────────────────────
+    for n in range(0, min(10, max_depth)):           # T0 alone … T0..T9
+        t_ops = [f'T{i}' for i in range(n + 1)]
+        _add(t_ops)                                   # pure toggle chain
+        for leet in LEET_OPS:
+            _add(t_ops + [leet])                      # toggle then leet
+            if n >= 1:
+                _add([leet] + t_ops)                  # leet then toggle
+        for l1, l2 in DOUBLE_LEET:
+            _add(t_ops + [l1, l2])                    # toggle + double leet
+            _add([l1] + t_ops + [l2])                 # leet before and after
+
+    # ── 2. Even positions T0 T2 T4 T6 T8 ─────────────────────────────────────
+    for n in range(1, min(5, max_depth)):
+        t_ops = [f'T{i * 2}' for i in range(n + 1)]
+        _add(t_ops)
+        for leet in LEET_OPS:
+            _add(t_ops + [leet])
+            _add([leet] + t_ops)
+        for l1, l2 in DOUBLE_LEET:
+            _add(t_ops + [l1, l2])
+
+    # ── 3. Odd positions T1 T3 T5 T7 T9 ──────────────────────────────────────
+    for n in range(1, min(5, max_depth)):
+        t_ops = [f'T{i * 2 + 1}' for i in range(n + 1)]
+        _add(t_ops)
+        for leet in LEET_OPS:
+            _add(t_ops + [leet])
+            _add([leet] + t_ops)
+        for l1, l2 in DOUBLE_LEET:
+            _add(t_ops + [l1, l2])
+
+    # ── 4. T0 + single leet (highest-utility depth-2 seeds) ───────────────────
+    for leet in LEET_OPS:
+        _add(['T0', leet])
+        _add([leet, 'T0'])
+
+    return sorted(seeds)
+
+
+def extract_token_strip_rules(
+    target_words:      List[str],
+    base_set:          Set[str],
+    max_depth:         int   = 0,
+    min_stem_len:      int   = 4,
+    max_prefix_len:    int   = 4,
+    max_suffix_len:    int   = 4,
+    max_leet_ambiguity: int  = 3,
+) -> List[str]:
+    """
+    Phase 0 — Token-Strip rule extraction.
+
+    Runs four complementary extraction modes for each target word:
+
+    LETTER MODE (original)
+        Boundary = digits + specials.  Middle segment = letters (+ leet chars).
+        Produces case-transform / leet-substitution / prepend / append chains.
+        Selected as primary when the word contains more letters than digits.
+
+    DIGIT MODE (dynamic boundary)
+        Boundary = letters + specials.  Middle segment = pure digit sequence.
+        Digit middle is looked up verbatim in the base wordlist (common
+        numeric passwords such as "123456" appear in rockyou-style lists).
+        Selected as primary when the word contains more digits than letters.
+        Produces prepend/append chains where letters/specials are boundary ops.
+
+    REVERSE MODE
+        Chain starts with 'r'.  The middle segment is reversed before stem
+        lookup, generating rules like 'r $!' for "drowssap!" from "password".
+
+    DELETE-EDGE MODE
+        Chain starts with '[' or ']'.  Tries stripping one non-boundary
+        character from the start or end of the word before normal extraction.
+
+    DUPLICATE / FOLD MODE
+        Detects passwords formed by duplicating ('d') or folding ('f') a
+        base-wordlist word: "passwordpassword" → 'd', "passworddrowssap" → 'f'.
+
+    Every candidate chain is verified by py_apply_chain before being accepted.
+
+    Parameters
+    ----------
+    target_words       : words from the target wordlist
+    base_set           : set of words from the base wordlist
+    max_depth          : maximum rule chain length; 0 = MAX_HASHCAT_CHAIN
+    min_stem_len       : reject stems shorter than this (default 4)
+    max_prefix_len     : maximum boundary prefix length to try (default 4)
+    max_suffix_len     : maximum boundary suffix length to try (default 4)
+    max_leet_ambiguity : max ambiguous leet positions per word (default 3)
+
+    Returns
+    -------
+    Sorted, deduplicated list of valid hashcat rule strings.
+    """
+    if max_depth <= 0:
+        max_depth = MAX_HASHCAT_CHAIN
+
+    found: Set[str] = set()
+
+    with tqdm(total=len(target_words),
+              desc=green("  Phase 0 "),
+              unit="word",
+              ncols=88,
+              bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}",
+              ) as pbar:
+        for word in target_words:
+            pbar.set_postfix({"rules": cyan(str(len(found)))}, refresh=False)
+            pbar.update(1)
+            if not word or len(word) > MAX_WORD_LEN:
+                continue
+
+            n_digits  = sum(1 for c in word if c.isdigit())
+            n_alpha   = sum(1 for c in word if c.isalpha())
+            n_special = len(word) - n_digits - n_alpha  # noqa: F841
+
+            # ── Dynamic mode selection ────────────────────────────────────────
+            # Primary extraction mode is chosen based on which character class
+            # dominates the word:
+            #
+            #   n_alpha >= n_digits (letters dominate or tie)
+            #     → LETTER primary: boundary = digits+specials, stem = letters
+            #       Example: "Password123!" → stem "password", boundary "123!"
+            #
+            #   n_digits > n_alpha (digits dominate)
+            #     → DIGIT primary: boundary = letters+specials, stem = digits
+            #       Example: "abc2024"   → stem "2024",   boundary "abc"
+            #       Example: "123456!!"  → stem "123456", boundary "!!"
+            #
+            # Both modes still run — they catch different decompositions of the
+            # same word and their results are unioned.
+
+            digit_primary = n_digits > n_alpha
+
+            if digit_primary:
+                # Digit-heavy: digit-stem first, then letter-stem
+                found |= _extract_digit_mode(
+                    word, base_set, max_depth, min_stem_len,
+                    max_prefix_len, max_suffix_len,
+                )
+                if n_alpha >= min_stem_len:
+                    found |= _extract_letter_mode(
+                        word, base_set, max_depth, min_stem_len,
+                        max_prefix_len, max_suffix_len, max_leet_ambiguity,
+                    )
+            else:
+                # Letter-heavy or mixed: letter-stem first, then digit-stem
+                found |= _extract_letter_mode(
+                    word, base_set, max_depth, min_stem_len,
+                    max_prefix_len, max_suffix_len, max_leet_ambiguity,
+                )
+                if n_digits > 0:
+                    found |= _extract_digit_mode(
+                        word, base_set, max_depth, min_stem_len,
+                        max_prefix_len, max_suffix_len,
+                    )
+
+            # ── REVERSE MODE ─────────────────────────────────────────────────
+            if max_depth >= 2:
+                found |= _extract_reverse_mode(
+                    word, base_set, max_depth, min_stem_len,
+                    max_prefix_len, max_suffix_len, max_leet_ambiguity,
+                )
+
+            # ── DELETE-EDGE MODE ─────────────────────────────────────────────
+            if max_depth >= 2:
+                found |= _extract_delete_edge_mode(
+                    word, base_set, max_depth, min_stem_len,
+                    max_prefix_len, max_suffix_len, max_leet_ambiguity,
+                )
+
+            # ── DUPLICATE / FOLD MODE ─────────────────────────────────────────
+            if len(word) >= 2 * min_stem_len:
+                found |= _extract_duplicate_mode(
+                    word, base_set, max_depth, min_stem_len,
+                )
+
+    return sorted(found)
+
+
+def _log_token_strip_stats(
+    n_words:     int,
+    rules:       List[str],
+    inject_sbd:  bool,
+) -> None:
+    """Print Phase 0 summary statistics with per-mode rule prefix breakdown."""
+    if not rules:
+        log_info(f"[P0]   {yellow('0')} rules extracted by token-strip "
+                 f"({n_words:,} target words scanned)")
+        return
+
+    depth_dist: Dict[int, int] = defaultdict(int)
+    mode_counts: Dict[str, int] = defaultdict(int)
+    for r in rules:
+        depth_dist[len(r.split())] += 1
+        toks = r.split()
+        first = toks[0] if toks else ''
+        if first == 'r':
+            mode_counts['reverse'] += 1
+        elif first == 'd':
+            mode_counts['dup'] += 1
+        elif first == 'f':
+            mode_counts['fold'] += 1
+        elif first in ('[', ']'):
+            mode_counts['del-edge'] += 1
+        elif first.startswith('T') and len(first) == 2:
+            mode_counts['toggle'] += 1
+        elif all(c.isdigit() or c in ('^', '$', ' ')
+                 for c in r) and any(c.isdigit() for c in r):
+            mode_counts['digit-bnd'] += 1
+        else:
+            mode_counts['letter'] += 1
+
+    depth_summary = '  '.join(f"d{d}:{depth_dist[d]:,}" for d in sorted(depth_dist))
+    inj = green('injected into Phase S sbd') if inject_sbd else dim('Phase S inactive')
+    mode_str = '  '.join(f"{k}:{v}" for k, v in sorted(mode_counts.items()) if v)
+    log_info(
+        f"[P0]   {bold(green(str(len(rules))))} rules extracted by token-strip"
+        f"  ({depth_summary})  → {inj}"
+    )
+    if mode_str:
+        log_info(f"[P0]   Mode breakdown  : {dim(mode_str)}")
+
 
 # --------------------------------------------------------------------
 # GPU device helpers
@@ -3006,19 +3832,28 @@ class GPUExtractor:
                  target_hours=0.5, max_chains=None, seed_rules_file=None, bloom_mb=None,
                  builtin_seeds=True,
                  genetic=False, genetic_generations=50,
-                 genetic_pop=200, genetic_elite=0.15):
-        self.base_count          = base_count
-        self.target_count        = target_count
-        self.max_depth           = max_depth
-        self.device_spec         = device_spec
-        self.max_chains          = max_chains
-        self.seed_rules_file     = seed_rules_file
-        self.bloom_mb            = bloom_mb
-        self.builtin_seeds       = builtin_seeds
-        self.genetic             = genetic
-        self.genetic_generations = genetic_generations
-        self.genetic_pop         = genetic_pop
-        self.genetic_elite       = genetic_elite
+                 genetic_pop=200, genetic_elite=0.15,
+                 token_strip=False, token_strip_min_stem=4,
+                 token_strip_max_prefix=4, token_strip_max_suffix=4,
+                 token_strip_min_leet_amb=3):
+        self.base_count               = base_count
+        self.target_count             = target_count
+        self.max_depth                = max_depth
+        self.device_spec              = device_spec
+        self.max_chains               = max_chains
+        self.seed_rules_file          = seed_rules_file
+        self.bloom_mb                 = bloom_mb
+        self.builtin_seeds            = builtin_seeds
+        self.genetic                  = genetic
+        self.genetic_generations      = genetic_generations
+        self.genetic_pop              = genetic_pop
+        self.genetic_elite            = genetic_elite
+        # Phase 0 — Token-Strip
+        self.token_strip              = token_strip
+        self.token_strip_min_stem     = token_strip_min_stem
+        self.token_strip_max_prefix   = token_strip_max_prefix
+        self.token_strip_max_suffix   = token_strip_max_suffix
+        self.token_strip_min_leet_amb = token_strip_min_leet_amb
         self.params              = calculate_dynamic_parameters(
             base_count, target_count, None, target_hours, bloom_mb_override=bloom_mb)
         self.params['MAX_CHAIN_DEPTH'] = max_depth
@@ -3082,6 +3917,137 @@ class GPUExtractor:
 
         bloom_filter = self.gpu_engine.generate_bloom_filter(target_words)
 
+        # --- Phase 0: Token-Strip Rule Extraction (CPU-only, optional) -------
+        # Runs before Phase 1 so discovered rules can be injected into the
+        # Phase 1 atomic pool (single-rule discoveries) and Phase S seed
+        # families (multi-rule chains).
+        ts_rules_singles: List[str] = []
+        ts_rules_chains:  List[str] = []
+        ts_sbd: Dict[int, set]      = defaultdict(set)    # for Phase S injection
+
+        if self.token_strip:
+            log_section("PHASE 0 — Token-Strip Rule Extraction")
+            base_set_for_ts = set(base_words)
+            log_info(
+                f"[P0]   Scanning {len(target_words):,} target words  |  "
+                f"base set {len(base_set_for_ts):,} words  |  "
+                f"min-stem={self.token_strip_min_stem}  "
+                f"max-prefix={self.token_strip_max_prefix}  "
+                f"max-suffix={self.token_strip_max_suffix}  "
+                f"min-leet-amb={self.token_strip_min_leet_amb}"
+            )
+            log_info(
+                f"[P0]   Modes: {bold('letter')} (alpha-stem)  "
+                f"{bold('digit')} (digit-stem, dynamic boundary)  "
+                f"{bold('reverse')} (r-prefix)  "
+                f"{bold('delete-edge')} ([/]-prefix)  "
+                f"{bold('dup/fold')} (d/f)"
+            )
+            ts_all = extract_token_strip_rules(
+                target_words,
+                base_set_for_ts,
+                max_depth          = self.max_depth,
+                min_stem_len       = self.token_strip_min_stem,
+                max_prefix_len     = self.token_strip_max_prefix,
+                max_suffix_len     = self.token_strip_max_suffix,
+                max_leet_ambiguity = self.token_strip_min_leet_amb,
+            )
+
+            # Split by depth
+            for r in ts_all:
+                depth = len(r.split())
+                if depth == 1:
+                    ts_rules_singles.append(r)
+                else:
+                    ts_rules_chains.append(r)
+                    if depth <= self.max_depth:
+                        ts_sbd[depth].add(r)       # schedule for Phase S injection
+
+            _log_token_strip_stats(
+                len(target_words), ts_all, inject_sbd=self.builtin_seeds
+            )
+            if ts_rules_singles:
+                log_info(
+                    f"[P0]   Single-rule discoveries  : "
+                    f"{bold(cyan(str(len(ts_rules_singles))))}  "
+                    f"→ merged into Phase 1 atomic pool"
+                )
+            if ts_rules_chains:
+                log_info(
+                    f"[P0]   Multi-rule chain discoveries : "
+                    f"{bold(cyan(str(len(ts_rules_chains))))}  "
+                    f"→ Phase S sbd injection + Phase 2 seed chains"
+                )
+
+            # ── Toggle-chain seeds ─────────────────────────────────────────────
+            # Generate T0..TN + leet combo chains for Phase 2 injection.
+            # These are NOT derived from stem lookups — they are deterministic
+            # structural seeds based on empirical evidence of T-chain effectiveness.
+            if self.max_depth >= 2:
+                toggle_seeds = _generate_toggle_chain_seeds(self.max_depth)
+                n_toggle_new = 0
+                for ts_chain in toggle_seeds:
+                    depth = len(ts_chain.split())
+                    if depth >= 2:
+                        ts_rules_chains.append(ts_chain)
+                        ts_sbd.setdefault(depth, set()).add(ts_chain)
+                        n_toggle_new += 1
+                if n_toggle_new:
+                    log_info(
+                        f"[P0]   Toggle-chain seeds       : "
+                        f"{bold(cyan(str(n_toggle_new)))}  "
+                        f"(T0..TN patterns + leet combos)  "
+                        f"→ Phase S sbd + Phase 2 seeds"
+                    )
+        # ── Debug dump — write all Phase 0 rules to a sidecar file ───────────
+        # Written only when --debug is active (VERBOSE=True).  The file is
+        # placed next to the main output file with a ".phase0.txt" suffix and
+        # contains every rule discovered by all extraction modes plus every
+        # toggle-chain seed, sorted by depth then alphabetically.
+        if VERBOSE and self.token_strip:
+            _all_p0 = sorted(
+                set(ts_rules_singles) | set(ts_rules_chains),
+                key=lambda r: (len(r.split()), r),
+            )
+            _p0_path = getattr(self, '_output_path', 'rulest_output.txt')
+            _p0_path = (_p0_path.rsplit('.', 1)[0] + '.phase0.txt'
+                        if '.' in _p0_path else _p0_path + '.phase0.txt')
+            try:
+                with open(_p0_path, 'w', encoding='utf-8') as _f:
+                    _f.write("# Phase 0 — Token-Strip Rule Extraction (debug dump)\n")
+                    _f.write(f"# Singles  : {len(ts_rules_singles)}\n")
+                    _f.write(f"# Chains   : {len(ts_rules_chains)}\n")
+                    _f.write(f"# Total    : {len(_all_p0)}\n")
+                    _f.write("#\n")
+                    _f.write("# Columns: depth  rule\n")
+                    _f.write("#\n")
+                    for _r in _all_p0:
+                        _f.write(f"{len(_r.split())}\t{_r}\n")
+                log_debug(
+                    f"[P0]   Debug dump written : {bold(_p0_path)}  "
+                    f"({len(_all_p0)} rules)"
+                )
+            except OSError as _e:
+                log_debug(f"[P0]   Debug dump failed : {_e}")
+
+        # ── Merge Phase 0 single-rules into Phase 1 atomic pool ───────────────
+        # Single-rule seeds from token-strip are merged with any user seed
+        # singles; duplicates vs built-in set are dropped.
+        ts_extra_singles = [r for r in ts_rules_singles if r not in builtin_set]
+        rules_phase1     = rules_phase1 + ts_extra_singles
+        if ts_extra_singles:
+            log_debug(
+                f"Phase 0: {len(ts_extra_singles)} new single-rule(s) added to Phase 1"
+            )
+        # ── Phase 0 chains also forwarded to Phase 2 as seed chains ──────────
+        # They are appended to all_seeds so generate_informed_chains picks them up.
+        if ts_rules_chains:
+            all_seeds = list(all_seeds) + ts_rules_chains
+            log_debug(
+                f"Phase 0: {len(ts_rules_chains)} chain(s) forwarded to Phase 2"
+            )
+        # ─────────────────────────────────────────────────────────────────────
+
         # --- Phase 1: single rules + seed singles ---
         log_section("PHASE 1 — Single Rule Search")
         seed_note = f"  ({len(extra_seeds)} from seeds)" if extra_seeds else ""
@@ -3105,6 +4071,23 @@ class GPUExtractor:
         if self.builtin_seeds:
             log_section("PHASE S — Seed Extraction (numeric + special-char families A–M)")
             sbd = self.gpu_engine.build_numeric_seed_families(max_depth=self.max_depth)
+
+            # ── Phase 0 → Phase S injection ───────────────────────────────────
+            # Add token-strip chains into the sbd pool so they receive the same
+            # full GPU coverage sweep as families A–M at no extra GPU cost.
+            if ts_sbd:
+                n_injected = 0
+                for depth, chains in ts_sbd.items():
+                    before = len(sbd.setdefault(depth, set()))
+                    sbd[depth].update(chains)
+                    n_injected += len(sbd[depth]) - before
+                if n_injected:
+                    log_info(
+                        f"[PS]   Phase 0 injected {bold(cyan(str(n_injected)))} "
+                        f"chain(s) into Phase S sbd"
+                    )
+            # ─────────────────────────────────────────────────────────────────
+
             seed_hits = self.gpu_engine.run_seed_extraction_pass(
                 base_words, sbd, bloom_filter, rules_phase1)
             all_counts.update(seed_hits)
@@ -3326,6 +4309,45 @@ def main() -> None:
                          'By default Phase S always runs; pass this flag to skip it '
                          'and rely solely on Phase 1 atomic rules and Phase 2 random chains.')
 
+    # ---- Phase 0: Token-Strip ----------------------------------------
+    pt = ap.add_argument_group(
+        'Phase 0 — Token-Strip Rule Extraction',
+        'Optional CPU-only pre-pass that decomposes target passwords into\n'
+        'token categories (lowercase=stem, uppercase=case rules,\n'
+        'leet chars=substitution rules, boundary digits/specials=prepend/append)\n'
+        'and generates hashcat rule chains that reconstruct each password\n'
+        'from a base-wordlist stem.  Activated with --token-strip.'
+    )
+    pt.add_argument(
+        '--token-strip', action='store_true',
+        help='Enable Phase 0: empirical CPU-only rule extraction by decomposing '
+             'target passwords into stem + transform rules.  Discovered rules are '
+             'injected into the Phase 1 atomic pool (single-rule) and Phase S sbd '
+             '(multi-rule chains) before any GPU work begins.',
+    )
+    pt.add_argument(
+        '--token-strip-min-stem', type=int, default=4, metavar='N',
+        help='Minimum stem length after token decoding (default: 4).  '
+             'Shorter stems produce noisy rules and are discarded.',
+    )
+    pt.add_argument(
+        '--token-strip-max-prefix', type=int, default=4, metavar='N',
+        help='Maximum number of boundary characters to strip from the start '
+             'of a target word (default: 4).  These become prepend (^) rules.',
+    )
+    pt.add_argument(
+        '--token-strip-max-suffix', type=int, default=4, metavar='N',
+        help='Maximum number of boundary characters to strip from the end '
+             'of a target word (default: 4).  These become append ($) rules.',
+    )
+    pt.add_argument(
+        '--token-strip-min-leet-amb', type=int, default=3, metavar='N',
+        help="Maximum number of ambiguous leet positions per word (default: 3). "
+             "A position is ambiguous when its leet char maps to more than one "
+             "base letter (e.g. '1' → 'i' or 'l').  Higher values allow more "
+             "combinations but increase CPU time.",
+    )
+
     # ---- Phase 3: Genetic Algorithm ----------------------------------
     ga = ap.add_argument_group(
         'Phase 3 — Genetic Algorithm',
@@ -3397,6 +4419,18 @@ def main() -> None:
              f"bloom: {bold(str(args.bloom_mb or BLOOM_FILTER_MAX_MB))}MB")
     _bs_status = red('DISABLED (--no-builtin-seeds)') if args.no_builtin_seeds else green('enabled (families A–M)')
     log_info(f"  builtin seeds (Phase S) : {_bs_status}")
+    # Phase 0 status
+    if args.token_strip:
+        _ts_inj = green('→ Phase S sbd') if not args.no_builtin_seeds else yellow('→ Phase 1 only (Phase S disabled)')
+        log_info(
+            f"  {bold(cyan('Phase 0 token-strip'))} : "
+            f"{green('enabled')}  |  "
+            f"min-stem={bold(str(args.token_strip_min_stem))}  "
+            f"prefix={bold(str(args.token_strip_max_prefix))}  "
+            f"suffix={bold(str(args.token_strip_max_suffix))}  "
+            f"leet-amb={bold(str(args.token_strip_min_leet_amb))}  "
+            f"{_ts_inj}"
+        )
     if args.seed_rules:
         log_info(f"  seeds     : {bold(args.seed_rules)}  "
                  f"{dim('(singles -> Phase 1 + Phase 2 atoms | chains -> Phase 2 direct)')}")
@@ -3426,12 +4460,19 @@ def main() -> None:
         len(base_words), len(target_words), args.max_depth,
         args.device, args.target_hours, args.max_chains,
         args.seed_rules, args.bloom_mb,
-        builtin_seeds        = not args.no_builtin_seeds,
-        genetic              = args.genetic,
-        genetic_generations  = args.genetic_generations,
-        genetic_pop          = args.genetic_pop,
-        genetic_elite        = args.genetic_elite,
+        builtin_seeds             = not args.no_builtin_seeds,
+        genetic                   = args.genetic,
+        genetic_generations       = args.genetic_generations,
+        genetic_pop               = args.genetic_pop,
+        genetic_elite             = args.genetic_elite,
+        token_strip               = args.token_strip,
+        token_strip_min_stem      = args.token_strip_min_stem,
+        token_strip_max_prefix    = args.token_strip_max_prefix,
+        token_strip_max_suffix    = args.token_strip_max_suffix,
+        token_strip_min_leet_amb  = args.token_strip_min_leet_amb,
     )
+
+    extractor._output_path = args.output   # used by Phase 0 debug dump
 
     depth_overrides = {f'depth{i}_override': getattr(args, f'depth{i}_chains')
                        for i in range(2, 11)}
