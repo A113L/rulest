@@ -164,20 +164,20 @@ python -c "import pyopencl; print(pyopencl.get_platforms())"
 ## 🚀 Usage
  
 ### `rulest_v2.py` — Full Reference
- 
+
 ```
 usage: rulest_v2.py [options] base_wordlist target_wordlist
 ```
- 
+
 #### Positional Arguments
- 
+
 | Argument | Description |
 |---|---|
 | `base_wordlist` | Source wordlist — words to transform *from* |
 | `target_wordlist` | Target dictionary — words to transform *to* |
- 
+
 #### Optional Arguments
- 
+
 | Flag | Default | Description |
 |---|---|---|
 | `--max-depth` | `2` | Maximum rule chain depth (1–31; depths >31 capped with a warning) |
@@ -194,15 +194,25 @@ usage: rulest_v2.py [options] base_wordlist target_wordlist
 | `--allow-reject-rules` | off | Include rejection rules (normally excluded as GPU-incompatible) |
 | `--no-builtin-seeds` | off | Disable the built-in seed families (Phase S). By default Phase S always runs; pass this flag to skip it entirely and rely solely on Phase 1 atomic rules and Phase 2 random chains. Useful for faster runs or when supplying all seeds via `--seed-rules`. Skips all thirteen families (A–M): numeric, date-pattern, special-character, leet substitution, double-transform, special-before-digit, and leet+transform. |
 | `--debug` | off | Enable verbose output (sets `VERBOSE = True` at runtime) |
- 
+
 #### Phase 3 — Genetic Algorithm Arguments
- 
+
 | Flag | Default | Description |
 |---|---|---|
 | `--genetic` | off | Enable Phase 3 genetic algorithm rule evolution. A dedicated time budget of 20 % of `--target-hours` (min 120 s) is reserved for Phase 3 before Phase 2 begins. Has no effect at `--max-depth 1` (chains require at least depth 2); emits a warning at `--max-depth 2` since Phase 2 already covers depth-2 exhaustively — use `--max-depth 3` or higher for meaningful GA output. |
 | `--genetic-generations` | `50` | Maximum number of GA generations. Each generation performs a full GPU fitness evaluation of the entire population, so larger values extend runtime proportionally. |
 | `--genetic-pop` | `200` | GA population size — number of rule chains evaluated per generation. Larger populations improve search coverage at the cost of more GPU evaluations per generation. |
 | `--genetic-elite` | `0.15` | Fraction of top-scoring individuals carried unchanged into the next generation (elitism). Must be strictly between 0.0 and 1.0. Higher values stabilise convergence; lower values increase diversity. |
+
+#### Phase 0 — Token Strip Arguments
+
+| Flag | Default | Description |
+|---|---|---|
+| `--token-strip` | off | Enable Phase 0: empirical CPU-only rule extraction by decomposing target passwords into stem + transform rules. Discovered rules are injected into the Phase 1 atomic pool (single-rule) and Phase S `sbd` (multi-rule chains) before any GPU work begins. |
+| `--token-strip-min-stem` | `4` | Minimum stem length after token decoding. Shorter stems produce noisy rules and are discarded. |
+| `--token-strip-max-prefix` | `4` | Maximum number of boundary characters to strip from the start of a target word. These become prepend (`^`) rules. |
+| `--token-strip-max-suffix` | `4` | Maximum number of boundary characters to strip from the end of a target word. These become append (`$`) rules. |
+| `--token-strip-min-leet-amb` | `3` | Maximum number of ambiguous leet positions per word. A position is ambiguous when its leet char maps to more than one base letter (e.g. `1` → `i` or `l`). Higher values allow more combinations but increase CPU time. |
  
 #### Legacy v1 Reference
  
@@ -241,7 +251,7 @@ usage: rulest.py -w WORDLIST [-b BASE_WORDLIST] [-d CHAIN_DEPTH]
 │  │  (all words ×       └───────────────────────┘ │  │
 │  │   single rules)                               │  │
 │  │                                               │  │
-│  │  Phase S ────────▶  Built-in seed families   │  │
+│  │  Phase S ────────▶  Built-in seed families    │  │
 │  │  (Families A–M;      direct extraction pass,  │  │
 │  │   default on;        depth 2–9 seeds)         │  │
 │  │                                               │  │
@@ -250,10 +260,10 @@ usage: rulest.py -w WORDLIST [-b BASE_WORDLIST] [-d CHAIN_DEPTH]
 │  │   VRAM-budgeted)                              │  │
 │  │                                               │  │
 │  │  Phase 3 ────────▶  GeneticRuleEvolver        │  │
-│  │  (--genetic;         novelty-weighted fitness   │  │
-│  │   reserved 20 %      (2× bonus for new chains)  │  │
-│  │   time budget;       tournament select +         │  │
-│  │   stagnation guard)  crossover + mutation        │  │
+│  │  (--genetic;         novelty-weighted fitness │  │
+│  │   reserved 20 %      (2× bonus for new chains)│  │
+│  │   time budget;       tournament select +      │  │
+│  │   stagnation guard)  crossover + mutation     │  │
 │  └───────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────┘
          │
@@ -549,16 +559,6 @@ For each target word, every `(prefix_len, suffix_len)` split within the configur
 | Multi-rule chains (depth ≥ 2) | Phase S seed-by-depth table + Phase 2 seed chains |
 
 When both `--token-strip` and Phase S are active (default), Phase 0 multi-rule chains are injected into Phase S's `sbd` pool before the GPU seed extraction pass, giving them the same full GPU coverage sweep as families A–M. If a Phase 0 chain falls at a depth that Phase S never initialized (e.g. depth 10), the depth slot is created automatically.
-
-### CLI Flags
-
-| Flag | Default | Description |
-|---|---|---|
-| `--token-strip` | off | Enable Phase 0: empirical CPU-only rule extraction by decomposing target passwords into stem + transform rules. Discovered rules are injected into the Phase 1 atomic pool (single-rule) and Phase S `sbd` (multi-rule chains) before any GPU work begins. |
-| `--token-strip-min-stem` | `4` | Minimum stem length after token decoding. Shorter stems produce noisy rules and are discarded. |
-| `--token-strip-max-prefix` | `4` | Maximum number of boundary characters to strip from the start of a target word. These become prepend (`^`) rules. |
-| `--token-strip-max-suffix` | `4` | Maximum number of boundary characters to strip from the end of a target word. These become append (`$`) rules. |
-| `--token-strip-min-leet-amb` | `3` | Maximum number of ambiguous leet positions per word. A position is ambiguous when its leet char maps to more than one base letter (e.g. `1` → `i` or `l`). Higher values allow more combinations but increase CPU time. |
 
 ---
 
