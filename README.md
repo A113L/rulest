@@ -560,16 +560,6 @@ When both `--token-strip` and Phase S are active (default), Phase 0 multi-rule c
 | `--token-strip-max-suffix` | `4` | Maximum number of boundary characters to strip from the end of a target word. These become append (`$`) rules. |
 | `--token-strip-min-leet-amb` | `3` | Maximum number of ambiguous leet positions per word. A position is ambiguous when its leet char maps to more than one base letter (e.g. `1` → `i` or `l`). Higher values allow more combinations but increase CPU time. |
 
-### Progress Bar
-
-Phase 0 displays a progress bar identical in style to Phases 1–3:
-
-```
-  Phase 0 : 100%|█████████████████████████| 131719/131719 [00:08<00:00] , rules=6716
-```
-
-The `rules=` postfix updates live as new chains are discovered.
-
 ---
 
 ## 🧬 Phase 3 — Genetic Algorithm
