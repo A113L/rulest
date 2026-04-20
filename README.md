@@ -19,6 +19,7 @@
 - [Architecture (v2)](#-architecture-v2)
   - [Extraction Pipeline](#extraction-pipeline)
 - [Built-in Seed Families (A–M)](#-built-in-seed-families)
+- [Phase 0 — Token-Strip Rule Extraction](#-phase-0--token-strip-rule-extraction)
 - [Phase 3 — Genetic Algorithm](#-phase-3--genetic-algorithm)
 - [Functional Minimization](#-functional-minimization)
 - [Rule Categories](#-rule-categories)
@@ -64,7 +65,8 @@ A complete redesign built around GPU efficiency, Hashcat compatibility, and inte
 **Key capabilities:**
 - ✅ Full **Hashcat GPU rule validation** (max 31 ops, correct argument types)
 - ✅ **Bloom filter** on-GPU for fast membership testing with configurable false-positive rate
-- ✅ **Three-phase extraction**: single-rule sweep (Phase 1) → built-in seed pass (Phase S) → informed chain generation (Phase 2)
+- ✅ **Phase 0 — Token-Strip Rule Extraction** (`--token-strip`): optional CPU pre-pass that decomposes target passwords into token classes (lowercase stem, uppercase case-transform, leet substitution, boundary digits/specials) and reverse-engineers the exact Hashcat rule chain that reconstructs each password from a base-wordlist stem; single-rule discoveries feed Phase 1; multi-rule chains are injected into Phase S and Phase 2; `T0..TN` per-position toggle chains are suppressed when a compact single-op equivalent (`u`, `c`, `t`, etc.) already covers the pattern
+- ✅ **Four-phase extraction**: token-strip pre-pass (Phase 0) → single-rule sweep (Phase 1) → built-in seed pass (Phase S) → informed chain generation (Phase 2)
 - ✅ **Built-in seed families** (A–M): thirteen deterministically generated seed families covering numeric prefixes/suffixes, mixed prepend/append, transform+digit combos, date patterns, special-character append/prepend/transform/combo patterns, leet substitutions, double-transform chains, special-before-digit patterns, and leet+transform combos — run by default as a dedicated extraction pass, independent of `--max-depth` and the random-chain time budget; can be skipped with `--no-builtin-seeds`
 - ✅ **Signature-based functional minimization**: removes functionally equivalent rules post-GPU using a deterministic probe set, keeping only the highest-frequency representative per equivalence class
 - ✅ **Dynamic VRAM-aware** batch and budget sizing (scales with available VRAM; baseline 8 GB)
@@ -80,12 +82,13 @@ A complete redesign built around GPU efficiency, Hashcat compatibility, and inte
  
 ---
  
-## 🆕 What's New in v2 — Phase 3 GA Fixes
+## 🆕 What's New
  
 Three root-cause bugs that caused Phase 3 to produce identical results with and without `--genetic` were identified and fixed:
  
-| Fix | Description |
+| Change | Description |
 |---|---|
+| **Phase 0 — Token-Strip** | New optional CPU pre-pass (`--token-strip`) that runs before Phase 1. Reverse-engineers exact rule chains from target passwords by splitting each word into a base stem + boundary tokens. Single-rule discoveries are injected into Phase 1; multi-rule chains are injected into Phase S and Phase 2. Supersedes ad-hoc leet/case rules with ground-truth verified chains. |
 | **Novelty-weighted fitness** | Chains not yet discovered by Phase 1/S/2 receive a **2x fitness bonus** during GA selection. Previously fitness was raw bloom hits, so already-known high-scorers dominated every generation and the GA just rediscovered Phase 2 results. |
 | **Unexplored-seed initial population** | The 40 % Phase-S fill slot now prefers seeds **absent from `known_rules`**. Previously it used top-hit Phase-S chains — all already in `all_counts` — so the GA started with a population of mostly-known rules. Depth-3+ bias (70 %) is also applied to seeded and fill portions when `--max-depth >= 3`. |
 | **Dedicated time reservation** | Phase 3 now reserves **20 % of `--target-hours`** (min 120 s) from Phase 2's budget before Phase 2 begins. Previously the GA ran on leftover time; with the default `--target-hours 0.5` Phase 2 consumed everything and Phase 3 was silently skipped. |
@@ -103,6 +106,7 @@ Three root-cause bugs that caused Phase 3 to produce identical results with and 
 | **Rule set size** | ~2,700 static rules | 5,600+ GPU-validated Hashcat single rules across 9 categories |
 | **Search strategy** | Naive BFS — every rule applied blindly | Phase 1 single-rule sweep → Phase S built-in seed extraction → Phase 2 hot-biased chain generation → Phase 3 GA (optional) |
 | **Built-in seed families** | ❌ Not implemented | ✅ Thirteen families (A–M): numeric prepend/append, mixed, transform+digit, date patterns, special-char append/prepend/transform/combo (F–I), leet substitutions (J), double-transform chains (K), special-before-digit (L), leet+transform (M); run by default as a dedicated pass independent of `--max-depth`; disable with `--no-builtin-seeds` |
+| **Token-strip pre-pass** | ❌ Not implemented | ✅ Optional Phase 0 (`--token-strip`): CPU-only; decomposes target passwords into base stem + case/leet/boundary tokens; injects verified rule chains into Phase 1, Phase S, and Phase 2; `TN` ops suppressed when single-op (`u`/`c`/`t`/…) suffices |
 | **Genetic algorithm** | ❌ Not implemented | ✅ Optional Phase 3 (`--genetic`): novelty-weighted evolutionary search (2× fitness bonus for chains not yet in known_rules) with dedicated time reservation (20 % of `--target-hours`, min 120 s) and stagnation-triggered population refresh; discovers deep-chain patterns that random Phase 2 sampling misses |
 | **Target lookup** | Python `set` (host RAM, per-result) | 16–256 MB Bloom filter uploaded once to GPU VRAM (FNV-1a, 4 hash functions) |
 | **Chain state** | Temp `.tmp` files on disk per depth | In-memory, GPU buffer-based with proper release and `gc.collect()` |
@@ -222,6 +226,11 @@ usage: rulest.py -w WORDLIST [-b BASE_WORDLIST] [-d CHAIN_DEPTH]
 │  ┌──────────────────────────────────▼────────────┐  │
 │  │                 GPUEngine                     │  │
 │  │                                               │  │
+│  │  Phase 0 ────────▶  TokenStripExtractor       │  │
+│  │  (--token-strip;     CPU-only  ·  optional;   │  │
+│  │   default off;       singles → Phase 1 atoms; │  │
+│  │   runs pre-GPU)      chains  → Ph.S + Ph.2    │  │
+│  │                                               │  │
 │  │  ┌─────────────┐    ┌───────────────────────┐ │  │
 │  │  │ Bloom Filter│    │  OpenCL Kernel        │ │  │
 │  │  │ (16–256 MB  │    │  ┌─────────────────┐  │ │  │
@@ -254,6 +263,11 @@ usage: rulest.py -w WORDLIST [-b BASE_WORDLIST] [-d CHAIN_DEPTH]
  
 ### Extraction Pipeline
  
+**Phase 0 — Token-Strip Rule Extraction** *(optional, `--token-strip`)*
+A CPU-only pre-pass that runs before Phase 1. For each target word, every `(prefix_len, suffix_len)` split within configurable bounds is tried. Boundary characters (digits and common special chars) are peeled off as prepend/append ops. The middle segment is decoded: leet characters are reversed to their letter equivalents (with ambiguity branching capped by `--token-strip-min-leet-amb`), uppercase letters are normalized and encoded as the shortest case op (`u`, `c`, `C`, `t`, `E`; falling back to per-position `TN` ops only for irregular mixed-case patterns). The resulting stem is looked up in the base wordlist, and the candidate chain is verified by `py_apply_chain` against the original target word. Validated single-rule discoveries are merged into Phase 1's atomic rule pool; multi-rule chains are injected into Phase S's seed-by-depth table and forwarded to Phase 2 as seed chains.
+
+See [Phase 0 — Token-Strip Rule Extraction](#-phase-0--token-strip-rule-extraction) for full details.
+
 **Phase 1 — Single Rule Sweep**
 All base words are processed against every GPU-compatible single rule in parallel. The Bloom filter (built from the entire target wordlist and uploaded once) allows near-zero-cost hit detection on-device using FNV-1a hashing with 4 independent hash functions. Results feed a `Counter` of rule → hit frequency.
  
@@ -485,9 +499,81 @@ Every leet substitution op paired with every structural transform op in both ord
 | M | Leet + transform | v2 | ~300 |
  
 ---
- 
+
+## 🔤 Phase 0 — Token-Strip Rule Extraction
+
+Phase 0 is an optional **CPU-only pre-pass** activated by `--token-strip`. It runs before Phase 1, reverse-engineering exact Hashcat rule chains by decomposing each target password into its constituent token classes and verifying that the derived chain correctly reconstructs the original password when applied to a stem from the base wordlist.
+
+### Token Model
+
+Each character in a target password is classified into one of four roles:
+
+| Character type | Role | Handling |
+|---|---|---|
+| Lowercase letters | Base stem characters | Passed through unchanged |
+| Uppercase letters | Stem chars (lowercased) + case op | Encoded as `u` / `c` / `C` / `t` / `E`; per-position `TN` used only as fallback |
+| Leet substitutions | Stem chars (reversed) + `sXY` op | e.g. `@` → `a` (rule `sa@`), `3` → `e` (rule `se3`) |
+| Boundary digits / specials | Prepend `^` / append `$` ops | Must form a contiguous prefix and/or suffix |
+
+### Case-Op Optimization
+
+When the cased middle segment can be expressed by a single compact operator (`u`, `c`, `C`, `t`, `E`), Phase 0 uses that operator exclusively. Per-position `TN` ops (e.g. `T0 T1 T2 T3 T4 T5 T6 T7 T8`) are only emitted when no such single-op equivalent exists — for example, irregular mixed-case patterns like `pAsSwOrD`. This prevents long depth-9 `TN` chains from dominating Phase 0 output and avoids bloating Phase S with chains that minimization cannot collapse (since `T0..T8` and `u` have different signatures on probe words longer than 9 characters).
+
+### Decomposition Examples
+
+| Target password | Base stem | Rule chain |
+|---|---|---|
+| `12password!` | `password` | `^2 ^1 $!` |
+| `Password!` | `password` | `c $!` |
+| `P@ssw0rd` | `password` | `c sa@ so0` |
+| `ADMIN123` | `admin` | `u $1 $2 $3` |
+| `p@SSW0RD` | `password` | `C sa@ so0` |
+| `L33t!` | `leet` | `c se3 $!` |
+
+### Algorithm
+
+For each target word, every `(prefix_len, suffix_len)` split within the configured bounds is tried:
+
+1. The boundary prefix/suffix must consist entirely of digits and common special characters. Scanning stops as soon as a non-boundary character is encountered.
+2. The middle segment is leet-decoded: ambiguous chars like `1` (→ `i` or `l`) are branched exhaustively up to `--token-strip-min-leet-amb` positions.
+3. Uppercase letters are normalised to lowercase; the case pattern is encoded as the shortest matching op (`u` / `c` / `C` / `t` / `E`). Per-position `TN` ops are used only when no single-op equivalent covers the pattern.
+4. The resulting all-lowercase stem is looked up in the base wordlist set.
+5. The full rule chain (case + leet + prepend + append) is verified via `py_apply_chain` — must reproduce the original target word exactly.
+6. The chain is validated by `HashcatRuleValidator` (max 31 ops, GPU-compatible syntax).
+
+### Injection into Later Phases
+
+| Discovery type | Injected into |
+|---|---|
+| Single-rule chains (depth 1) | Phase 1 atomic rule pool (deduplicated) |
+| Multi-rule chains (depth ≥ 2) | Phase S seed-by-depth table + Phase 2 seed chains |
+
+When both `--token-strip` and Phase S are active (default), Phase 0 multi-rule chains are injected into Phase S's `sbd` pool before the GPU seed extraction pass, giving them the same full GPU coverage sweep as families A–M. If a Phase 0 chain falls at a depth that Phase S never initialized (e.g. depth 10), the depth slot is created automatically.
+
+### CLI Flags
+
+| Flag | Default | Description |
+|---|---|---|
+| `--token-strip` | off | Enable Phase 0: empirical CPU-only rule extraction by decomposing target passwords into stem + transform rules. Discovered rules are injected into the Phase 1 atomic pool (single-rule) and Phase S `sbd` (multi-rule chains) before any GPU work begins. |
+| `--token-strip-min-stem` | `4` | Minimum stem length after token decoding. Shorter stems produce noisy rules and are discarded. |
+| `--token-strip-max-prefix` | `4` | Maximum number of boundary characters to strip from the start of a target word. These become prepend (`^`) rules. |
+| `--token-strip-max-suffix` | `4` | Maximum number of boundary characters to strip from the end of a target word. These become append (`$`) rules. |
+| `--token-strip-min-leet-amb` | `3` | Maximum number of ambiguous leet positions per word. A position is ambiguous when its leet char maps to more than one base letter (e.g. `1` → `i` or `l`). Higher values allow more combinations but increase CPU time. |
+
+### Progress Bar
+
+Phase 0 displays a progress bar identical in style to Phases 1–3:
+
+```
+  Phase 0 : 100%|█████████████████████████| 131719/131719 [00:08<00:00] , rules=6716
+```
+
+The `rules=` postfix updates live as new chains are discovered.
+
+---
+
 ## 🧬 Phase 3 — Genetic Algorithm
- 
+
 Phase 3 is an optional evolutionary search activated by `--genetic`. It runs **after Phase 2**, with a **dedicated time reservation of 20 % of `--target-hours`** (minimum 120 s) that is subtracted from Phase 2's budget before Phase 2 begins — guaranteeing the GA always runs with meaningful time rather than only leftover scraps. All results are merged into the global hit counter before signature minimization.
  
 ### Why a Genetic Algorithm
@@ -714,7 +800,7 @@ These constants are defined at the top of `rulest_v2.py` and can be tuned for ad
 | `HOT_RULE_RATIO` | `0.6` | Fraction of Phase 2 chains biased toward hot rules |
 | `EXTENSION_RATIO` | `0.3` | Fraction of Phase 2 budget allocated to seed extension |
 | `TIME_SAFETY_FACTOR` | `0.9` | Multiplier applied to time-budget combo estimates |
-| `MAX_GPU_RULES` | `31` | Maximum operations allowed per rule chain |
+| `MAX_GPU_RULES` | `255` | Maximum number of operations allowed in a single GPU rule string (validated by `HashcatRuleValidator`); separate from `MAX_HASHCAT_CHAIN` which caps chain length |
 | `BASELINE_COMBOS_PER_SEC` | `120,000,000` | Estimated throughput on a capable GPU |
 | `LOW_END_COMBOS_PER_SEC` | `40,000,000` | Throughput fallback for devices with < 20 compute units |
 | `MAX_WORD_LEN` | `256` | Maximum word length accepted from wordlists |
@@ -782,6 +868,8 @@ sa@ $0
 | Limit total combinations | `--max-chains 500000` to cap generation before scaling |
 | Reduce terminal noise | Set `VERBOSE = False` in the script header or omit `--debug` |
 | Increase hot-rule aggressiveness | Raise `HOT_RULE_RATIO` toward `1.0` (reduces random exploration) |
+| Enable token-strip pre-pass | Add `--token-strip` — most effective when the target wordlist contains structured transformations (leet speak, capitalized words, boundary digits) |
+| Tune token-strip scope | Lower `--token-strip-min-prefix` / `--token-strip-min-suffix` for faster runs; raise `--token-strip-min-leet-amb` (e.g. `5`) to decode more ambiguous leet chars at the cost of more branching |
 | Enable evolutionary search | Add `--genetic` with `--max-depth 3` or higher — Phase 3 adds no value at depth 2 since Phase 2 already covers it exhaustively |
 | Guarantee GA time budget | The 20 % reservation is automatic; raise `--target-hours` to give both Phase 2 and Phase 3 more headroom |
 | Speed up GA per generation | Lower `--genetic-pop` (e.g. `100`) — fewer GPU evaluations per generation |
@@ -890,6 +978,39 @@ python rulest_v2.py rockyou.txt target.txt --max-depth 5 --target-hours 4.0 \
   -o pass3_final.txt
 ```
  
+**Token-strip pre-pass — extract rules from structured target wordlist:**
+```bash
+# Phase 0 scans the target for leet / case / boundary-digit patterns
+# and injects verified chains into Phase 1, Phase S, and Phase 2
+python rulest_v2.py rockyou.txt target.txt \
+  --token-strip \
+  --max-depth 4 --target-hours 1.0 \
+  -o with_token_strip.txt
+```
+
+**Token-strip with extended leet ambiguity:**
+```bash
+# Allow up to 5 ambiguous leet positions per word (default 3)
+# Useful for targets with heavy leet encoding like "1337sp34k"
+python rulest_v2.py rockyou.txt target.txt \
+  --token-strip \
+  --token-strip-min-leet-amb 5 \
+  --token-strip-max-prefix 6 \
+  --token-strip-max-suffix 6 \
+  --max-depth 4 --target-hours 1.5 \
+  -o extended_leet.txt
+```
+
+**Benchmark Phase 0 contribution:**
+```bash
+# Without token-strip — baseline
+python rulest_v2.py base.txt target.txt --max-depth 3 --target-hours 1.0 -o no_ts.txt
+
+# With token-strip — compare rule count and depth distribution
+python rulest_v2.py base.txt target.txt --max-depth 3 --target-hours 1.0 \
+  --token-strip -o with_ts.txt
+```
+
 **Skip built-in seed families (Phase S disabled):**
 ```bash
 # Faster run when you supply all seeds yourself and don't need families A–M
@@ -916,7 +1037,8 @@ python rulest_v2.py base.txt target.txt --max-depth 3 --target-hours 2.0 -o no_g
  
 # With GA — compare rule count, depth distribution, and "genuinely novel" count in the log
 # Note: GA reserves 20 % of total time (24 min) before Phase 2 begins
-python rulest_v2.py base.txt target.txt --max-depth 3 --target-hours 2.0 --genetic -o with_ga.txt
+python rulest_v2.py base.txt target.txt --max-depth 3 --target-hours 2.0 \
+  --genetic -o with_ga.txt
 ```
  
 ---
@@ -926,5 +1048,6 @@ python rulest_v2.py base.txt target.txt --max-depth 3 --target-hours 2.0 --genet
 MIT
  
 ## Credits
+
 
 https://github.com/synacktiv/rulesfinder
