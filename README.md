@@ -859,7 +859,7 @@ sa@ $0
 | Reduce terminal noise | Set `VERBOSE = False` in the script header or omit `--debug` |
 | Increase hot-rule aggressiveness | Raise `HOT_RULE_RATIO` toward `1.0` (reduces random exploration) |
 | Enable token-strip pre-pass | Add `--token-strip` — most effective when the target wordlist contains structured transformations (leet speak, capitalized words, boundary digits) |
-| Tune token-strip scope | Lower `--token-strip-min-prefix` / `--token-strip-min-suffix` for faster runs; raise `--token-strip-min-leet-amb` (e.g. `5`) to decode more ambiguous leet chars at the cost of more branching |
+| Tune token-strip scope | Lower `--token-strip-max-prefix` / `--token-strip-max-suffix` for faster runs; raise `--token-strip-min-leet-amb` (e.g. `5`) to decode more ambiguous leet chars at the cost of more branching |
 | Enable evolutionary search | Add `--genetic` with `--max-depth 3` or higher — Phase 3 adds no value at depth 2 since Phase 2 already covers it exhaustively |
 | Guarantee GA time budget | The 20 % reservation is automatic; raise `--target-hours` to give both Phase 2 and Phase 3 more headroom |
 | Speed up GA per generation | Lower `--genetic-pop` (e.g. `100`) — fewer GPU evaluations per generation |
