@@ -256,7 +256,7 @@ usage: rulest.py -w WORDLIST [-b BASE_WORDLIST] [-d CHAIN_DEPTH]
 │  │  (all words ×       └───────────────────────┘ │  │
 │  │   single rules)                               │  │
 │  │                                               │  │
-│  │  Phase S ────────▶  Built-in seed families   │  │
+│  │  Phase S ────────▶  Built-in seed families    │  │
 │  │  (Families A–M;      direct extraction pass,  │  │
 │  │   default on;        depth 2–9 seeds)         │  │
 │  │                                               │  │
@@ -265,10 +265,10 @@ usage: rulest.py -w WORDLIST [-b BASE_WORDLIST] [-d CHAIN_DEPTH]
 │  │   VRAM-budgeted)                              │  │
 │  │                                               │  │
 │  │  Phase 3 ────────▶  GeneticRuleEvolver        │  │
-│  │  (--genetic;         novelty-weighted fitness   │  │
-│  │   reserved 20 %      (2× bonus for new chains)  │  │
-│  │   time budget;       tournament select +         │  │
-│  │   stagnation guard)  crossover + mutation        │  │
+│  │  (--genetic;         novelty-weighted fitness │  │
+│  │   reserved 20 %      (2× bonus for new chains)│  │
+│  │   time budget;       tournament select +      │  │
+│  │   stagnation guard)  crossover + mutation     │  │
 │  └───────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────┘
          │
