@@ -228,6 +228,7 @@ import random
 from typing import Dict, Set, Tuple, Optional, List, Iterator
 import gc
 import datetime
+import multiprocessing as mp
 
 # ================== GLOBAL FLAGS ===================
 VERBOSE            = False   # set by --debug
@@ -407,6 +408,18 @@ TOKEN_STRIP_BOUNDARY: Set[str] = set('0123456789!@#$%^&*?.-_+()')
 TOKEN_STRIP_ALPHA_BOUNDARY: Set[str] = (
     set(string.ascii_letters) | set('!@#$%^&*?.-_+()')
 )
+
+# ── Phase 0 multiprocessing worker globals ───────────────────────────────────
+# Set before Pool() creation so forked workers inherit via CoW (zero-copy).
+# On Windows/macOS-spawn, _worker_init_p0 re-assigns them from initargs.
+_p0_worker_base_set:       Set[str]                       = set()
+_p0_worker_base_by_len:    Dict[int, Set[str]]            = {}
+_p0_worker_base_lower_idx: Dict[str, Set[str]]            = {}
+_p0_worker_purge_idx:      Dict[str, Set[str]]            = {}
+_p0_worker_substr_idx:     Dict[str, Set[str]]            = {}
+_p0_worker_omit_idx:       Dict[str, Set[str]]            = {}
+_p0_worker_prefix_idx:     Dict[str, Set[str]]            = {}
+_p0_worker_ascii_idx:      Dict[str, Set[Tuple[str,str]]] = {}
 
 # ====================================================================
 # --- BUILT-IN PROBE SET (hand‑curated, covers all important cases) ---
@@ -1528,6 +1541,477 @@ def _extract_delete_edge_mode(
     return found
 
 
+# ====================================================================
+# --- PHASE 0 NEW EXTRACTION MODES (v1.1 — ported from stripper.py) ---
+# ====================================================================
+
+def _extract_insert_mode(
+    word:        str,
+    base_set:    Set[str],
+    max_depth:   int,
+    min_stem_len: int,
+    max_leet_amb: int,
+    base_by_len: Dict[int, Set[str]],
+) -> Set[str]:
+    """
+    INSERT MODE — detect iNX (insert char X at position N) rules.
+    Generates stem candidates by removing 1–2 characters from the word,
+    then checks base_set membership in O(1) per candidate.
+    """
+    found: Set[str] = set()
+    if max_depth < 2:
+        return found
+    wlen = len(word)
+    # ── Single insertion ────────────────────────────────────────────
+    if wlen - 1 >= min_stem_len:
+        for pos in range(min(wlen, 10)):
+            candidate = word[:pos] + word[pos + 1:]
+            if candidate in base_set:
+                rule = f"i{pos}{word[pos]}"
+                if HashcatRuleValidator.validate_rule_for_gpu(rule):
+                    if py_apply_chain(rule, candidate) == word:
+                        found.add(rule)
+    # ── Double insertion ─────────────────────────────────────────────
+    if max_depth >= 3 and wlen - 2 >= min_stem_len:
+        for i in range(min(wlen, 10)):
+            for j in range(i + 1, min(wlen, 10)):
+                candidate = word[:i] + word[i + 1:j] + word[j + 1:]
+                if len(candidate) < min_stem_len:
+                    continue
+                if candidate in base_set:
+                    chain = f"i{i}{word[i]} i{j}{word[j]}"
+                    if HashcatRuleValidator.validate_rule_for_gpu(chain):
+                        if py_apply_chain(chain, candidate) == word:
+                            found.add(chain)
+    return found
+
+
+def _extract_swap_mode(
+    word:        str,
+    base_set:    Set[str],
+    max_depth:   int,
+    min_stem_len: int,
+    max_leet_amb: int,
+) -> Set[str]:
+    """
+    SWAP MODE — detect *MN, k, K transposition rules.
+    Checks if the target is a transposition of a base-wordlist word.
+    """
+    found: Set[str] = set()
+    if max_depth < 1:
+        return found
+    wlen = len(word)
+    if wlen < 2:
+        return found
+    # k: swap first two chars
+    k_sw = word[1] + word[0] + word[2:]
+    if len(k_sw) >= min_stem_len and k_sw in base_set:
+        rule = 'k'
+        if HashcatRuleValidator.validate_rule_for_gpu(rule):
+            if py_apply_chain(rule, k_sw) == word:
+                found.add(rule)
+    # K: swap last two chars
+    K_sw = word[:-2] + word[-1] + word[-2]
+    if len(K_sw) >= min_stem_len and K_sw in base_set:
+        rule = 'K'
+        if HashcatRuleValidator.validate_rule_for_gpu(rule):
+            if py_apply_chain(rule, K_sw) == word:
+                found.add(rule)
+    # *MN: swap positions M and N
+    max_pos = min(wlen - 1, 9)
+    for m in range(max_pos + 1):
+        for n in range(m + 1, max_pos + 1):
+            swapped = list(word); swapped[m], swapped[n] = swapped[n], swapped[m]
+            sw_str = ''.join(swapped)
+            if len(sw_str) >= min_stem_len and sw_str in base_set:
+                rule = f"*{m}{n}"
+                if HashcatRuleValidator.validate_rule_for_gpu(rule):
+                    if py_apply_chain(rule, sw_str) == word:
+                        found.add(rule)
+    return found
+
+
+def _extract_range_mode(
+    word:       str,
+    base_set:   Set[str],
+    max_depth:  int,
+    min_stem_len: int,
+    max_leet_amb: int,
+    substr_idx: Dict[str, Set[str]],
+    omit_idx:   Dict[str, Set[str]],
+) -> Set[str]:
+    """
+    RANGE MODE — detect xNM (extract range) and ONM (omit range) rules.
+    Uses precomputed inverted indexes for O(1) stem lookup.
+    """
+    found: Set[str] = set()
+    if max_depth < 1:
+        return found
+    wlen = len(word)
+    # xNM: word is a contiguous slice of a base stem
+    for stem in substr_idx.get(word, set()):
+        if len(stem) < min_stem_len:
+            continue
+        slen = len(stem)
+        for start in range(min(slen - wlen + 1, 10)):
+            end = start + wlen - 1
+            if end > 9:
+                break
+            if stem[start:end + 1] == word:
+                rule = f"x{start}{end}"
+                if HashcatRuleValidator.validate_rule_for_gpu(rule):
+                    if py_apply_chain(rule, stem) == word:
+                        found.add(rule)
+    # ONM: word is stem with a contiguous range removed
+    for stem in omit_idx.get(word, set()):
+        if len(stem) < min_stem_len or len(stem) <= wlen:
+            continue
+        slen   = len(stem)
+        omit_n = slen - wlen
+        for start in range(min(slen - omit_n + 1, 10)):
+            if omit_n > 9 or start + omit_n > 10:
+                continue
+            if stem[:start] + stem[start + omit_n:] == word:
+                rule = f"O{start}{omit_n}"
+                if HashcatRuleValidator.validate_rule_for_gpu(rule):
+                    if py_apply_chain(rule, stem) == word:
+                        found.add(rule)
+    return found
+
+
+def _extract_char_duplicate_mode(
+    word:        str,
+    base_set:    Set[str],
+    max_depth:   int,
+    min_stem_len: int,
+) -> Set[str]:
+    """
+    CHAR-DUP MODE — detect zN (prepend N copies of first char),
+    ZN (append N copies of last char), and q (duplicate every char) rules.
+    """
+    found: Set[str] = set()
+    if max_depth < 1:
+        return found
+    wlen = len(word)
+    if wlen < 2:
+        return found
+    # q: duplicate every char — word[::2] must equal base stem
+    if wlen % 2 == 0:
+        q_cand = word[::2]
+        if len(q_cand) >= min_stem_len and q_cand in base_set:
+            if all(word[i] == word[i + 1] for i in range(0, wlen, 2)):
+                rule = 'q'
+                if HashcatRuleValidator.validate_rule_for_gpu(rule):
+                    if py_apply_chain(rule, q_cand) == word:
+                        found.add(rule)
+    # zN: N extra copies of first char prepended
+    for n in range(1, min(10, wlen)):
+        if wlen <= n:
+            continue
+        candidate = word[n:]
+        if len(candidate) >= min_stem_len and candidate in base_set:
+            if word[:n] == word[0] * n and candidate[0] == word[0]:
+                rule = f"z{n}"
+                if HashcatRuleValidator.validate_rule_for_gpu(rule):
+                    if py_apply_chain(rule, candidate) == word:
+                        found.add(rule)
+    # ZN: N extra copies of last char appended
+    for n in range(1, min(10, wlen)):
+        if wlen <= n:
+            continue
+        candidate = word[:-n]
+        if len(candidate) >= min_stem_len and candidate in base_set:
+            if word[-n:] == word[-1] * n and candidate[-1] == word[-1]:
+                rule = f"Z{n}"
+                if HashcatRuleValidator.validate_rule_for_gpu(rule):
+                    if py_apply_chain(rule, candidate) == word:
+                        found.add(rule)
+    return found
+
+
+def _extract_ascii_transform_mode(
+    word:        str,
+    base_set:    Set[str],
+    max_depth:   int,
+    min_stem_len: int,
+    max_leet_amb: int,
+    base_by_len: Dict[int, Set[str]],
+    ascii_idx:   Dict[str, Set[Tuple[str, str]]],
+) -> Set[str]:
+    """
+    ASCII TRANSFORM MODE — detect +N, -N, LN, RN rules.
+    All lookups are O(1) via precomputed ascii_idx.
+    """
+    found: Set[str] = set()
+    if max_depth < 1:
+        return found
+    for stem, rule in ascii_idx.get(word, set()):
+        if len(stem) < min_stem_len:
+            continue
+        if len(rule.split()) > max_depth:
+            continue
+        if HashcatRuleValidator.validate_rule_for_gpu(rule):
+            if py_apply_chain(rule, stem) == word:
+                found.add(rule)
+    return found
+
+
+def _extract_truncate_mode(
+    word:        str,
+    base_set:    Set[str],
+    max_depth:   int,
+    min_stem_len: int,
+    max_leet_amb: int,
+    prefix_idx:  Dict[str, Set[str]],
+) -> Set[str]:
+    """
+    TRUNCATE MODE — detect 'N (truncate at position N) rules.
+    prefix_idx[word] gives all stems whose prefix equals word.
+    """
+    found: Set[str] = set()
+    if max_depth < 1:
+        return found
+    wlen = len(word)
+    if wlen < min_stem_len or wlen - 1 > 9:
+        return found
+    rule = f"'{wlen - 1}"
+    if not HashcatRuleValidator.validate_rule_for_gpu(rule):
+        return found
+    for stem in prefix_idx.get(word, set()):
+        if len(stem) < min_stem_len or len(stem) <= wlen:
+            continue
+        if py_apply_chain(rule, stem) == word:
+            found.add(rule)
+    return found
+
+
+def _extract_purge_mode(
+    word:        str,
+    base_set:    Set[str],
+    max_depth:   int,
+    min_stem_len: int,
+    max_leet_amb: int,
+    purge_idx:   Dict[str, Set[str]],
+) -> Set[str]:
+    """
+    PURGE MODE — detect @X (remove all instances of char X) rules.
+    purge_idx[word] gives all stems s such that s.replace(c,'') == word.
+    """
+    found: Set[str] = set()
+    if max_depth < 1:
+        return found
+    wlen      = len(word)
+    word_chars = set(word)
+    for stem in purge_idx.get(word, set()):
+        if len(stem) < min_stem_len or len(stem) <= wlen:
+            continue
+        for char in set(stem) - word_chars:
+            if stem.replace(char, '') == word:
+                rule = f"@{char}"
+                if HashcatRuleValidator.validate_rule_for_gpu(rule):
+                    if py_apply_chain(rule, stem) == word:
+                        found.add(rule)
+    return found
+
+
+def _extract_repeat_mode(
+    word:        str,
+    base_set:    Set[str],
+    max_depth:   int,
+    min_stem_len: int,
+) -> Set[str]:
+    """
+    REPEAT MODE — detect pN (repeat word N times) rules.
+    Generalisation of 'd' for repetition counts > 2.
+    """
+    found: Set[str] = set()
+    if max_depth < 1:
+        return found
+    wlen = len(word)
+    if wlen < 2 * min_stem_len:
+        return found
+    for n in range(2, min(10, wlen // min_stem_len + 1)):
+        if wlen % n != 0:
+            continue
+        part_len = wlen // n
+        if part_len < min_stem_len:
+            continue
+        parts = [word[i * part_len:(i + 1) * part_len] for i in range(n)]
+        if len(set(parts)) == 1 and parts[0] in base_set:
+            rule = f"p{n - 1}"
+            if HashcatRuleValidator.validate_rule_for_gpu(rule):
+                if py_apply_chain(rule, parts[0]) == word:
+                    found.add(rule)
+    return found
+
+
+def _extract_separator_title_mode(
+    word:           str,
+    base_set:       Set[str],
+    max_depth:      int,
+    min_stem_len:   int,
+    max_leet_amb:   int,
+    base_lower_idx: Dict[str, Set[str]],
+) -> Set[str]:
+    """
+    SEPARATOR TITLE-CASE MODE — detect eX rules.
+    Covers passwords like 'Pass-Word' from 'pass-word' using 'e-'.
+    Uses precomputed base_lower_idx for O(1) case-folded lookup.
+    """
+    found: Set[str] = set()
+    if max_depth < 1:
+        return found
+    separators = ['-', '_', ' ', '.']
+    lower_word  = word.lower()
+    for sep in separators:
+        if sep not in word:
+            continue
+        stem_candidates = base_lower_idx.get(lower_word, set())
+        for stem in stem_candidates:
+            if len(stem) < min_stem_len:
+                continue
+            expected = []; cap_next = True
+            for c in stem:
+                if cap_next and 'a' <= c <= 'z':
+                    expected.append(c.upper()); cap_next = False
+                else:
+                    expected.append(c)
+                if c == sep:
+                    cap_next = True
+            if ''.join(expected) == word:
+                rule = f"e{sep}"
+                if HashcatRuleValidator.validate_rule_for_gpu(rule):
+                    if py_apply_chain(rule, stem) == word:
+                        found.add(rule)
+    return found
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Phase 0 multiprocessing infrastructure
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _worker_init_p0(
+    base_set=None, base_by_len=None, base_lower_idx=None,
+    purge_idx=None, substr_idx=None, omit_idx=None,
+    prefix_idx=None, ascii_idx=None,
+) -> None:
+    """Pool initialiser for Phase 0 workers.
+    With fork, globals are inherited via CoW — all args are None.
+    With spawn (Windows / macOS), they must be passed explicitly.
+    """
+    global _p0_worker_base_set, _p0_worker_base_by_len, _p0_worker_base_lower_idx
+    global _p0_worker_purge_idx, _p0_worker_substr_idx, _p0_worker_omit_idx
+    global _p0_worker_prefix_idx, _p0_worker_ascii_idx
+    if base_set       is not None: _p0_worker_base_set       = base_set
+    if base_by_len    is not None: _p0_worker_base_by_len    = base_by_len
+    if base_lower_idx is not None: _p0_worker_base_lower_idx = base_lower_idx
+    if purge_idx      is not None: _p0_worker_purge_idx      = purge_idx
+    if substr_idx     is not None: _p0_worker_substr_idx     = substr_idx
+    if omit_idx       is not None: _p0_worker_omit_idx       = omit_idx
+    if prefix_idx     is not None: _p0_worker_prefix_idx     = prefix_idx
+    if ascii_idx      is not None: _p0_worker_ascii_idx      = ascii_idx
+
+
+def _process_chunk_p0(args: Tuple) -> Set[str]:
+    """Worker function — process one chunk of target words for Phase 0.
+    Returns the set of discovered rule chains for the chunk.
+    """
+    (words_chunk, max_depth, min_stem_len, max_leet_amb,
+     max_prefix_len, max_suffix_len, enable_new_modes) = args
+
+    base_set       = _p0_worker_base_set
+    base_by_len    = _p0_worker_base_by_len
+    base_lower_idx = _p0_worker_base_lower_idx
+    purge_idx      = _p0_worker_purge_idx
+    substr_idx     = _p0_worker_substr_idx
+    omit_idx       = _p0_worker_omit_idx
+    prefix_idx     = _p0_worker_prefix_idx
+    ascii_idx      = _p0_worker_ascii_idx
+    found: Set[str] = set()
+
+    for word in words_chunk:
+        if not word or len(word) > MAX_WORD_LEN:
+            continue
+        n_digits  = sum(1 for c in word if c.isdigit())
+        n_alpha   = sum(1 for c in word if c.isalpha())
+        digit_primary = n_digits > n_alpha
+
+        # ── Original five modes ─────────────────────────────────────
+        if digit_primary:
+            found |= _extract_digit_mode(
+                word, base_set, max_depth, min_stem_len,
+                max_prefix_len, max_suffix_len,
+            )
+            if n_alpha >= min_stem_len:
+                found |= _extract_letter_mode(
+                    word, base_set, max_depth, min_stem_len,
+                    max_prefix_len, max_suffix_len, max_leet_amb,
+                )
+        else:
+            found |= _extract_letter_mode(
+                word, base_set, max_depth, min_stem_len,
+                max_prefix_len, max_suffix_len, max_leet_amb,
+            )
+            if n_digits > 0:
+                found |= _extract_digit_mode(
+                    word, base_set, max_depth, min_stem_len,
+                    max_prefix_len, max_suffix_len,
+                )
+        if max_depth >= 2:
+            found |= _extract_reverse_mode(
+                word, base_set, max_depth, min_stem_len,
+                max_prefix_len, max_suffix_len, max_leet_amb,
+            )
+            found |= _extract_delete_edge_mode(
+                word, base_set, max_depth, min_stem_len,
+                max_prefix_len, max_suffix_len, max_leet_amb,
+            )
+        if len(word) >= 2 * min_stem_len:
+            found |= _extract_duplicate_mode(
+                word, base_set, max_depth, min_stem_len,
+            )
+
+        # ── New v1.1 modes ─────────────────────────────────────────
+        if enable_new_modes:
+            if max_depth >= 2:
+                found |= _extract_insert_mode(
+                    word, base_set, max_depth, min_stem_len, max_leet_amb,
+                    base_by_len,
+                )
+            if max_depth >= 1:
+                found |= _extract_swap_mode(
+                    word, base_set, max_depth, min_stem_len, max_leet_amb,
+                )
+                found |= _extract_range_mode(
+                    word, base_set, max_depth, min_stem_len, max_leet_amb,
+                    substr_idx, omit_idx,
+                )
+                found |= _extract_char_duplicate_mode(
+                    word, base_set, max_depth, min_stem_len,
+                )
+                found |= _extract_ascii_transform_mode(
+                    word, base_set, max_depth, min_stem_len, max_leet_amb,
+                    base_by_len, ascii_idx,
+                )
+                found |= _extract_truncate_mode(
+                    word, base_set, max_depth, min_stem_len, max_leet_amb,
+                    prefix_idx,
+                )
+                found |= _extract_purge_mode(
+                    word, base_set, max_depth, min_stem_len, max_leet_amb,
+                    purge_idx,
+                )
+                if len(word) >= 2 * min_stem_len:
+                    found |= _extract_repeat_mode(
+                        word, base_set, max_depth, min_stem_len,
+                    )
+                found |= _extract_separator_title_mode(
+                    word, base_set, max_depth, min_stem_len, max_leet_amb,
+                    base_lower_idx,
+                )
+    return found
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Toggle-chain seed generator (T0..TN patterns for Phase 2 injection)
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1615,54 +2099,59 @@ def _generate_toggle_chain_seeds(max_depth: int) -> List[str]:
 
 
 def extract_token_strip_rules(
-    target_words:      List[str],
-    base_set:          Set[str],
-    max_depth:         int   = 0,
-    min_stem_len:      int   = 4,
-    max_prefix_len:    int   = 4,
-    max_suffix_len:    int   = 4,
+    target_words:       List[str],
+    base_set:           Set[str],
+    max_depth:          int  = 0,
+    min_stem_len:       int  = 4,
+    max_prefix_len:     int  = 4,
+    max_suffix_len:     int  = 4,
     max_leet_ambiguity: int  = 3,
+    workers:            int  = 0,
+    chunk_size:         int  = 0,
+    enable_new_modes:   bool = True,
 ) -> List[str]:
     """
-    Phase 0 — Token-Strip rule extraction.
+    Phase 0 — Token-Strip rule extraction (multiprocessing, 14 modes).
 
-    Runs four complementary extraction modes for each target word:
+    Original five modes
+    ───────────────────
+    LETTER MODE      boundary = digits+specials   → stem = letters (+leet)
+    DIGIT MODE       boundary = letters+specials  → stem = pure digit run
+    REVERSE MODE     chain prefix 'r'
+    DELETE-EDGE MODE chain prefix '[' or ']'
+    DUPLICATE/FOLD   chain 'd' or 'f'
 
-    LETTER MODE (original)
-        Boundary = digits + specials.  Middle segment = letters (+ leet chars).
-        Produces case-transform / leet-substitution / prepend / append chains.
-        Selected as primary when the word contains more letters than digits.
+    New v1.1 modes (enabled by default, disable with enable_new_modes=False)
+    ──────────────────────────────────────────────────────────────────────────
+    INSERT MODE      iNX — intra-word character insertions
+    SWAP MODE        *MN, k, K — transposition detection
+    RANGE MODE       xNM, ONM — contiguous extract/omit
+    CHAR-DUP MODE    zN, ZN, q — character-level duplication
+    ASCII MODE       +N, -N, LN, RN — single-char ASCII offset
+    TRUNCATE MODE    'N — position-based truncation
+    PURGE MODE       @X — remove all instances of char X
+    REPEAT MODE      pN — word-level repetition (>2 copies)
+    SEP-TITLE MODE   eX — title-case after separator char X
 
-    DIGIT MODE (dynamic boundary)
-        Boundary = letters + specials.  Middle segment = pure digit sequence.
-        Digit middle is looked up verbatim in the base wordlist (common
-        numeric passwords such as "123456" appear in rockyou-style lists).
-        Selected as primary when the word contains more digits than letters.
-        Produces prepend/append chains where letters/specials are boundary ops.
-
-    REVERSE MODE
-        Chain starts with 'r'.  The middle segment is reversed before stem
-        lookup, generating rules like 'r $!' for "drowssap!" from "password".
-
-    DELETE-EDGE MODE
-        Chain starts with '[' or ']'.  Tries stripping one non-boundary
-        character from the start or end of the word before normal extraction.
-
-    DUPLICATE / FOLD MODE
-        Detects passwords formed by duplicating ('d') or folding ('f') a
-        base-wordlist word: "passwordpassword" → 'd', "passworddrowssap" → 'f'.
-
-    Every candidate chain is verified by py_apply_chain before being accepted.
+    Parallelism
+    ───────────
+    workers=0 (default) → use all CPU cores.
+    The base-set inverted indexes (purge, substr, omit, prefix, ascii) are
+    built once in the main process and inherited by forked workers via CoW
+    (Linux/macOS).  On Windows/spawn, they are passed via initargs.
 
     Parameters
     ----------
     target_words       : words from the target wordlist
-    base_set           : set of words from the base wordlist
+    base_set           : set of words from the base wordlist (lowercase)
     max_depth          : maximum rule chain length; 0 = MAX_HASHCAT_CHAIN
     min_stem_len       : reject stems shorter than this (default 4)
     max_prefix_len     : maximum boundary prefix length to try (default 4)
     max_suffix_len     : maximum boundary suffix length to try (default 4)
     max_leet_ambiguity : max ambiguous leet positions per word (default 3)
+    workers            : worker processes (0 = cpu_count)
+    chunk_size         : words per chunk (0 = auto)
+    enable_new_modes   : include v1.1 extraction modes (default True)
 
     Returns
     -------
@@ -1671,84 +2160,126 @@ def extract_token_strip_rules(
     if max_depth <= 0:
         max_depth = MAX_HASHCAT_CHAIN
 
+    n_workers = workers or mp.cpu_count()
+    n_words   = len(target_words)
+    if chunk_size <= 0:
+        chunk_size = max(500, n_words // (n_workers * 4) + 1)
+
+    # ── Build inverted indexes once in main process ──────────────────────────
+    # Workers inherit them via CoW fork (zero copy) on Linux/macOS.
+    log_debug("[P0]   Building lookup indexes …")
+    base_by_len:    Dict[int, Set[str]]            = defaultdict(set)
+    base_lower_idx: Dict[str, Set[str]]            = defaultdict(set)
+    purge_idx:      Dict[str, Set[str]]            = defaultdict(set)
+    substr_idx:     Dict[str, Set[str]]            = defaultdict(set)
+    omit_idx:       Dict[str, Set[str]]            = defaultdict(set)
+    prefix_idx:     Dict[str, Set[str]]            = defaultdict(set)
+    ascii_idx:      Dict[str, Set[Tuple[str, str]]] = defaultdict(set)
+
+    for w in base_set:
+        wlen = len(w)
+        base_by_len[wlen].add(w)
+        base_lower_idx[w.lower()].add(w)
+        for c in set(w):
+            purge_idx[w.replace(c, '')].add(w)
+        for start in range(min(wlen, 10)):
+            for end in range(start + 1, min(wlen + 1, 11)):
+                substr_idx[w[start:end]].add(w)
+            for omit_n in range(1, min(10, wlen - start) + 1):
+                if start + omit_n > 10:
+                    break
+                result = w[:start] + w[start + omit_n:]
+                if result:
+                    omit_idx[result].add(w)
+            if start < wlen - 1:
+                prefix_idx[w[:start + 1]].add(w)
+        for pos in range(min(wlen, 10)):
+            sc = ord(w[pos])
+            for delta, rchar in ((1, '+'), (-1, '-')):
+                t = w[:pos] + chr((sc + delta) & 0xFF) + w[pos + 1:]
+                ascii_idx[t].add((w, f"{rchar}{pos}"))
+            for shifted, rchar in (
+                (chr((sc << 1) & 0xFF), 'L'),
+                (chr((sc >> 1) & 0xFF), 'R'),
+            ):
+                ascii_idx[w[:pos] + shifted + w[pos + 1:]].add((w, f"{rchar}{pos}"))
+        # Full-word uniform +1/-1 shift (covers "+0 +1 … +N" type chains)
+        for delta, rchar in ((1, '+'), (-1, '-')):
+            full_t = ''.join(chr((ord(c) + delta) & 0xFF) for c in w)
+            if full_t != w:
+                chain_str = ' '.join(f"{rchar}{p}" for p in range(min(wlen, 10)))
+                ascii_idx[full_t].add((w, chain_str))
+
+    base_by_len    = dict(base_by_len)
+    base_lower_idx = dict(base_lower_idx)
+    purge_idx      = dict(purge_idx)
+    substr_idx     = dict(substr_idx)
+    omit_idx       = dict(omit_idx)
+    prefix_idx     = dict(prefix_idx)
+    ascii_idx      = dict(ascii_idx)
+    log_debug(f"[P0]   Indexes built  purge:{len(purge_idx)}  "
+              f"substr:{len(substr_idx)}  omit:{len(omit_idx)}  "
+              f"prefix:{len(prefix_idx)}  ascii:{len(ascii_idx)}")
+
+    # ── Expose globals before Pool() so forked workers CoW-inherit them ──────
+    global _p0_worker_base_set, _p0_worker_base_by_len, _p0_worker_base_lower_idx
+    global _p0_worker_purge_idx, _p0_worker_substr_idx, _p0_worker_omit_idx
+    global _p0_worker_prefix_idx, _p0_worker_ascii_idx
+    _p0_worker_base_set       = base_set
+    _p0_worker_base_by_len    = base_by_len
+    _p0_worker_base_lower_idx = base_lower_idx
+    _p0_worker_purge_idx      = purge_idx
+    _p0_worker_substr_idx     = substr_idx
+    _p0_worker_omit_idx       = omit_idx
+    _p0_worker_prefix_idx     = prefix_idx
+    _p0_worker_ascii_idx      = ascii_idx
+
+    # ── Build task chunks ─────────────────────────────────────────────────────
+    chunks    = [target_words[i:i + chunk_size] for i in range(0, n_words, chunk_size)]
+    n_chunks  = len(chunks)
+    task_args = [
+        (chunk, max_depth, min_stem_len, max_leet_ambiguity,
+         max_prefix_len, max_suffix_len, enable_new_modes)
+        for chunk in chunks
+    ]
+
+    mode_label = green('14 modes') if enable_new_modes else yellow('5 modes')
+    log_info(
+        f"[P0]   Workers: {bold(str(n_workers))}  |  "
+        f"chunks: {bold(str(n_chunks))} × ~{chunk_size}  |  "
+        f"{mode_label}"
+    )
+
     found: Set[str] = set()
+    use_fork = hasattr(os, 'fork')
+    ctx      = mp.get_context('fork' if use_fork else 'spawn')
 
-    with tqdm(total=len(target_words),
-              desc=green("  Phase 0 "),
-              unit="word",
-              ncols=88,
-              bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}",
-              ) as pbar:
-        for word in target_words:
-            pbar.set_postfix({"rules": cyan(str(len(found)))}, refresh=False)
-            pbar.update(1)
-            if not word or len(word) > MAX_WORD_LEN:
-                continue
+    if use_fork:
+        pool_kw: dict = dict(processes=n_workers, initializer=_worker_init_p0)
+    else:
+        pool_kw = dict(
+            processes   = n_workers,
+            initializer = _worker_init_p0,
+            initargs    = (base_set, base_by_len, base_lower_idx,
+                           purge_idx, substr_idx, omit_idx,
+                           prefix_idx, ascii_idx),
+        )
 
-            n_digits  = sum(1 for c in word if c.isdigit())
-            n_alpha   = sum(1 for c in word if c.isalpha())
-            n_special = len(word) - n_digits - n_alpha  # noqa: F841
-
-            # ── Dynamic mode selection ────────────────────────────────────────
-            # Primary extraction mode is chosen based on which character class
-            # dominates the word:
-            #
-            #   n_alpha >= n_digits (letters dominate or tie)
-            #     → LETTER primary: boundary = digits+specials, stem = letters
-            #       Example: "Password123!" → stem "password", boundary "123!"
-            #
-            #   n_digits > n_alpha (digits dominate)
-            #     → DIGIT primary: boundary = letters+specials, stem = digits
-            #       Example: "abc2024"   → stem "2024",   boundary "abc"
-            #       Example: "123456!!"  → stem "123456", boundary "!!"
-            #
-            # Both modes still run — they catch different decompositions of the
-            # same word and their results are unioned.
-
-            digit_primary = n_digits > n_alpha
-
-            if digit_primary:
-                # Digit-heavy: digit-stem first, then letter-stem
-                found |= _extract_digit_mode(
-                    word, base_set, max_depth, min_stem_len,
-                    max_prefix_len, max_suffix_len,
-                )
-                if n_alpha >= min_stem_len:
-                    found |= _extract_letter_mode(
-                        word, base_set, max_depth, min_stem_len,
-                        max_prefix_len, max_suffix_len, max_leet_ambiguity,
-                    )
-            else:
-                # Letter-heavy or mixed: letter-stem first, then digit-stem
-                found |= _extract_letter_mode(
-                    word, base_set, max_depth, min_stem_len,
-                    max_prefix_len, max_suffix_len, max_leet_ambiguity,
-                )
-                if n_digits > 0:
-                    found |= _extract_digit_mode(
-                        word, base_set, max_depth, min_stem_len,
-                        max_prefix_len, max_suffix_len,
-                    )
-
-            # ── REVERSE MODE ─────────────────────────────────────────────────
-            if max_depth >= 2:
-                found |= _extract_reverse_mode(
-                    word, base_set, max_depth, min_stem_len,
-                    max_prefix_len, max_suffix_len, max_leet_ambiguity,
-                )
-
-            # ── DELETE-EDGE MODE ─────────────────────────────────────────────
-            if max_depth >= 2:
-                found |= _extract_delete_edge_mode(
-                    word, base_set, max_depth, min_stem_len,
-                    max_prefix_len, max_suffix_len, max_leet_ambiguity,
-                )
-
-            # ── DUPLICATE / FOLD MODE ─────────────────────────────────────────
-            if len(word) >= 2 * min_stem_len:
-                found |= _extract_duplicate_mode(
-                    word, base_set, max_depth, min_stem_len,
-                )
+    with ctx.Pool(**pool_kw) as pool:
+        with tqdm(
+            total      = n_words,
+            desc       = green("  Phase 0 "),
+            unit       = "word",
+            ncols      = 88,
+            bar_format = "{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}",
+        ) as pbar:
+            for task_arg, chunk_result in zip(
+                task_args,
+                pool.imap_unordered(_process_chunk_p0, task_args),
+            ):
+                found |= chunk_result
+                pbar.set_postfix({"rules": cyan(str(len(found)))}, refresh=False)
+                pbar.update(len(task_arg[0]))
 
     return sorted(found)
 
@@ -1771,20 +2302,46 @@ def _log_token_strip_stats(
         toks = r.split()
         first = toks[0] if toks else ''
         if first == 'r':
-            mode_counts['reverse'] += 1
+            mode_counts['reverse']    += 1
         elif first == 'd':
-            mode_counts['dup'] += 1
+            mode_counts['dup']         += 1
         elif first == 'f':
-            mode_counts['fold'] += 1
+            mode_counts['fold']        += 1
         elif first in ('[', ']'):
-            mode_counts['del-edge'] += 1
+            mode_counts['del-edge']    += 1
         elif first.startswith('T') and len(first) == 2:
-            mode_counts['toggle'] += 1
+            mode_counts['toggle']      += 1
+        elif first.startswith('i') and len(first) == 3:
+            mode_counts['insert']      += 1
+        elif first in ('k', 'K') or (first.startswith('*') and len(first) == 3):
+            mode_counts['swap']        += 1
+        elif first.startswith('x') and len(first) == 3:
+            mode_counts['range-ext']   += 1
+        elif first.startswith('O') and len(first) == 3:
+            mode_counts['range-omit']  += 1
+        elif first.startswith('z') and len(first) == 2:
+            mode_counts['char-dup-f']  += 1
+        elif first.startswith('Z') and len(first) == 2:
+            mode_counts['char-dup-l']  += 1
+        elif first == 'q':
+            mode_counts['char-dup-q']  += 1
+        elif first.startswith('+') and len(first) == 2:
+            mode_counts['ascii-inc']   += 1
+        elif first.startswith('-') and len(first) == 2:
+            mode_counts['ascii-dec']   += 1
+        elif first.startswith("'") and len(first) == 2:
+            mode_counts['truncate']    += 1
+        elif first.startswith('@') and len(first) == 2:
+            mode_counts['purge']       += 1
+        elif first.startswith('p') and len(first) == 2:
+            mode_counts['repeat']      += 1
+        elif first.startswith('e') and len(first) == 2:
+            mode_counts['sep-title']   += 1
         elif all(c.isdigit() or c in ('^', '$', ' ')
                  for c in r) and any(c.isdigit() for c in r):
-            mode_counts['digit-bnd'] += 1
+            mode_counts['digit-bnd']   += 1
         else:
-            mode_counts['letter'] += 1
+            mode_counts['letter']      += 1
 
     depth_summary = '  '.join(f"d{d}:{depth_dist[d]:,}" for d in sorted(depth_dist))
     inj = green('injected into Phase S sbd') if inject_sbd else dim('Phase S inactive')
@@ -3948,7 +4505,9 @@ class GPUExtractor:
                  genetic_pop=200, genetic_elite=0.15,
                  token_strip=False, token_strip_min_stem=4,
                  token_strip_max_prefix=4, token_strip_max_suffix=4,
-                 token_strip_min_leet_amb=3):
+                 token_strip_min_leet_amb=3,
+                 token_strip_workers=0, token_strip_chunk_size=0,
+                 token_strip_no_new_modes=False):
         self.base_count               = base_count
         self.target_count             = target_count
         self.max_depth                = max_depth
@@ -3967,6 +4526,9 @@ class GPUExtractor:
         self.token_strip_max_prefix   = token_strip_max_prefix
         self.token_strip_max_suffix   = token_strip_max_suffix
         self.token_strip_min_leet_amb = token_strip_min_leet_amb
+        self.token_strip_workers      = token_strip_workers
+        self.token_strip_chunk_size   = token_strip_chunk_size
+        self.token_strip_no_new_modes = token_strip_no_new_modes
         self.params              = calculate_dynamic_parameters(
             base_count, target_count, None, target_hours, bloom_mb_override=bloom_mb)
         self.params['MAX_CHAIN_DEPTH'] = max_depth
@@ -4049,12 +4611,11 @@ class GPUExtractor:
                 f"max-suffix={self.token_strip_max_suffix}  "
                 f"min-leet-amb={self.token_strip_min_leet_amb}"
             )
+            _new_modes_label = yellow('disabled (--token-strip-no-new-modes)') \
+                if self.token_strip_no_new_modes else green('enabled (14 modes)')
             log_info(
-                f"[P0]   Modes: {bold('letter')} (alpha-stem)  "
-                f"{bold('digit')} (digit-stem, dynamic boundary)  "
-                f"{bold('reverse')} (r-prefix)  "
-                f"{bold('delete-edge')} ([/]-prefix)  "
-                f"{bold('dup/fold')} (d/f)"
+                f"[P0]   Modes: {_new_modes_label}  |  "
+                f"workers: {bold(str(self.token_strip_workers or mp.cpu_count()))}"
             )
             ts_all = extract_token_strip_rules(
                 target_words,
@@ -4064,6 +4625,9 @@ class GPUExtractor:
                 max_prefix_len     = self.token_strip_max_prefix,
                 max_suffix_len     = self.token_strip_max_suffix,
                 max_leet_ambiguity = self.token_strip_min_leet_amb,
+                workers            = self.token_strip_workers,
+                chunk_size         = self.token_strip_chunk_size,
+                enable_new_modes   = not self.token_strip_no_new_modes,
             )
 
             # Split by depth
@@ -4460,6 +5024,22 @@ def main() -> None:
              "base letter (e.g. '1' → 'i' or 'l').  Higher values allow more "
              "combinations but increase CPU time.",
     )
+    pt.add_argument(
+        '--token-strip-workers', type=int, default=0, metavar='N',
+        help='Worker processes for Phase 0 (default: 0 = all CPU cores). '
+             'Set to 1 to disable multiprocessing.',
+    )
+    pt.add_argument(
+        '--token-strip-chunk-size', type=int, default=0, metavar='N',
+        help='Target words per worker chunk (default: 0 = auto).  '
+             'Smaller chunks improve progress resolution; larger chunks reduce overhead.',
+    )
+    pt.add_argument(
+        '--token-strip-no-new-modes', action='store_true',
+        help='Disable the v1.1 extraction modes (insert, swap, range, char-dup, '
+             'ascii, truncate, purge, repeat, sep-title) and run only the original '
+             'five modes (letter, digit, reverse, delete-edge, dup/fold).',
+    )
 
     # ---- Phase 3: Genetic Algorithm ----------------------------------
     ga = ap.add_argument_group(
@@ -4535,6 +5115,8 @@ def main() -> None:
     # Phase 0 status
     if args.token_strip:
         _ts_inj = green('→ Phase S sbd') if not args.no_builtin_seeds else yellow('→ Phase 1 only (Phase S disabled)')
+        _ts_modes = yellow('5 modes (new disabled)') if args.token_strip_no_new_modes else green('14 modes')
+        _ts_workers = bold(str(args.token_strip_workers or mp.cpu_count()))
         log_info(
             f"  {bold(cyan('Phase 0 token-strip'))} : "
             f"{green('enabled')}  |  "
@@ -4542,6 +5124,8 @@ def main() -> None:
             f"prefix={bold(str(args.token_strip_max_prefix))}  "
             f"suffix={bold(str(args.token_strip_max_suffix))}  "
             f"leet-amb={bold(str(args.token_strip_min_leet_amb))}  "
+            f"workers={_ts_workers}  "
+            f"modes={_ts_modes}  "
             f"{_ts_inj}"
         )
     if args.seed_rules:
@@ -4583,6 +5167,9 @@ def main() -> None:
         token_strip_max_prefix    = args.token_strip_max_prefix,
         token_strip_max_suffix    = args.token_strip_max_suffix,
         token_strip_min_leet_amb  = args.token_strip_min_leet_amb,
+        token_strip_workers       = args.token_strip_workers,
+        token_strip_chunk_size    = args.token_strip_chunk_size,
+        token_strip_no_new_modes  = args.token_strip_no_new_modes,
     )
 
     extractor._output_path = args.output   # used by Phase 0 debug dump
