@@ -572,10 +572,7 @@ def _py_apply_single_rule(rule: str, word: str) -> Optional[str]:
         return word
     w   = list(word.encode('latin-1'))
     cmd = rule[0]
-    def dg(c):
-        if '0' <= c <= '9': return ord(c) - 48
-        if 'A' <= c <= 'Z': return ord(c) - 55   # A=10, B=11, …, Z=35
-        return -1
+    def dg(c): return ord(c) - 48 if '0' <= c <= '9' else -1
     try:
         if   cmd == ':': pass
         elif cmd == 'l': w = [c | 0x20 if 65<=c<=90 else c for c in w]
@@ -610,15 +607,9 @@ def _py_apply_single_rule(rule: str, word: str) -> Optional[str]:
             for c in w: out += [c, c]
             w = out
         elif cmd == 'E':
-            # Title-case: lowercase everything first, then uppercase after space/hyphen/underscore.
             out = []; cap = True
             for c in w:
-                if cap and 97 <= c <= 122:
-                    out.append(c & ~0x20)      # lowercase → uppercase (word start)
-                elif not cap and 65 <= c <= 90:
-                    out.append(c | 0x20)       # uppercase → lowercase (mid-word)
-                else:
-                    out.append(c)
+                out.append(c & ~0x20 if cap and 97<=c<=122 else c)
                 cap = c in (32, 45, 95)
             w = out
         elif cmd == '^' and len(rule)==2: w = [ord(rule[1])] + w
@@ -651,9 +642,8 @@ def _py_apply_single_rule(rule: str, word: str) -> Optional[str]:
             p = dg(rule[1]); delta = 1 if cmd == '.' else -1
             if 0 <= p < len(w): w[p] = (w[p] + delta) & 0xFF
         elif cmd == "'" and len(rule)==2:
-            # 'N — keep only the first N characters (w[:N])
             p = dg(rule[1])
-            if 0 <= p: w = w[:p]
+            if 0 <= p < len(w): w = w[:p+1]
         elif cmd == 'z' and len(rule)==2:
             n = dg(rule[1])
             if n > 0 and w: w = [w[0]] * n + w
@@ -676,21 +666,15 @@ def _py_apply_single_rule(rule: str, word: str) -> Optional[str]:
             p, ch = dg(rule[1]), ord(rule[2])
             if 0 <= p < len(w): w[p] = ch
         elif cmd == 'e' and len(rule)>=2:
-            # Title-case with custom separator: lowercase everything, then uppercase after sep.
             sep = ord(rule[1]); out = []; cap = True
             for c in w:
-                if cap and 97 <= c <= 122:
-                    out.append(c & ~0x20)
-                elif not cap and 65 <= c <= 90:
-                    out.append(c | 0x20)
-                else:
-                    out.append(c)
+                out.append(c & ~0x20 if cap and 97<=c<=122 else c)
                 cap = (c == sep)
             w = out
         elif cmd == 'x' and len(rule)==3:
-            # xNM — extract M characters starting at position N  (M is a count, not end-index)
-            n, m = dg(rule[1]), dg(rule[2])
-            if n >= 0 and m >= 0: w = w[n:n+m]
+            a, b = dg(rule[1]), dg(rule[2])
+            if a > b: a, b = b, a
+            w = w[a:b+1]
         elif cmd == 'O' and len(rule)==3:
             p, m = dg(rule[1]), dg(rule[2])
             if 0 <= p < len(w) and m > 0: w = w[:p] + w[p+m:]
@@ -698,12 +682,11 @@ def _py_apply_single_rule(rule: str, word: str) -> Optional[str]:
             a, b = dg(rule[1]), dg(rule[2])
             if 0<=a<len(w) and 0<=b<len(w) and a!=b: w[a], w[b] = w[b], w[a]
         elif cmd == '3' and len(rule)==3:
-            # 3NX — toggle after the Nth separator X (N is 0-based: 30X = first sep)
             n, sep = dg(rule[1]), ord(rule[2]); cnt = 0
             for i, c in enumerate(w):
                 if c == sep:
                     cnt += 1
-                    if cnt == n + 1 and i+1 < len(w):
+                    if cnt == n and i+1 < len(w):
                         ci = w[i+1]
                         w[i+1] = ci|0x20 if 65<=ci<=90 else (ci&~0x20 if 97<=ci<=122 else ci)
                         break
@@ -735,27 +718,17 @@ def compute_rule_signature(rule: str, probe_words: List[str]) -> tuple:
     Compute the functional signature of *rule* over *probe_words*.
 
     The signature is a tuple of outputs (one per probe word).  When the rule
-    contains an unsupported opcode, a UNIQUE sentinel tuple is returned:
-    ``('__UNSUPPORTED__', rule)`` — embedding the rule text ensures that two
-    different unsupported rules never share a bucket and collapse to one.
-
-    The old behaviour — returning the shared constant ``('__UNSUPPORTED__',)``
-    for every unsupported rule — caused false deduplication: e.g. 200 rules
-    using reject ops (<, >, !, /, …) all mapped to the same bucket, keeping
-    only the highest-count survivor and silently discarding the other 199.
+    contains an unsupported opcode, the entire tuple is replaced by the
+    single-element tuple ``('__UNSUPPORTED__',)`` so that all unsupported rules
+    are bucketed together and the highest-GPU-count one survives.
     """
     outputs = []
     for word in probe_words:
         out = py_apply_chain(rule, word)
         if out is None:
-            return ('__UNSUPPORTED__', rule)   # unique per rule
+            return ('__UNSUPPORTED__',)
         outputs.append(out)
     return tuple(outputs)
-
-
-def _is_unsupported_sig(sig: tuple) -> bool:
-    """Return True if *sig* is an unsupported-opcode sentinel (any variant)."""
-    return len(sig) >= 1 and sig[0] == '__UNSUPPORTED__'
 
 
 def minimize_by_signature(
@@ -856,8 +829,8 @@ def _minimize_mem(
     survivors    = Counter()
     n_unsupported = 0
     for sig, group in sig_map.items():
-        if _is_unsupported_sig(sig):
-            n_unsupported += len(group)
+        if sig == ('__UNSUPPORTED__',):
+            n_unsupported = len(group)
         best_rule, best_count = min(group, key=_group_key)
         survivors[best_rule] = best_count
 
@@ -913,9 +886,8 @@ def _minimize_disk(
     ---------------
     SHA-1 produces a 160-bit digest.  For 8 M rules the birthday-collision
     probability is ~(8e6)² / 2^161 ≈ 2.5 × 10⁻³⁵ — negligible in practice.
-    Rules with unsupported opcodes receive a unique sentinel
-    ``('__UNSUPPORTED__', rule_text)`` which joins to a unique string before
-    hashing, so every unsupported rule gets its own row — no false deduplication.
+    The ``__UNSUPPORTED__`` sentinel signature is hashed identically to all
+    other signatures; one representative survives as usual.
 
     SQLite version requirement
     --------------------------
@@ -1053,10 +1025,12 @@ def _minimize_disk(
 
         conn.close()
 
-        # n_unsupported: each unsupported rule gets a unique sig_hash
-        # ('__UNSUPPORTED__\x00' + rule_text), so ALL unsupported rules survive
-        # the upsert — no false deduplication.  We report 0 here because we'd
-        # need a second scan to count them accurately; the mem-path log covers it.
+        # n_unsupported: rows whose sig_hash matches the SHA-1 of '__UNSUPPORTED__'
+        _unsup_hash = hashlib.sha1(
+            '__UNSUPPORTED__'.encode('latin-1')
+        ).hexdigest()
+        # We can't count unsupported accurately post-upsert (only 1 row kept).
+        # Report 0 to keep the stats consistent with the memory path.
         _log_minimize_stats(n_total, survivors, n_sigs, n_unsupported=0)
         return survivors
 
@@ -2161,10 +2135,13 @@ class GPUEngine:
         self.max_work_group_size = 512
         self.local_work_size     = params.get('LOCAL_WORK_SIZE', 512)
         self.bloom_buf           = None
+        self.bloom_np            = None   # keep a copy so _reset_gpu can re-upload
         self.rule_index          = {}
         self.gpu_rules           = []
         self.kernel_single       = None
         self.kernel_chain        = None
+        self._consecutive_errors = 0      # consecutive batch failures — triggers graceful exit
+        self._MAX_CONSECUTIVE_ERRORS = 5  # give up GPU phase after this many in a row
 
     def get_free_vram(self):      return estimate_free_vram(self.device)
     def get_max_allocation(self): return get_max_allocation(self.device)
@@ -2213,6 +2190,75 @@ class GPUEngine:
         except Exception as e:
             log_error(f"Kernel compile failed: {e}"); return None
 
+    def _reset_gpu(self, error: Exception) -> bool:
+        """
+        Attempt a full GPU context recovery after a fatal OpenCL error.
+
+        ``INVALID_COMMAND_QUEUE`` almost always means the underlying OpenCL
+        context is lost (GPU TDR / driver reset / VRAM fault).  Recreating
+        only the ``CommandQueue`` (the old approach) leaves ``self.context``
+        pointing at a dead object, so the very next GPU call raises the same
+        error again.
+
+        This method tears down *everything* — context, queue, program, bloom
+        buffer — and rebuilds from scratch using the device reference that was
+        captured during ``initialize_gpu``.  The cached bloom numpy array
+        (``self.bloom_np``) is re-uploaded so subsequent batches can continue
+        without recomputing it.
+
+        Returns True if recovery succeeded, False if it failed (caller should
+        then abort the GPU phase gracefully).
+        """
+        log_warn(f"[GPU] Fatal kernel error: {error}  — attempting full context reset")
+        # ── tear down ──────────────────────────────────────────────────────
+        for attr in ('bloom_buf', 'program', 'kernel_single', 'kernel_chain',
+                     'queue', 'context'):
+            obj = getattr(self, attr, None)
+            if obj is not None:
+                try: obj.release()
+                except Exception: pass
+            setattr(self, attr, None)
+
+        if self.device is None:
+            log_error("[GPU] No device reference — cannot recover context")
+            return False
+
+        try:
+            self.context         = cl.Context([self.device])
+            self.queue           = cl.CommandQueue(self.context)
+            self.local_work_size = min(
+                self.params.get('LOCAL_WORK_SIZE', 512),
+                self.max_work_group_size,
+            )
+            if not self.compile_kernel():
+                log_error("[GPU] Context reset: kernel recompile failed")
+                return False
+            if self.bloom_np is not None:
+                self.upload_bloom_filter(self.bloom_np)
+            log_info("[GPU] Context reset successful — resuming")
+            return True
+        except Exception as exc:
+            log_error(f"[GPU] Context reset failed: {exc}")
+            return False
+
+    def _safe_queue_finish(self) -> bool:
+        """
+        Call ``self.queue.finish()`` and return True on success.
+
+        On any OpenCL error, attempt a full context reset via ``_reset_gpu``
+        and return False.  The caller is responsible for deciding whether to
+        continue, skip the batch, or abort the phase.
+        """
+        if self.queue is None:
+            return False
+        try:
+            self.queue.finish()
+            return True
+        except Exception as exc:
+            log_warn(f"[GPU] queue.finish() failed: {exc}")
+            self._reset_gpu(exc)
+            return False
+
     def generate_bloom_filter(self, target_words):
         bsz = self.params['BLOOM_FILTER_SIZE'] // 8
         bf  = np.zeros(bsz, dtype=np.uint8)
@@ -2232,7 +2278,10 @@ class GPUEngine:
 
     def upload_bloom_filter(self, bf):
         mf = cl.mem_flags
-        if self.bloom_buf: self.bloom_buf.release()
+        if self.bloom_buf:
+            try: self.bloom_buf.release()
+            except Exception: pass
+        self.bloom_np  = bf                       # keep a copy for context recovery
         self.bloom_buf = cl.Buffer(self.context, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=bf)
 
     def _flatten(self, items):
@@ -2275,10 +2324,27 @@ class GPUEngine:
                 if batch:
                     found = self._run_single_kernel(self.prepare_batch_data(batch, self.gpu_rules))
                     if found:
+                        self._consecutive_errors = 0
                         counter.update(found)
                         pbar.set_postfix({"rules": cyan(str(len(counter)))}, refresh=False)
+                    elif self.queue is None:
+                        # _reset_gpu failed — GPU is unrecoverable
+                        self._consecutive_errors += 1
+                        if self._consecutive_errors >= self._MAX_CONSECUTIVE_ERRORS:
+                            log_warn(f"[GPU] {self._consecutive_errors} consecutive failures — "
+                                     f"aborting Phase 1 gracefully")
+                            break
                 pbar.update(len(batch))
-                self.queue.finish(); gc.collect()
+                # Use _safe_queue_finish — never let an unprotected queue.finish()
+                # crash the process.  A failure here triggers _reset_gpu internally.
+                if not self._safe_queue_finish():
+                    self._consecutive_errors += 1
+                    if self._consecutive_errors >= self._MAX_CONSECUTIVE_ERRORS:
+                        log_warn("[GPU] queue.finish() repeatedly failing — "
+                                 "aborting Phase 1 gracefully")
+                        break
+                else:
+                    gc.collect()
 
         log_info(f"[P1]   {bold(green(str(len(counter))))} unique rules passed bloom filter")
         log_debug(f"Phase 1 complete: {len(counter)} rules in counter")
@@ -2318,7 +2384,8 @@ class GPUEngine:
             return out
         except Exception as e:
             log_warn(f"Single-rule kernel error: {e}")
-            self.queue = cl.CommandQueue(self.context); return []
+            self._reset_gpu(e)
+            return []
         finally:
             for b in bufs:
                 try: b.release()
@@ -2878,8 +2945,18 @@ class GPUEngine:
                     if wb:
                         found = self._run_chain_kernel(wb, cb)
                         if found:
+                            self._consecutive_errors = 0
                             counter.update(found)
-                    self.queue.finish()
+                        elif self.queue is None:
+                            self._consecutive_errors += 1
+                    if not self._safe_queue_finish():
+                        self._consecutive_errors += 1
+
+                if self._consecutive_errors >= self._MAX_CONSECUTIVE_ERRORS:
+                    log_warn(f"[GPU] {self._consecutive_errors} consecutive failures — "
+                             "aborting seed pass gracefully")
+                    break
+
                 pbar.update(1)
                 pbar.set_postfix({"hits": cyan(str(len(counter)))}, refresh=False)
 
@@ -2974,8 +3051,17 @@ class GPUEngine:
                     if wb:
                         found = self._run_chain_kernel(wb, cb)
                         if found:
+                            self._consecutive_errors = 0
                             counter.update(found)
-                    self.queue.finish()
+                        elif self.queue is None:
+                            self._consecutive_errors += 1
+                    if not self._safe_queue_finish():
+                        self._consecutive_errors += 1
+
+                if self._consecutive_errors >= self._MAX_CONSECUTIVE_ERRORS:
+                    log_warn(f"[GPU] {self._consecutive_errors} consecutive failures — "
+                             "aborting Phase 2 gracefully")
+                    break
 
                 pbar.update(1)
                 pbar.set_postfix({"rules": cyan(str(len(counter)))}, refresh=False)
@@ -3030,7 +3116,8 @@ class GPUEngine:
             return out
         except Exception as e:
             log_warn(f"Chain kernel error: {e}")
-            self.queue = cl.CommandQueue(self.context); return []
+            self._reset_gpu(e)
+            return []
         finally:
             for b in bufs:
                 try: b.release()
@@ -3259,7 +3346,7 @@ class GeneticRuleEvolver:
             if raw_hits <= 0:
                 continue
             sig = self._get_sig(chain_str)
-            if _is_unsupported_sig(sig):
+            if sig == ('__UNSUPPORTED__',):
                 continue
             existing = self._sig_to_best.get(sig)
             if existing is None:
@@ -3293,7 +3380,7 @@ class GeneticRuleEvolver:
         if not self._sig_to_best:
             return False
         sig = self._get_sig(chain_str)
-        if _is_unsupported_sig(sig):
+        if sig == ('__UNSUPPORTED__',):
             return False
         return sig in self._sig_to_best
 
@@ -3495,7 +3582,7 @@ class GeneticRuleEvolver:
                     found = self.gpu_engine._run_chain_kernel(wb, cb)
                     if found:
                         batch_hits.update(found)
-            self.gpu_engine.queue.finish()
+            self.gpu_engine._safe_queue_finish()
 
         raw_map.update(batch_hits)
         return raw_map
