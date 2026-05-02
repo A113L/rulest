@@ -572,7 +572,10 @@ def _py_apply_single_rule(rule: str, word: str) -> Optional[str]:
         return word
     w   = list(word.encode('latin-1'))
     cmd = rule[0]
-    def dg(c): return ord(c) - 48 if '0' <= c <= '9' else -1
+    def dg(c):
+        if '0' <= c <= '9': return ord(c) - 48
+        if 'A' <= c <= 'Z': return ord(c) - 55   # A=10, B=11, …, Z=35
+        return -1
     try:
         if   cmd == ':': pass
         elif cmd == 'l': w = [c | 0x20 if 65<=c<=90 else c for c in w]
@@ -607,9 +610,15 @@ def _py_apply_single_rule(rule: str, word: str) -> Optional[str]:
             for c in w: out += [c, c]
             w = out
         elif cmd == 'E':
+            # Title-case: lowercase everything first, then uppercase after space/hyphen/underscore.
             out = []; cap = True
             for c in w:
-                out.append(c & ~0x20 if cap and 97<=c<=122 else c)
+                if cap and 97 <= c <= 122:
+                    out.append(c & ~0x20)      # lowercase → uppercase (word start)
+                elif not cap and 65 <= c <= 90:
+                    out.append(c | 0x20)       # uppercase → lowercase (mid-word)
+                else:
+                    out.append(c)
                 cap = c in (32, 45, 95)
             w = out
         elif cmd == '^' and len(rule)==2: w = [ord(rule[1])] + w
@@ -642,8 +651,9 @@ def _py_apply_single_rule(rule: str, word: str) -> Optional[str]:
             p = dg(rule[1]); delta = 1 if cmd == '.' else -1
             if 0 <= p < len(w): w[p] = (w[p] + delta) & 0xFF
         elif cmd == "'" and len(rule)==2:
+            # 'N — keep only the first N characters (w[:N])
             p = dg(rule[1])
-            if 0 <= p < len(w): w = w[:p+1]
+            if 0 <= p: w = w[:p]
         elif cmd == 'z' and len(rule)==2:
             n = dg(rule[1])
             if n > 0 and w: w = [w[0]] * n + w
@@ -666,15 +676,21 @@ def _py_apply_single_rule(rule: str, word: str) -> Optional[str]:
             p, ch = dg(rule[1]), ord(rule[2])
             if 0 <= p < len(w): w[p] = ch
         elif cmd == 'e' and len(rule)>=2:
+            # Title-case with custom separator: lowercase everything, then uppercase after sep.
             sep = ord(rule[1]); out = []; cap = True
             for c in w:
-                out.append(c & ~0x20 if cap and 97<=c<=122 else c)
+                if cap and 97 <= c <= 122:
+                    out.append(c & ~0x20)
+                elif not cap and 65 <= c <= 90:
+                    out.append(c | 0x20)
+                else:
+                    out.append(c)
                 cap = (c == sep)
             w = out
         elif cmd == 'x' and len(rule)==3:
-            a, b = dg(rule[1]), dg(rule[2])
-            if a > b: a, b = b, a
-            w = w[a:b+1]
+            # xNM — extract M characters starting at position N  (M is a count, not end-index)
+            n, m = dg(rule[1]), dg(rule[2])
+            if n >= 0 and m >= 0: w = w[n:n+m]
         elif cmd == 'O' and len(rule)==3:
             p, m = dg(rule[1]), dg(rule[2])
             if 0 <= p < len(w) and m > 0: w = w[:p] + w[p+m:]
@@ -682,11 +698,12 @@ def _py_apply_single_rule(rule: str, word: str) -> Optional[str]:
             a, b = dg(rule[1]), dg(rule[2])
             if 0<=a<len(w) and 0<=b<len(w) and a!=b: w[a], w[b] = w[b], w[a]
         elif cmd == '3' and len(rule)==3:
+            # 3NX — toggle after the Nth separator X (N is 0-based: 30X = first sep)
             n, sep = dg(rule[1]), ord(rule[2]); cnt = 0
             for i, c in enumerate(w):
                 if c == sep:
                     cnt += 1
-                    if cnt == n and i+1 < len(w):
+                    if cnt == n + 1 and i+1 < len(w):
                         ci = w[i+1]
                         w[i+1] = ci|0x20 if 65<=ci<=90 else (ci&~0x20 if 97<=ci<=122 else ci)
                         break
@@ -718,17 +735,27 @@ def compute_rule_signature(rule: str, probe_words: List[str]) -> tuple:
     Compute the functional signature of *rule* over *probe_words*.
 
     The signature is a tuple of outputs (one per probe word).  When the rule
-    contains an unsupported opcode, the entire tuple is replaced by the
-    single-element tuple ``('__UNSUPPORTED__',)`` so that all unsupported rules
-    are bucketed together and the highest-GPU-count one survives.
+    contains an unsupported opcode, a UNIQUE sentinel tuple is returned:
+    ``('__UNSUPPORTED__', rule)`` — embedding the rule text ensures that two
+    different unsupported rules never share a bucket and collapse to one.
+
+    The old behaviour — returning the shared constant ``('__UNSUPPORTED__',)``
+    for every unsupported rule — caused false deduplication: e.g. 200 rules
+    using reject ops (<, >, !, /, …) all mapped to the same bucket, keeping
+    only the highest-count survivor and silently discarding the other 199.
     """
     outputs = []
     for word in probe_words:
         out = py_apply_chain(rule, word)
         if out is None:
-            return ('__UNSUPPORTED__',)
+            return ('__UNSUPPORTED__', rule)   # unique per rule
         outputs.append(out)
     return tuple(outputs)
+
+
+def _is_unsupported_sig(sig: tuple) -> bool:
+    """Return True if *sig* is an unsupported-opcode sentinel (any variant)."""
+    return len(sig) >= 1 and sig[0] == '__UNSUPPORTED__'
 
 
 def minimize_by_signature(
@@ -829,8 +856,8 @@ def _minimize_mem(
     survivors    = Counter()
     n_unsupported = 0
     for sig, group in sig_map.items():
-        if sig == ('__UNSUPPORTED__',):
-            n_unsupported = len(group)
+        if _is_unsupported_sig(sig):
+            n_unsupported += len(group)
         best_rule, best_count = min(group, key=_group_key)
         survivors[best_rule] = best_count
 
@@ -886,8 +913,9 @@ def _minimize_disk(
     ---------------
     SHA-1 produces a 160-bit digest.  For 8 M rules the birthday-collision
     probability is ~(8e6)² / 2^161 ≈ 2.5 × 10⁻³⁵ — negligible in practice.
-    The ``__UNSUPPORTED__`` sentinel signature is hashed identically to all
-    other signatures; one representative survives as usual.
+    Rules with unsupported opcodes receive a unique sentinel
+    ``('__UNSUPPORTED__', rule_text)`` which joins to a unique string before
+    hashing, so every unsupported rule gets its own row — no false deduplication.
 
     SQLite version requirement
     --------------------------
@@ -1025,12 +1053,10 @@ def _minimize_disk(
 
         conn.close()
 
-        # n_unsupported: rows whose sig_hash matches the SHA-1 of '__UNSUPPORTED__'
-        _unsup_hash = hashlib.sha1(
-            '__UNSUPPORTED__'.encode('latin-1')
-        ).hexdigest()
-        # We can't count unsupported accurately post-upsert (only 1 row kept).
-        # Report 0 to keep the stats consistent with the memory path.
+        # n_unsupported: each unsupported rule gets a unique sig_hash
+        # ('__UNSUPPORTED__\x00' + rule_text), so ALL unsupported rules survive
+        # the upsert — no false deduplication.  We report 0 here because we'd
+        # need a second scan to count them accurately; the mem-path log covers it.
         _log_minimize_stats(n_total, survivors, n_sigs, n_unsupported=0)
         return survivors
 
@@ -3233,7 +3259,7 @@ class GeneticRuleEvolver:
             if raw_hits <= 0:
                 continue
             sig = self._get_sig(chain_str)
-            if sig == ('__UNSUPPORTED__',):
+            if _is_unsupported_sig(sig):
                 continue
             existing = self._sig_to_best.get(sig)
             if existing is None:
@@ -3267,7 +3293,7 @@ class GeneticRuleEvolver:
         if not self._sig_to_best:
             return False
         sig = self._get_sig(chain_str)
-        if sig == ('__UNSUPPORTED__',):
+        if _is_unsupported_sig(sig):
             return False
         return sig in self._sig_to_best
 
