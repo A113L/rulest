@@ -4587,49 +4587,13 @@ class GPUExtractor:
         all_counts = Counter()
         rules      = self.rules_gen.generate_gpu_compatible_rules()
 
-        if not self.gpu_engine.initialize_gpu(self.device_spec):
-            return all_counts
-
-        self.params = calculate_dynamic_parameters(
-            self.base_count, self.target_count,
-            self.gpu_engine.device,
-            self.params['TARGET_SECONDS'] / 3600,
-            bloom_mb_override=self.bloom_mb)
-        self.params['MAX_CHAIN_DEPTH'] = self.max_depth
-        self.gpu_engine.params = self.params
-
-        # ── Seed rules: split by depth ──────────────────────────────────────
-        # Single-rule seeds (no spaces) are injected into Phase 1 so they are
-        # tested as standalone extraction candidates — not only as chain
-        # building blocks.  Multi-rule chain seeds are forwarded to Phase 2
-        # unchanged (they are already run directly there via generate_informed_chains).
-        all_seeds    = self.load_seed_rules()
-        seed_singles = [s for s in all_seeds if ' ' not in s.strip()]
-        seed_chains  = [s for s in all_seeds if ' ' in  s.strip()]
-
-        # Merge seed singles into Phase 1 rule set (dedup while preserving order)
-        builtin_set  = set(rules)
-        extra_seeds  = [s for s in seed_singles if s not in builtin_set]
-        rules_phase1 = rules + extra_seeds          # Phase 1 rule list
-        if extra_seeds:
-            log_info(f"[SEED] {len(extra_seeds)} seed single-rule(s) added to Phase 1 "
-                     f"({len(seed_singles) - len(extra_seeds)} already in built-in set)")
-        if seed_chains and self.max_depth < 2:
-            log_warn(f"[SEED] {len(seed_chains)} chain seed(s) ignored — "
-                     f"requires --max-depth >= 2 to run Phase 2")
-        log_debug(f"Seed split: {len(seed_singles)} singles → Phase 1, "
-                  f"{len(seed_chains)} chains → Phase 2")
-        # ────────────────────────────────────────────────────────────────────
-
-        bloom_filter = self.gpu_engine.generate_bloom_filter(target_words)
-
-        # --- Phase 0: Token-Strip Rule Extraction (CPU-only, optional) -------
-        # Runs before Phase 1 so discovered rules can be injected into the
-        # Phase 1 atomic pool (single-rule discoveries) and Phase S seed
-        # families (multi-rule chains).
+        # ── Phase 0: Token-Strip Rule Extraction (CPU‑only, must run before GPU init) ──
         ts_rules_singles: List[str] = []
         ts_rules_chains:  List[str] = []
-        ts_sbd: Dict[int, set]      = defaultdict(set)    # for Phase S injection
+        ts_sbd: Dict[int, set]      = defaultdict(set)
+        ts_extra_singles: List[str] = []
+        builtin_set = set(rules)
+        all_seeds   = self.load_seed_rules()   # original seeds (may be empty)
 
         if self.token_strip:
             log_section("PHASE 0 — Token-Strip Rule Extraction")
@@ -4661,7 +4625,6 @@ class GPUExtractor:
                 enable_new_modes   = not self.token_strip_no_new_modes,
             )
 
-            # Split by depth
             for r in ts_all:
                 depth = len(r.split())
                 if depth == 1:
@@ -4669,7 +4632,7 @@ class GPUExtractor:
                 else:
                     ts_rules_chains.append(r)
                     if depth <= self.max_depth:
-                        ts_sbd[depth].add(r)       # schedule for Phase S injection
+                        ts_sbd[depth].add(r)
 
             _log_token_strip_stats(
                 len(target_words), ts_all, inject_sbd=self.builtin_seeds
@@ -4688,9 +4651,6 @@ class GPUExtractor:
                 )
 
             # ── Toggle-chain seeds ─────────────────────────────────────────────
-            # Generate T0..TN + leet combo chains for Phase 2 injection.
-            # These are NOT derived from stem lookups — they are deterministic
-            # structural seeds based on empirical evidence of T-chain effectiveness.
             if self.max_depth >= 2:
                 toggle_seeds = _generate_toggle_chain_seeds(self.max_depth)
                 n_toggle_new = 0
@@ -4707,82 +4667,66 @@ class GPUExtractor:
                         f"(T0..TN patterns + leet combos)  "
                         f"→ Phase S sbd + Phase 2 seeds"
                     )
-        # ── Debug dump — write all Phase 0 rules to a sidecar file ───────────
-        # Written only when --debug is active (VERBOSE=True).  The file is
-        # placed next to the main output file with a ".phase0.txt" suffix and
-        # contains every rule discovered by all extraction modes plus every
-        # toggle-chain seed, sorted by depth then alphabetically.
-        if VERBOSE and self.token_strip:
-            _all_p0 = sorted(
-                set(ts_rules_singles) | set(ts_rules_chains),
-                key=lambda r: (len(r.split()), r),
-            )
-            _p0_path = getattr(self, '_output_path', 'rulest_output.txt')
-            _p0_path = (_p0_path.rsplit('.', 1)[0] + '.phase0.txt'
-                        if '.' in _p0_path else _p0_path + '.phase0.txt')
-            try:
-                with open(_p0_path, 'w', encoding='utf-8') as _f:
-                    _f.write("# Phase 0 — Token-Strip Rule Extraction (debug dump)\n")
-                    _f.write(f"# Singles  : {len(ts_rules_singles)}\n")
-                    _f.write(f"# Chains   : {len(ts_rules_chains)}\n")
-                    _f.write(f"# Total    : {len(_all_p0)}\n")
-                    _f.write("#\n")
-                    _f.write("# Columns: depth  rule\n")
-                    _f.write("#\n")
-                    for _r in _all_p0:
-                        _f.write(f"{len(_r.split())}\t{_r}\n")
-                log_debug(
-                    f"[P0]   Debug dump written : {bold(_p0_path)}  "
-                    f"({len(_all_p0)} rules)"
-                )
-            except OSError as _e:
-                log_debug(f"[P0]   Debug dump failed : {_e}")
 
-        # ── Merge Phase 0 single-rules into Phase 1 atomic pool ───────────────
-        # Single-rule seeds from token-strip are merged with any user seed
-        # singles; duplicates vs built-in set are dropped.
-        ts_extra_singles = [r for r in ts_rules_singles if r not in builtin_set]
-        rules_phase1     = rules_phase1 + ts_extra_singles
-        if ts_extra_singles:
-            log_debug(
-                f"Phase 0: {len(ts_extra_singles)} new single-rule(s) added to Phase 1"
-            )
-        # ── Phase 0 chains also forwarded to Phase 2 as seed chains ──────────
-        # They are appended to all_seeds so generate_informed_chains picks them up.
-        if ts_rules_chains:
-            all_seeds = list(all_seeds) + ts_rules_chains
-            log_debug(
-                f"Phase 0: {len(ts_rules_chains)} chain(s) forwarded to Phase 2"
-            )
+            # Merge Phase 0 single‑rules into Phase 1 atomic pool
+            ts_extra_singles = [r for r in ts_rules_singles if r not in builtin_set]
+
+            # Phase 0 chains also forwarded to Phase 2 as seed chains
+            if ts_rules_chains:
+                all_seeds = list(all_seeds) + ts_rules_chains
+
         # ─────────────────────────────────────────────────────────────────────
+        # NOW initialise GPU and continue with phases 1, S, 2, 3 ...
+        # ─────────────────────────────────────────────────────────────────────
+        if not self.gpu_engine.initialize_gpu(self.device_spec):
+            return all_counts
+
+        # Recompute params now that we have a real GPU device
+        self.params = calculate_dynamic_parameters(
+            self.base_count, self.target_count,
+            self.gpu_engine.device,
+            self.params['TARGET_SECONDS'] / 3600,
+            bloom_mb_override=self.bloom_mb)
+        self.params['MAX_CHAIN_DEPTH'] = self.max_depth
+        self.gpu_engine.params = self.params
+
+        # Merge Phase 0 single-rules into Phase 1 atomic pool
+        extra_seeds = [s for s in all_seeds if ' ' not in s.strip()]
+        extra_seeds_valid = [s for s in extra_seeds if s not in builtin_set]
+        rules_phase1 = rules + ts_extra_singles + extra_seeds_valid
+
+        seed_chains = [s for s in all_seeds if ' ' in s.strip()]
+
+        if extra_seeds_valid:
+            log_info(f"[SEED] {len(extra_seeds_valid)} seed single-rule(s) added to Phase 1 "
+                     f"({len(extra_seeds) - len(extra_seeds_valid)} already in built-in set)")
+        if seed_chains and self.max_depth < 2:
+            log_warn(f"[SEED] {len(seed_chains)} chain seed(s) ignored — "
+                     f"requires --max-depth >= 2 to run Phase 2")
+        log_debug(f"Seed split: {len(extra_seeds_valid)} singles → Phase 1, "
+                  f"{len(seed_chains)} chains → Phase 2")
+
+        bloom_filter = self.gpu_engine.generate_bloom_filter(target_words)
 
         # --- Phase 1: single rules + seed singles ---
         log_section("PHASE 1 — Single Rule Search")
-        seed_note = f"  ({len(extra_seeds)} from seeds)" if extra_seeds else ""
+        seed_note = f"  ({len(extra_seeds_valid)} from seeds)" if extra_seeds_valid else ""
         log_info(f"[P1]   {len(base_words):,} base words × "
                  f"{len(rules_phase1):,} atomic rules{seed_note}")
-        t0     = time.time()
+        t0 = time.time()
         single = self.gpu_engine.process_all_words_single_rule(
             base_words, rules_phase1, bloom_filter)
-        t1     = time.time()
+        t1 = time.time()
         all_counts.update(single)
         log_debug(f"Phase 1 elapsed: {t1-t0:.1f}s")
 
         # --- Phase S: Numeric Seed Extraction (controlled by --no-builtin-seeds) ---
-        # Build the numeric seed families and run them as a *dedicated direct
-        # extraction pass* — independent of --max-depth and the random-chain
-        # time budget.  Seeds up to depth 4 are always tested (depth-1 seeds
-        # are skipped here since Phase 1 already covered them).
-        # The prebuilt sbd is kept locally for reference but is not forwarded
-        # to Phase 2 — seeds are never used as scaffolding in chain generation.
-        seed_hits = Counter()   # will be passed to Phase 3 GA
+        seed_hits = Counter()
         if self.builtin_seeds:
             log_section("PHASE S — Seed Extraction (numeric + special-char families A–M)")
             sbd = self.gpu_engine.build_numeric_seed_families(max_depth=self.max_depth)
 
             # ── Phase 0 → Phase S injection ───────────────────────────────────
-            # Add token-strip chains into the sbd pool so they receive the same
-            # full GPU coverage sweep as families A–M at no extra GPU cost.
             if ts_sbd:
                 n_injected = 0
                 for depth, chains in ts_sbd.items():
@@ -4794,36 +4738,30 @@ class GPUExtractor:
                         f"[PS]   Phase 0 injected {bold(cyan(str(n_injected)))} "
                         f"chain(s) into Phase S sbd"
                     )
-            # ─────────────────────────────────────────────────────────────────
 
             seed_hits = self.gpu_engine.run_seed_extraction_pass(
                 base_words, sbd, bloom_filter, rules_phase1)
             all_counts.update(seed_hits)
-            ts     = time.time()
+            ts = time.time()
             log_debug(f"Seed pass elapsed: {ts-t1:.1f}s")
         else:
             log_info(f"[PS]   {yellow('Skipped')} — built-in numeric seed families disabled "
                      f"(--no-builtin-seeds)")
             sbd = {}
-            ts  = t1
+            ts = t1
 
         # --- Phase 2: random rule chains ---
-        # Phase 2 chains are built purely from atomic rules (Phase 1 output).
-        # Seeds are not used as scaffolding or building blocks here.
-        #
-        # If Phase 3 GA is enabled, we reserve a dedicated time budget for it
-        # (20 % of TARGET_SECONDS, minimum 120 s) so that GA always gets a
-        # meaningful run rather than consuming only leftover scraps.
-        if self.genetic and self.max_depth >= 2:
-            _min_ga_secs    = 120.0
-            _ga_frac        = 0.20
-            _reserved_for_ga = max(_min_ga_secs,
-                                   self.params['TARGET_SECONDS'] * _ga_frac)
-        else:
-            _reserved_for_ga = 0.0
-
         if self.max_depth > 1:
             log_section("PHASE 2 — Rule Chain Search")
+            # Reserve time for GA if enabled
+            if self.genetic and self.max_depth >= 2:
+                _min_ga_secs    = 120.0
+                _ga_frac        = 0.20
+                _reserved_for_ga = max(_min_ga_secs,
+                                       self.params['TARGET_SECONDS'] * _ga_frac)
+            else:
+                _reserved_for_ga = 0.0
+
             remaining = max(0, self.params['TARGET_SECONDS'] - (ts-t0) - _reserved_for_ga)
             budget    = remaining * self.params['EST_COMBOS_PER_SEC'] * TIME_SAFETY_FACTOR
             depths    = list(range(2, self.max_depth+1))
@@ -4854,7 +4792,7 @@ class GPUExtractor:
 
             chains = self.gpu_engine.process_all_words_chain_rules(
                 base_words, rules_phase1, self.max_depth, bloom_filter, single,
-                seed_chains=all_seeds, prebuilt_sbd=sbd)
+                seed_chains=seed_chains, prebuilt_sbd=sbd)
             all_counts.update(chains)
             log_debug(f"Phase 2 elapsed: {time.time()-ts:.1f}s")
 
@@ -4863,8 +4801,6 @@ class GPUExtractor:
             log_section("PHASE 3 — Genetic Algorithm Rule Evolution")
 
             # Build the rule pool from Phase-1 validated rules.
-            # We use only the rules that the GPU validator accepts so that
-            # every individual in the population is always a legal chain.
             rule_pool = HashcatRuleValidator.validate_rules_for_gpu(rules_phase1)
 
             # Seed the GA with the hottest Phase-1 hits (most bloom hits first).
@@ -4875,11 +4811,17 @@ class GPUExtractor:
             ]
 
             # Time remaining: use the dedicated GA reservation first, then
-            # any unconsumed Phase-2 budget.
+            # any unconsumed Phase-2 time.
             t_now     = time.time()
-            # Effective GA budget = reserved portion + any unused Phase-2 time
             elapsed_p12s = t_now - t0
             remaining = max(0.0, self.params['TARGET_SECONDS'] - elapsed_p12s)
+            if self.genetic and self.max_depth >= 2:
+                _min_ga_secs    = 120.0
+                _ga_frac        = 0.20
+                _reserved_for_ga = max(_min_ga_secs,
+                                       self.params['TARGET_SECONDS'] * _ga_frac)
+            else:
+                _reserved_for_ga = 0.0
             ga_budget = max(remaining, _reserved_for_ga)
 
             if ga_budget < 5.0:
@@ -4896,7 +4838,6 @@ class GPUExtractor:
                 )
 
             # Pass all rules already discovered (Phase 1 + Phase S + Phase 2)
-            # so the GA can compute novelty-weighted fitness.
             known_rules_set = set(all_counts.keys())
 
             evolver = GeneticRuleEvolver(
@@ -4907,7 +4848,7 @@ class GPUExtractor:
                 pop_size          = self.genetic_pop,
                 elite_frac        = self.genetic_elite,
                 seed_hits         = seed_hits,
-                known_rules       = known_rules_set,  # v2: novelty-aware fitness
+                known_rules       = known_rules_set,
             )
 
             ga_hits = evolver.evolve(
@@ -4930,6 +4871,7 @@ class GPUExtractor:
                              if HashcatRuleValidator.validate_rule_for_gpu(r)})
         log_debug(f"Post-validation: {len(validated)} rules from {len(all_counts)} raw")
         return validated
+
 
 # --------------------------------------------------------------------
 # Wordlist loader
