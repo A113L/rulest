@@ -229,6 +229,7 @@ from typing import Dict, Set, Tuple, Optional, List, Iterator
 import gc
 import datetime
 import multiprocessing as mp
+import threading
 
 # ================== GLOBAL FLAGS ===================
 VERBOSE            = False   # set by --debug
@@ -2728,6 +2729,12 @@ class GPUEngine:
             log_error(f"GPU init failed: {e}"); return False
 
     def compile_kernel(self):
+        """
+        Compile the OpenCL kernels.  Both cl.Program() and build() are run
+        on a background thread so the main thread can print a progress ticker
+        immediately — on some NVIDIA drivers the Program constructor itself
+        blocks before build() is even called.
+        """
         try:
             src = GPU_KERNEL_TEMPLATE.format(
                 BLOOM_FILTER_SIZE          = self.params['BLOOM_FILTER_SIZE'],
@@ -2739,9 +2746,33 @@ class GPUEngine:
                 MAX_OUTPUT_LEN             = MAX_OUTPUT_LEN,
                 BLOOM_HASH_FUNCTIONS       = BLOOM_HASH_FUNCTIONS,
             )
-            self.program       = cl.Program(self.context, src).build()
-            self.kernel_single = self.program.find_single_rules_gpu
-            self.kernel_chain  = self.program.find_rule_chains_gpu
+            context = self.context
+            result: list = [None]   # [program | Exception]
+
+            def _build():
+                try:
+                    prog = cl.Program(context, src)
+                    prog.build()
+                    result[0] = prog
+                except Exception as exc:
+                    result[0] = exc
+
+            t = threading.Thread(target=_build, daemon=True)
+            t.start()
+            print("[GPU]  Compiling OpenCL kernel ", end='', flush=True)
+            while t.is_alive():
+                t.join(timeout=10)
+                if t.is_alive():
+                    print('.', end='', flush=True)
+            print(" done", flush=True)
+
+            if isinstance(result[0], Exception):
+                raise result[0]
+
+            prog = result[0]
+            self.program       = prog
+            self.kernel_single = prog.find_single_rules_gpu
+            self.kernel_chain  = prog.find_rule_chains_gpu
             log_debug("OpenCL kernel compiled successfully")
             return self.program
         except Exception as e:
