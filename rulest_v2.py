@@ -3,7 +3,7 @@
 rulest — GPU-Compatible Hashcat Rules Engine
 =============================================
 Extracts hashcat rules/chains by comparing a base wordlist against a target
-wordlist.  GPU bloom filter screening (Phase 1: single rules, Phase 2: chains)
+wordlist.  GPU bloom filter screening (STAGE 1: single rules, STAGE 2: chains)
 is followed by signature-based functional minimization.
 
 Key feature: built-in probe set for functional minimisation.
@@ -41,7 +41,7 @@ Key feature: built-in probe set for functional minimisation.
   Both paths apply the same tie-breaking: highest GPU count → shortest
   chain depth → lexicographic rule order.
 
-Phase S — Built-in Seed Families (A–M)
+STAGE S — Built-in Seed Families (A–M)
   Thirteen seed families are always tested via a dedicated GPU chain-kernel
   pass, independent of the random-chain time budget (unless --no-builtin-seeds).
 
@@ -77,7 +77,7 @@ Phase S — Built-in Seed Families (A–M)
   Special chars — top-15 (F/G/H):  ! @ # $ % ^ & * ? . - _ + ( )
   Special chars — core-7  (I/L):   ! @ # $ % * ?
 
-Phase 0 — Token-Strip Rule Extraction  (--token-strip)
+STAGE 0 — Token-Strip Rule Extraction  (--token-strip)
   An optional CPU-only pre-pass that extracts rules empirically by
   decomposing target passwords into their constituent token categories
   and building hashcat rule chains that reconstruct each password from
@@ -109,53 +109,53 @@ Phase 0 — Token-Strip Rule Extraction  (--token-strip)
     Detects passwords built by duplicating ('d': stem+stem) or folding
     ('f': stem+reverse(stem)) a base-wordlist word.
 
-  Toggle-chain seeds (separate, direct injection into Phase 2)
+  Toggle-chain seeds (separate, direct injection into STAGE 2)
   ─────────────────────────────────────────────────────────────
   Deterministic T0..TN chains (sequential, even-position, odd-position)
   combined with every core leet op are generated independently of stem
-  lookups and injected directly into Phase S sbd + Phase 2 seed pool.
+  lookups and injected directly into STAGE S sbd + STAGE 2 seed pool.
   Captures high-frequency patterns observed in practice:
     "T0 T1 T2 T3 T4 T5 T6 T7 se3"  →  mixed-case + e→3 on 8-char words
     "T0 T2 T4 T6 sa@"               →  alternating toggle + a→@
 
-  Phase S injection
+  STAGE S injection
   ─────────────────
-  All Phase 0 chains (from all modes) are injected into the Phase S
+  All STAGE 0 chains (from all modes) are injected into the STAGE S
   seed-by-depth (sbd) pool before the GPU sweep.  Depth slots not present
   in sbd (e.g. depth 10 with --max-depth 10) are created automatically.
 
-  Single-rule discoveries are merged into the Phase 1 atomic-rule pool;
-  multi-rule chains are forwarded to Phase 2 as seed chains.
+  Single-rule discoveries are merged into the STAGE 1 atomic-rule pool;
+  multi-rule chains are forwarded to STAGE 2 as seed chains.
 
   CLI flags
   ─────────
-    --token-strip                 Enable Phase 0 (default: disabled)
+    --token-strip                 Enable STAGE 0 (default: disabled)
     --token-strip-min-stem N      Minimum stem length (default: 4)
     --token-strip-max-prefix N    Max boundary prefix/suffix length (default: 4)
     --token-strip-min-leet-amb N  Max ambiguous leet positions per word
                                   (default: 3; limits branching for '1')
 
-Phase 3 — Genetic Algorithm Rule Evolution  (--genetic)
-  An optional evolutionary search that runs after Phase 2 and complements
+STAGE 3 — Genetic Algorithm Rule Evolution  (--genetic)
+  An optional evolutionary search that runs after STAGE 2 and complements
   random chain sampling with guided, coverage-driven optimisation.
 
   Why it fits this project
   ────────────────────────
   • The fitness function (bloom-filter hits) is already computed by the
     existing GPU chain kernel — no new GPU code is required.
-  • Phase 2 samples chains *uniformly at random* from the atomic-rule pool.
+  • STAGE 2 samples chains *uniformly at random* from the atomic-rule pool.
     For depth ≥ 3 the search space is |pool|^depth (millions of candidates);
     the GA focuses probability mass on high-hit-rate regions of that space.
-  • Hot atomic rules from Phase 1 seed the initial population, giving the GA
+  • Hot atomic rules from STAGE 1 seed the initial population, giving the GA
     a strong head start rather than searching from scratch.
   • **Improvement (v2)**: the original 40 % purely random portion of the
-    initial population is now replaced by high-hit chains from Phase S
+    initial population is now replaced by high-hit chains from STAGE S
     (families A–M) when builtin seeds are enabled. This dramatically
     improves starting coverage while gracefully falling back to random
     when --no-builtin-seeds is used.
-  • **Improvement (v2)**: three key fixes make Phase 3 produce genuinely
-    new rules rather than rediscovering Phase 2 results:
-      1. Novelty-weighted fitness — chains NOT already found by Phase 1/S/2
+  • **Improvement (v2)**: three key fixes make STAGE 3 produce genuinely
+    new rules rather than rediscovering STAGE 2 results:
+      1. Novelty-weighted fitness — chains NOT already found by STAGE 1/S/2
          receive a 2× fitness bonus so the GA is driven toward new territory
          rather than cycling through already-known high-scorers.
       2. Unexplored-seed initial population — the 40 % Phase-S fill slot
@@ -163,19 +163,19 @@ Phase 3 — Genetic Algorithm Rule Evolution  (--genetic)
          as fallback.  Depth-3+ chains are also biased (70 % probability)
          in the seeded and fill portions when max_depth ≥ 3.
       3. Dedicated time budget — 20 % of --target-hours (min 120 s) is
-         reserved for Phase 3 instead of relying on leftover scraps after
-         Phase 1+S+2.  This guarantees the GA actually runs.
+         reserved for STAGE 3 instead of relying on leftover scraps after
+         STAGE 1+S+2.  This guarantees the GA actually runs.
   • Stagnation detection — if the best fitness score does not improve for
     5 consecutive generations, the bottom 30 % of the population is replaced
     with fresh random chains, preventing premature convergence.
   • All Phase-3 discoveries are merged into the global hit counter before
     signature-based minimisation, so they benefit from the same deduplication
-    and sorting as Phase 1 and Phase 2 results.
+    and sorting as STAGE 1 and STAGE 2 results.
 
   Algorithm summary
   ─────────────────
-  1. Initial population — 30 % depth-2 hot-rule combos (Phase 1),
-     30 % seeded deeper chains (Phase 1 hot + random, depth-3+ biased),
+  1. Initial population — 30 % depth-2 hot-rule combos (STAGE 1),
+     30 % seeded deeper chains (STAGE 1 hot + random, depth-3+ biased),
      40 % unexplored Phase-S chains (NOT in known_rules, novel-first)
      — ensures both exploitation and exploration with far better
      starting coverage when seeds are active.
@@ -204,7 +204,7 @@ Phase 3 — Genetic Algorithm Rule Evolution  (--genetic)
 
   CLI flags
   ─────────
-    --genetic                   Enable Phase 3 (default: disabled)
+    --genetic                   Enable STAGE 3 (default: disabled)
     --genetic-generations N     Max generations (default: 50)
     --genetic-pop N             Population size (default: 200)
     --genetic-elite F           Elite fraction, e.g. 0.15 (default: 0.15)
@@ -374,8 +374,8 @@ LEET_SUBS: List[Tuple[str, str]] = [
 # Pre-built hashcat rule strings derived from LEET_SUBS (e.g. "sa@").
 LEET_OPS: List[str] = [f's{orig}{rep}' for orig, rep in LEET_SUBS]
 
-# ── Token-Strip constants (Phase 0) ──────────────────────────────────────────
-# Leet decode table used in Phase 0 to reverse substitutions found in target
+# ── Token-Strip constants (STAGE 0) ──────────────────────────────────────────
+# Leet decode table used in STAGE 0 to reverse substitutions found in target
 # passwords.  Each entry is (encoded_char, base_char, hashcat_sub_rule).
 # Multiple entries may share the same encoded_char (e.g. '1' → 'i' or 'l').
 TOKEN_STRIP_LEET_TABLE: List[Tuple[str, str, str]] = [
@@ -410,7 +410,7 @@ TOKEN_STRIP_ALPHA_BOUNDARY: Set[str] = (
     set(string.ascii_letters) | set('!@#$%^&*?.-_+()')
 )
 
-# ── Phase 0 multiprocessing worker globals ───────────────────────────────────
+# ── STAGE 0 multiprocessing worker globals ───────────────────────────────────
 # Set before Pool() creation so forked workers inherit via CoW (zero-copy).
 # On Windows/macOS-spawn, _worker_init_p0 re-assigns them from initargs.
 _p0_worker_base_set:       Set[str]                       = set()
@@ -1080,7 +1080,7 @@ def _log_minimize_stats(
     )
 
 # ====================================================================
-# --- PHASE 0 — TOKEN-STRIP RULE EXTRACTION ---
+# --- STAGE 0 — TOKEN-STRIP RULE EXTRACTION ---
 # ====================================================================
 
 def _hashcat_title_case(s: str) -> str:
@@ -1543,7 +1543,7 @@ def _extract_delete_edge_mode(
 
 
 # ====================================================================
-# --- PHASE 0 NEW EXTRACTION MODES (v1.1 — ported from stripper.py) ---
+# --- STAGE 0 NEW EXTRACTION MODES (v1.1 — ported from stripper.py) ---
 # ====================================================================
 
 def _extract_insert_mode(
@@ -1888,7 +1888,7 @@ def _extract_separator_title_mode(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Phase 0 multiprocessing infrastructure
+# STAGE 0 multiprocessing infrastructure
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _worker_init_p0(
@@ -1896,7 +1896,7 @@ def _worker_init_p0(
     purge_idx=None, substr_idx=None, omit_idx=None,
     prefix_idx=None, ascii_idx=None,
 ) -> None:
-    """Pool initialiser for Phase 0 workers.
+    """Pool initialiser for STAGE 0 workers.
     With fork, globals are inherited via CoW — all args are None.
     With spawn (Windows / macOS), they must be passed explicitly.
     """
@@ -1914,7 +1914,7 @@ def _worker_init_p0(
 
 
 def _process_chunk_p0(args: Tuple) -> Set[str]:
-    """Worker function — process one chunk of target words for Phase 0.
+    """Worker function — process one chunk of target words for STAGE 0.
     Returns the set of discovered rule chains for the chunk.
     """
     (words_chunk, max_depth, min_stem_len, max_leet_amb,
@@ -2014,12 +2014,12 @@ def _process_chunk_p0(args: Tuple) -> Set[str]:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Toggle-chain seed generator (T0..TN patterns for Phase 2 injection)
+# Toggle-chain seed generator (T0..TN patterns for STAGE 2 injection)
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _generate_toggle_chain_seeds(max_depth: int) -> List[str]:
     """
-    Generate T-position toggle chains for direct injection into Phase 2 as
+    Generate T-position toggle chains for direct injection into STAGE 2 as
     seed chains.  These are NOT derived from stem lookups — they are
     deterministic patterns that the empirical evidence shows produce large
     numbers of Phase-2 hits when used as seed scaffolding.
@@ -2112,7 +2112,7 @@ def extract_token_strip_rules(
     enable_new_modes:   bool = True,
 ) -> List[str]:
     """
-    Phase 0 — Token-Strip rule extraction (multiprocessing, 14 modes).
+    STAGE 0 — Token-Strip rule extraction (multiprocessing, 14 modes).
 
     Original five modes
     ───────────────────
@@ -2168,7 +2168,7 @@ def extract_token_strip_rules(
 
     # ── Build inverted indexes once in main process ──────────────────────────
     # Workers inherit them via CoW fork (zero copy) on Linux/macOS.
-    log_debug("[P0]   Building lookup indexes …")
+    log_debug("[S0]    Building lookup indexes …")
     base_by_len:    Dict[int, Set[str]]            = defaultdict(set)
     base_lower_idx: Dict[str, Set[str]]            = defaultdict(set)
     purge_idx:      Dict[str, Set[str]]            = defaultdict(set)
@@ -2218,7 +2218,7 @@ def extract_token_strip_rules(
     omit_idx       = dict(omit_idx)
     prefix_idx     = dict(prefix_idx)
     ascii_idx      = dict(ascii_idx)
-    log_debug(f"[P0]   Indexes built  purge:{len(purge_idx)}  "
+    log_debug(f"[S0]    Indexes built  purge:{len(purge_idx)}  "
               f"substr:{len(substr_idx)}  omit:{len(omit_idx)}  "
               f"prefix:{len(prefix_idx)}  ascii:{len(ascii_idx)}")
 
@@ -2246,7 +2246,7 @@ def extract_token_strip_rules(
 
     mode_label = green('14 modes') if enable_new_modes else yellow('5 modes')
     log_info(
-        f"[P0]   Workers: {bold(str(n_workers))}  |  "
+        f"[S0]    Workers: {bold(str(n_workers))}  |  "
         f"chunks: {bold(str(n_chunks))} × ~{chunk_size}  |  "
         f"{mode_label}"
     )
@@ -2269,7 +2269,7 @@ def extract_token_strip_rules(
     with ctx.Pool(**pool_kw) as pool:
         with tqdm(
             total      = n_words,
-            desc       = green("  Phase 0 "),
+            desc       = green("  STAGE 0 "),
             unit       = "word",
             ncols      = 88,
             bar_format = "{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}",
@@ -2290,9 +2290,9 @@ def _log_token_strip_stats(
     rules:       List[str],
     inject_sbd:  bool,
 ) -> None:
-    """Print Phase 0 summary statistics with per-mode rule prefix breakdown."""
+    """Print STAGE 0 summary statistics with per-mode rule prefix breakdown."""
     if not rules:
-        log_info(f"[P0]   {yellow('0')} rules extracted by token-strip "
+        log_info(f"[S0]    {yellow('0')} rules extracted by token-strip "
                  f"({n_words:,} target words scanned)")
         return
 
@@ -2345,14 +2345,14 @@ def _log_token_strip_stats(
             mode_counts['letter']      += 1
 
     depth_summary = '  '.join(f"d{d}:{depth_dist[d]:,}" for d in sorted(depth_dist))
-    inj = green('injected into Phase S sbd') if inject_sbd else dim('Phase S inactive')
+    inj = green('injected into STAGE S sbd') if inject_sbd else dim('STAGE S inactive')
     mode_str = '  '.join(f"{k}:{v}" for k, v in sorted(mode_counts.items()) if v)
     log_info(
-        f"[P0]   {bold(green(str(len(rules))))} rules extracted by token-strip"
+        f"[S0]    {bold(green(str(len(rules))))} rules extracted by token-strip"
         f"  ({depth_summary})  → {inj}"
     )
     if mode_str:
-        log_info(f"[P0]   Mode breakdown  : {dim(mode_str)}")
+        log_info(f"[S0]    Mode breakdown  : {dim(mode_str)}")
 
 
 # --------------------------------------------------------------------
@@ -2699,7 +2699,7 @@ class GPUEngine:
         self.kernel_single       = None
         self.kernel_chain        = None
         self._consecutive_errors = 0      # consecutive batch failures — triggers graceful exit
-        self._MAX_CONSECUTIVE_ERRORS = 5  # give up GPU phase after this many in a row
+        self._MAX_CONSECUTIVE_ERRORS = 5  # give up GPU STAGE after this many in a row
 
     def get_free_vram(self):      return estimate_free_vram(self.device)
     def get_max_allocation(self): return get_max_allocation(self.device)
@@ -2795,7 +2795,7 @@ class GPUEngine:
         without recomputing it.
 
         Returns True if recovery succeeded, False if it failed (caller should
-        then abort the GPU phase gracefully).
+        then abort the GPU STAGE gracefully).
         """
         log_warn(f"[GPU] Fatal kernel error: {error}  — attempting full context reset")
         # ── tear down ──────────────────────────────────────────────────────
@@ -2889,19 +2889,19 @@ class GPUEngine:
                     rules_flat=rf, rule_offsets=ro, rule_lengths=rl,
                     num_words=len(words), num_rules=len(rules))
 
-    # ---------------------------------------------------------------- Phase 1
+    # ---------------------------------------------------------------- STAGE 1
     def process_all_words_single_rule(self, base_words, rules, bloom_filter):
         self.upload_bloom_filter(bloom_filter)
         if not self.compile_kernel(): return Counter()
         self.gpu_rules  = HashcatRuleValidator.validate_rules_for_gpu(rules)
         self.rule_index = {r: i for i, r in enumerate(self.gpu_rules)}
-        log_debug(f"Phase 1: {len(base_words):,} words × {len(self.gpu_rules):,} rules")
+        log_debug(f"STAGE 1: {len(base_words):,} words × {len(self.gpu_rules):,} rules")
 
         counter = Counter()
         bs      = self.params['WORDS_PER_BATCH']
 
         with tqdm(total=len(base_words),
-                  desc=green("  Phase 1 "),
+                  desc=green("  STAGE 1 "),
                   unit="word",
                   ncols=88,
                   bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}",
@@ -2920,7 +2920,7 @@ class GPUEngine:
                         self._consecutive_errors += 1
                         if self._consecutive_errors >= self._MAX_CONSECUTIVE_ERRORS:
                             log_warn(f"[GPU] {self._consecutive_errors} consecutive failures — "
-                                     f"aborting Phase 1 gracefully")
+                                     f"aborting STAGE 1 gracefully")
                             break
                 pbar.update(len(batch))
                 # Use _safe_queue_finish — never let an unprotected queue.finish()
@@ -2929,13 +2929,13 @@ class GPUEngine:
                     self._consecutive_errors += 1
                     if self._consecutive_errors >= self._MAX_CONSECUTIVE_ERRORS:
                         log_warn("[GPU] queue.finish() repeatedly failing — "
-                                 "aborting Phase 1 gracefully")
+                                 "aborting STAGE 1 gracefully")
                         break
                 else:
                     gc.collect()
 
-        log_info(f"[P1]   {bold(green(str(len(counter))))} unique rules passed bloom filter")
-        log_debug(f"Phase 1 complete: {len(counter)} rules in counter")
+        log_info(f"[S1]    {bold(green(str(len(counter))))} unique rules passed bloom filter")
+        log_debug(f"STAGE 1 complete: {len(counter)} rules in counter")
         return counter
 
     def _run_single_kernel(self, bd):
@@ -2979,7 +2979,7 @@ class GPUEngine:
                 try: b.release()
                 except: pass
 
-    # ---------------------------------------------------------------- Phase 2
+    # ---------------------------------------------------------------- STAGE 2
     def _gen_random_chains(self, depth, count, valid, hot, existing, new_set):
         gen = set(); max_att = count * MAX_ATTEMPTS_MULTIPLIER
         hot_budget = int(count * HOT_RULE_RATIO) if hot else 0
@@ -3000,7 +3000,7 @@ class GPUEngine:
 
     def build_numeric_seed_families(self, max_depth: int = 4) -> dict:
         """
-        Build nine seed families for Phase S direct extraction.
+        Build nine seed families for STAGE S direct extraction.
 
         Every family produces chains that are tested against the bloom filter
         individually via the GPU chain kernel — they are extraction candidates
@@ -3485,14 +3485,14 @@ class GPUEngine:
         chain-building atoms.
 
         Depth-1 seeds are single rules (e.g. "^5") that are already covered
-        by Phase 1; they are skipped here to avoid double-counting.
+        by STAGE 1; they are skipped here to avoid double-counting.
         Depth >= 2 seeds (e.g. "^1 ^2", "$3 $1 $4") are always run here,
         independent of --max-depth and the random-chain time budget.
 
-        The method ensures self.rule_index is populated (reuses Phase 1's
-        index) and runs the chain kernel in the same batches used by Phase 2.
+        The method ensures self.rule_index is populated (reuses STAGE 1's
+        index) and runs the chain kernel in the same batches used by STAGE 2.
         """
-        # Ensure kernel + bloom filter are ready (Phase 1 sets these up)
+        # Ensure kernel + bloom filter are ready (STAGE 1 sets these up)
         if self.bloom_buf is None:
             self.upload_bloom_filter(bloom_filter)
         if not self.program:
@@ -3501,18 +3501,18 @@ class GPUEngine:
             self.gpu_rules  = HashcatRuleValidator.validate_rules_for_gpu(phase1_rules)
             self.rule_index = {r: i for i, r in enumerate(self.gpu_rules)}
 
-        # Collect only depth >= 2 seeds (depth-1 already done in Phase 1)
+        # Collect only depth >= 2 seeds (depth-1 already done in STAGE 1)
         multi_seeds: List[str] = []
         for depth, chains in sorted(sbd.items()):
             if depth >= 2:
                 multi_seeds.extend(chains)
 
         if not multi_seeds:
-            log_info("[PS]   No multi-depth seeds to test (max_seed_depth=1 or none generated)")
+            log_info("[SEED]    No multi-depth seeds to test (max_seed_depth=1 or none generated)")
             return Counter()
 
         total = sum(len(v) for d, v in sbd.items() if d >= 2)
-        log_info(f"[PS]   Numeric seed pass: {total:,} chains across "
+        log_info(f"[SEED]    Numeric seed pass: {total:,} chains across "
                  f"{sum(1 for d in sbd if d >= 2)} depth(s)")
 
         counter = Counter()
@@ -3548,22 +3548,22 @@ class GPUEngine:
                 pbar.update(1)
                 pbar.set_postfix({"hits": cyan(str(len(counter)))}, refresh=False)
 
-        log_info(f"[PS]   {bold(green(str(len(counter))))} unique seed chains passed bloom filter")
+        log_info(f"[SEED]    {bold(green(str(len(counter))))} unique seed chains passed bloom filter")
         log_debug(f"Seed extraction pass complete: {len(counter)} hits")
         return counter
 
     def generate_informed_chains(self, rules, single_found, max_depth,
                                    seed_chains=None, prebuilt_sbd=None):
         """
-        Generate random chain candidates for Phase 2.
+        Generate random chain candidates for STAGE 2.
 
-        Chains are built entirely from atomic rules discovered in Phase 1
+        Chains are built entirely from atomic rules discovered in STAGE 1
         (valid / hot).  Seeds play no role here:
-          - Built-in seed families (A–E) are tested in Phase S only and are
+          - Built-in seed families (A–E) are tested in STAGE S only and are
             never used as scaffolding or candidates in this phase.
           - User-supplied single-rule seeds are already present in *valid*.
           - User-supplied multi-rule seed chains are injected as direct
-            Phase 2 candidates but are NOT used as building blocks for
+            STAGE 2 candidates but are NOT used as building blocks for
             further chain extension.
 
         *prebuilt_sbd* is accepted for signature compatibility but ignored.
@@ -3574,7 +3574,7 @@ class GPUEngine:
         if not valid: return []
         found_s = set(single_found.keys()) if single_found else set()
         hot     = [r for r in valid if r in found_s]
-        # Phase 2 candidate set — starts with atomic rules only.
+        # STAGE 2 candidate set — starts with atomic rules only.
         chains  = set(valid)
 
         # ── User-supplied multi-rule seed chains (direct candidates only) ─────
@@ -3588,7 +3588,7 @@ class GPUEngine:
                     chains.add(sc)
                     n_user_direct += 1
             if n_user_direct:
-                log_debug(f"User seed chains injected as Phase 2 candidates: "
+                log_debug(f"User seed chains injected as STAGE 2 candidates: "
                           f"{n_user_direct}")
 
         # ── Random chain extension (atomic rules only) ────────────────────────
@@ -3601,7 +3601,7 @@ class GPUEngine:
             chains.update(new)
             log_debug(f"Depth {depth}: budget={budget:,}, generated={len(new):,}")
 
-        log_debug(f"Total Phase 2 candidates: {len(chains):,}  "
+        log_debug(f"Total STAGE 2 candidates: {len(chains):,}  "
                   f"(atomic rules + user chains + random extensions)")
         return list(chains)
 
@@ -3618,7 +3618,7 @@ class GPUEngine:
                                                     prebuilt_sbd=prebuilt_sbd)
         if not chains: return Counter()
 
-        log_debug(f"Phase 2: {len(chains):,} chains × {len(base_words):,} words")
+        log_debug(f"STAGE 2: {len(chains):,} chains × {len(base_words):,} words")
 
         counter = Counter()
         cbs     = self.params['CHAINS_PER_BATCH']
@@ -3626,7 +3626,7 @@ class GPUEngine:
         n_batches = (len(chains)+cbs-1)//cbs
 
         with tqdm(total=n_batches,
-                  desc=green("  Phase 2 "),
+                  desc=green("  STAGE 2 "),
                   unit="batch",
                   ncols=88,
                   bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}",
@@ -3648,15 +3648,15 @@ class GPUEngine:
 
                 if self._consecutive_errors >= self._MAX_CONSECUTIVE_ERRORS:
                     log_warn(f"[GPU] {self._consecutive_errors} consecutive failures — "
-                             "aborting Phase 2 gracefully")
+                             "aborting STAGE 2 gracefully")
                     break
 
                 pbar.update(1)
                 pbar.set_postfix({"rules": cyan(str(len(counter)))}, refresh=False)
                 gc.collect()
 
-        log_info(f"[P2]   {bold(green(str(len(counter))))} unique chain rules passed bloom filter")
-        log_debug(f"Phase 2 complete: {len(counter)} chain rules in counter")
+        log_info(f"[S2]    {bold(green(str(len(counter))))} unique chain rules passed bloom filter")
+        log_debug(f"STAGE 2 complete: {len(counter)} chain rules in counter")
         return counter
 
     def _run_chain_kernel(self, words, chains):
@@ -3712,12 +3712,12 @@ class GPUEngine:
                 except: pass
 
 # ====================================================================
-# --- PHASE 3 — GENETIC ALGORITHM RULE EVOLVER ---
+# --- STAGE 3 — GENETIC ALGORITHM RULE EVOLVER ---
 # ====================================================================
 #
 # Motivation
 # ----------
-# Phase 2 samples rule chains *uniformly at random* from the atomic-rule
+# STAGE 2 samples rule chains *uniformly at random* from the atomic-rule
 # pool.  For long chains (depth >= 3) the search space grows as
 # |pool|^depth, which makes random sampling extremely inefficient — most
 # candidates score zero hits.
@@ -3748,19 +3748,19 @@ class GPUEngine:
 #
 # Integration
 # -----------
-# Activated by --genetic flag.  Runs after Phase 2, consuming whatever
+# Activated by --genetic flag.  Runs after STAGE 2, consuming whatever
 # time remains from --target-hours.  Newly discovered chains are merged
 # into `all_counts` before signature minimisation.
 #
 # v2 improvement: the original 40 % purely random portion of the initial
-# population is now replaced by high-hit chains from Phase S (families A–M)
+# population is now replaced by high-hit chains from STAGE S (families A–M)
 # when builtin seeds are enabled. This dramatically improves starting
 # coverage while gracefully falling back to random when --no-builtin-seeds
 # is used.
 
 class GeneticRuleEvolver:
     """
-    Phase 3 — Genetic Algorithm to evolve high-coverage hashcat rule chains.
+    STAGE 3 — Genetic Algorithm to evolve high-coverage hashcat rule chains.
 
     Parameters
     ----------
@@ -3779,9 +3779,9 @@ class GeneticRuleEvolver:
                       chains from families A–M). If provided, the original
                       40 % random portion of the initial population is
                       replaced by top-scoring Phase-S chains. Falls back
-                      gracefully when Phase S is disabled.
+                      gracefully when STAGE S is disabled.
     known_rules     : Optional set of chain strings already discovered by
-                      Phase 1 / Phase S / Phase 2.  Used to:
+                      STAGE 1 / STAGE S / STAGE 2.  Used to:
                         (a) compute the novelty bonus in fitness evaluation
                         (b) prefer unexplored Phase-S chains in seeding
                         (c) seed the incremental signature registry so that
@@ -3848,7 +3848,7 @@ class GeneticRuleEvolver:
             mut_delete_p  / _total,
         ]
 
-        # v2: Phase S seed chains replace the original 40 % random portion
+        # v2: STAGE S seed chains replace the original 40 % random portion
         self.seed_hits = seed_hits or Counter()
         self.seed_chains_sorted: List[str] = [
             r for r, _ in sorted(
@@ -3856,7 +3856,7 @@ class GeneticRuleEvolver:
             )
         ] if self.seed_hits else []
 
-        # v2: known_rules — chains already discovered by Phase 1 / Phase S / Phase 2.
+        # v2: known_rules — chains already discovered by STAGE 1 / STAGE S / STAGE 2.
         # Used to compute the novelty bonus in evaluate_population and to seed
         # the initial population with *unexplored* Phase-S chains.
         # v2: also updated dynamically as GA discovers new sig representatives.
@@ -4013,7 +4013,7 @@ class GeneticRuleEvolver:
 
         2. Seeded deeper chains: one hot rule + random pool atoms  (30 %)
            Biased toward depth 3+ when max_depth >= 3 to explore regions
-           that Phase 2's random sampling may have undersampled.
+           that STAGE 2's random sampling may have undersampled.
 
         3. Phase-S builtin seed families (A–M) — chains NOT already known
            are preferred (40 %). If all Phase-S seeds are already in
@@ -4025,7 +4025,7 @@ class GeneticRuleEvolver:
 
         n_hot    = int(self.pop_size * 0.30)
         n_seeded = int(self.pop_size * 0.30)
-        # remainder (40 %) filled by unexplored Phase S or random
+        # remainder (40 %) filled by unexplored STAGE S or random
 
         # 1 — depth-2 hot pairs
         max_tries = n_hot * 20
@@ -4043,7 +4043,7 @@ class GeneticRuleEvolver:
 
         # 2 — seeded deeper chains
         # Bias toward depth 3+ when max_depth >= 3: exploring deeper chains
-        # is more valuable since Phase 2 already covers depth-2 exhaustively.
+        # is more valuable since STAGE 2 already covers depth-2 exhaustively.
         max_tries = n_seeded * 20
         tries = 0
         while len(pop_set) < n_hot + n_seeded and tries < max_tries:
@@ -4064,7 +4064,7 @@ class GeneticRuleEvolver:
                 tokens = self._random_chain(depth)
             pop_set.add(tuple(tokens))
 
-        # 3 — Phase S seeds, preferring chains NOT yet in known_rules (40 %)
+        # 3 — STAGE S seeds, preferring chains NOT yet in known_rules (40 %)
         n_fill = int(self.pop_size * 0.40)
         fill_set: set = set()
 
@@ -4076,7 +4076,7 @@ class GeneticRuleEvolver:
                            if s in self.known_rules]
 
             log_debug(
-                f"[GA]   Phase-S seed pool: {len(novel_seeds)} novel, "
+                f"[S3]    Phase-S seed pool: {len(novel_seeds)} novel, "
                 f"{len(known_seeds)} already known"
             )
 
@@ -4106,7 +4106,7 @@ class GeneticRuleEvolver:
                      else random.randint(2, self.max_depth))
                 fill_set.add(tuple(self._random_chain(d)))
         else:
-            # Phase S disabled or produced zero hits — pure random fallback
+            # STAGE S disabled or produced zero hits — pure random fallback
             max_tries = n_fill * 20
             tries = 0
             while len(fill_set) < n_fill and tries < max_tries:
@@ -4275,7 +4275,7 @@ class GeneticRuleEvolver:
         ----------
         hot_rules     : Phase-1 hit rules, sorted descending by hit count.
         generations   : Hard cap on generation count.
-        time_budget   : Maximum wall-clock seconds for Phase 3.
+        time_budget   : Maximum wall-clock seconds for STAGE 3.
 
         Returns
         -------
@@ -4284,16 +4284,16 @@ class GeneticRuleEvolver:
             their raw (non-bonus) hit count, highest value across all gens.
         """
         if not self.rule_pool:
-            log_warn("[GA]   Rule pool is empty — skipping Phase 3.")
+            log_warn("[S3]    Rule pool is empty — skipping STAGE 3.")
             return Counter()
 
         if time_budget <= 0:
-            log_warn("[GA]   No time budget remaining — skipping Phase 3.")
+            log_warn("[S3]    No time budget remaining — skipping STAGE 3.")
             return Counter()
 
         if self.max_depth < 3:
             log_warn(
-                "[GA]   max_depth is only 2 — Phase 2 already covers depth-2 "
+                "[S3]    max_depth is only 2 — STAGE 2 already covers depth-2 "
                 "exhaustively.  Consider --max-depth 3 or higher to get "
                 "meaningful GA discoveries."
             )
@@ -4308,7 +4308,7 @@ class GeneticRuleEvolver:
         best_ever_score      = 0
 
         log_info(
-            f"[GA]   pop={self.pop_size}  max_gen={generations}  "
+            f"[S3]    pop={self.pop_size}  max_gen={generations}  "
             f"elite={self.elite_frac:.0%}  budget={time_budget:.0f}s  "
             f"pool={len(self.rule_pool):,} rules  "
             f"known={len(self.known_rules):,}"
@@ -4320,7 +4320,7 @@ class GeneticRuleEvolver:
 
         with tqdm(
             total=generations,
-            desc=green("  Phase 3 "),
+            desc=green("  STAGE 3 "),
             unit="gen",
             ncols=88,
             bar_format=(
@@ -4334,7 +4334,7 @@ class GeneticRuleEvolver:
 
                 # Time guard — checked at the start of every generation
                 if time.time() - t_start >= time_budget:
-                    log_debug(f"[GA]   Time budget exhausted at generation {gen}.")
+                    log_debug(f"[S3]    Time budget exhausted at generation {gen}.")
                     break
 
                 # ── Step 1: GPU fitness evaluation (raw hits, no bonus) ────────
@@ -4392,7 +4392,7 @@ class GeneticRuleEvolver:
                     stagnation_counter = 0
                     n_refresh = max(1, int(self.pop_size * 0.30))
                     log_debug(
-                        f"[GA]   Stagnation ({STAGNATION_THRESHOLD} gens) — "
+                        f"[S3]    Stagnation ({STAGNATION_THRESHOLD} gens) — "
                         f"refreshing {n_refresh} individuals with random chains"
                     )
                     depth_bias = self.max_depth >= 3
@@ -4488,7 +4488,7 @@ class GeneticRuleEvolver:
                 pop = next_pop[:self.pop_size]
 
                 log_debug(
-                    f"[GA]   gen={gen}  new_sigs={new_sigs}  "
+                    f"[S3]    gen={gen}  new_sigs={new_sigs}  "
                     f"sig_replaced={n_sig_replaced}  "
                     f"total_sigs={len(self._sig_to_best)}"
                 )
@@ -4510,13 +4510,13 @@ class GeneticRuleEvolver:
         n_chains      = len(all_new)
         n_sig_classes = len(self._sig_to_best)
         log_info(
-            f"[GA]   Evolution complete — "
+            f"[S3]    Evolution complete — "
             f"{bold(green(str(n_chains)))} unique chains passed bloom filter  "
             f"({bold(cyan(str(n_sig_classes)))} distinct functional signatures)  "
             f"({elapsed:.1f}s, {last_gen + 1} generation(s))"
         )
         log_debug(
-            f"Phase 3 GA complete: chains={n_chains}, "
+            f"STAGE 3 GA complete: chains={n_chains}, "
             f"sig_classes={n_sig_classes}, "
             f"sig_cache={len(self._sig_cache)}, "
             f"elapsed={elapsed:.1f}s"
@@ -4551,7 +4551,7 @@ class GPUExtractor:
         self.genetic_generations      = genetic_generations
         self.genetic_pop              = genetic_pop
         self.genetic_elite            = genetic_elite
-        # Phase 0 — Token-Strip
+        # STAGE 0 — Token-Strip
         self.token_strip              = token_strip
         self.token_strip_min_stem     = token_strip_min_stem
         self.token_strip_max_prefix   = token_strip_max_prefix
@@ -4587,7 +4587,7 @@ class GPUExtractor:
         all_counts = Counter()
         rules      = self.rules_gen.generate_gpu_compatible_rules()
 
-        # ── Phase 0: Token-Strip Rule Extraction (CPU‑only, must run before GPU init) ──
+        # ── STAGE 0: Token-Strip Rule Extraction (CPU‑only, must run before GPU init) ──
         ts_rules_singles: List[str] = []
         ts_rules_chains:  List[str] = []
         ts_sbd: Dict[int, set]      = defaultdict(set)
@@ -4596,10 +4596,10 @@ class GPUExtractor:
         all_seeds   = self.load_seed_rules()   # original seeds (may be empty)
 
         if self.token_strip:
-            log_section("PHASE 0 — Token-Strip Rule Extraction")
+            log_section("STAGE 0 — Token-Strip Rule Extraction")
             base_set_for_ts = set(base_words)
             log_info(
-                f"[P0]   Scanning {len(target_words):,} target words  |  "
+                f"[S0]    Scanning {len(target_words):,} target words  |  "
                 f"base set {len(base_set_for_ts):,} words  |  "
                 f"min-stem={self.token_strip_min_stem}  "
                 f"max-prefix={self.token_strip_max_prefix}  "
@@ -4609,7 +4609,7 @@ class GPUExtractor:
             _new_modes_label = yellow('disabled (--token-strip-no-new-modes)') \
                 if self.token_strip_no_new_modes else green('enabled (14 modes)')
             log_info(
-                f"[P0]   Modes: {_new_modes_label}  |  "
+                f"[S0]    Modes: {_new_modes_label}  |  "
                 f"workers: {bold(str(self.token_strip_workers or mp.cpu_count()))}"
             )
             ts_all = extract_token_strip_rules(
@@ -4639,15 +4639,15 @@ class GPUExtractor:
             )
             if ts_rules_singles:
                 log_info(
-                    f"[P0]   Single-rule discoveries  : "
+                    f"[S0]    Single-rule discoveries  : "
                     f"{bold(cyan(str(len(ts_rules_singles))))}  "
-                    f"→ merged into Phase 1 atomic pool"
+                    f"→ merged into STAGE 1 atomic pool"
                 )
             if ts_rules_chains:
                 log_info(
-                    f"[P0]   Multi-rule chain discoveries : "
+                    f"[S0]    Multi-rule chain discoveries : "
                     f"{bold(cyan(str(len(ts_rules_chains))))}  "
-                    f"→ Phase S sbd injection + Phase 2 seed chains"
+                    f"→ STAGE S sbd injection + STAGE 2 seed chains"
                 )
 
             # ── Toggle-chain seeds ─────────────────────────────────────────────
@@ -4662,16 +4662,16 @@ class GPUExtractor:
                         n_toggle_new += 1
                 if n_toggle_new:
                     log_info(
-                        f"[P0]   Toggle-chain seeds       : "
+                        f"[S0]    Toggle-chain seeds       : "
                         f"{bold(cyan(str(n_toggle_new)))}  "
                         f"(T0..TN patterns + leet combos)  "
-                        f"→ Phase S sbd + Phase 2 seeds"
+                        f"→ STAGE S sbd + STAGE 2 seeds"
                     )
 
-            # Merge Phase 0 single‑rules into Phase 1 atomic pool
+            # Merge STAGE 0 single‑rules into STAGE 1 atomic pool
             ts_extra_singles = [r for r in ts_rules_singles if r not in builtin_set]
 
-            # Phase 0 chains also forwarded to Phase 2 as seed chains
+            # STAGE 0 chains also forwarded to STAGE 2 as seed chains
             if ts_rules_chains:
                 all_seeds = list(all_seeds) + ts_rules_chains
 
@@ -4690,7 +4690,7 @@ class GPUExtractor:
         self.params['MAX_CHAIN_DEPTH'] = self.max_depth
         self.gpu_engine.params = self.params
 
-        # Merge Phase 0 single-rules into Phase 1 atomic pool
+        # Merge STAGE 0 single-rules into STAGE 1 atomic pool
         extra_seeds = [s for s in all_seeds if ' ' not in s.strip()]
         extra_seeds_valid = [s for s in extra_seeds if s not in builtin_set]
         rules_phase1 = rules + ts_extra_singles + extra_seeds_valid
@@ -4698,35 +4698,35 @@ class GPUExtractor:
         seed_chains = [s for s in all_seeds if ' ' in s.strip()]
 
         if extra_seeds_valid:
-            log_info(f"[SEED] {len(extra_seeds_valid)} seed single-rule(s) added to Phase 1 "
+            log_info(f"[SEED] {len(extra_seeds_valid)} seed single-rule(s) added to STAGE 1 "
                      f"({len(extra_seeds) - len(extra_seeds_valid)} already in built-in set)")
         if seed_chains and self.max_depth < 2:
             log_warn(f"[SEED] {len(seed_chains)} chain seed(s) ignored — "
-                     f"requires --max-depth >= 2 to run Phase 2")
-        log_debug(f"Seed split: {len(extra_seeds_valid)} singles → Phase 1, "
-                  f"{len(seed_chains)} chains → Phase 2")
+                     f"requires --max-depth >= 2 to run STAGE 2")
+        log_debug(f"Seed split: {len(extra_seeds_valid)} singles → STAGE 1, "
+                  f"{len(seed_chains)} chains → STAGE 2")
 
         bloom_filter = self.gpu_engine.generate_bloom_filter(target_words)
 
-        # --- Phase 1: single rules + seed singles ---
-        log_section("PHASE 1 — Single Rule Search")
+        # --- STAGE 1: single rules + seed singles ---
+        log_section("STAGE 1 — Single Rule Search")
         seed_note = f"  ({len(extra_seeds_valid)} from seeds)" if extra_seeds_valid else ""
-        log_info(f"[P1]   {len(base_words):,} base words × "
+        log_info(f"[S1]    {len(base_words):,} base words × "
                  f"{len(rules_phase1):,} atomic rules{seed_note}")
         t0 = time.time()
         single = self.gpu_engine.process_all_words_single_rule(
             base_words, rules_phase1, bloom_filter)
         t1 = time.time()
         all_counts.update(single)
-        log_debug(f"Phase 1 elapsed: {t1-t0:.1f}s")
+        log_debug(f"STAGE 1 elapsed: {t1-t0:.1f}s")
 
-        # --- Phase S: Numeric Seed Extraction (controlled by --no-builtin-seeds) ---
+        # --- STAGE S: Numeric Seed Extraction (controlled by --no-builtin-seeds) ---
         seed_hits = Counter()
         if self.builtin_seeds:
-            log_section("PHASE S — Seed Extraction (numeric + special-char families A–M)")
+            log_section("STAGE S — Seed Extraction (numeric + special-char families A–M)")
             sbd = self.gpu_engine.build_numeric_seed_families(max_depth=self.max_depth)
 
-            # ── Phase 0 → Phase S injection ───────────────────────────────────
+            # ── STAGE 0 → STAGE S injection ───────────────────────────────────
             if ts_sbd:
                 n_injected = 0
                 for depth, chains in ts_sbd.items():
@@ -4735,8 +4735,8 @@ class GPUExtractor:
                     n_injected += len(sbd[depth]) - before
                 if n_injected:
                     log_info(
-                        f"[PS]   Phase 0 injected {bold(cyan(str(n_injected)))} "
-                        f"chain(s) into Phase S sbd"
+                        f"[SEED]    STAGE 0 injected {bold(cyan(str(n_injected)))} "
+                        f"chain(s) into STAGE S sbd"
                     )
 
             seed_hits = self.gpu_engine.run_seed_extraction_pass(
@@ -4745,14 +4745,14 @@ class GPUExtractor:
             ts = time.time()
             log_debug(f"Seed pass elapsed: {ts-t1:.1f}s")
         else:
-            log_info(f"[PS]   {yellow('Skipped')} — built-in numeric seed families disabled "
+            log_info(f"[SEED]    {yellow('Skipped')} — built-in numeric seed families disabled "
                      f"(--no-builtin-seeds)")
             sbd = {}
             ts = t1
 
-        # --- Phase 2: random rule chains ---
+        # --- STAGE 2: random rule chains ---
         if self.max_depth > 1:
-            log_section("PHASE 2 — Rule Chain Search")
+            log_section("STAGE 2 — Rule Chain Search")
             # Reserve time for GA if enabled
             if self.genetic and self.max_depth >= 2:
                 _min_ga_secs    = 120.0
@@ -4786,7 +4786,7 @@ class GPUExtractor:
             for d, bgt in depth_budgets.items():
                 self.params[f'CHAIN_GEN_LIMIT_{d}'] = bgt
 
-            log_info(f"[P2]   depth 2–{self.max_depth} | "
+            log_info(f"[S2]    depth 2–{self.max_depth} | "
                      + " | ".join(f"d{d}:{v:,}" for d,v in depth_budgets.items()))
             log_debug(f"Remaining time budget: {remaining:.1f}s")
 
@@ -4794,11 +4794,11 @@ class GPUExtractor:
                 base_words, rules_phase1, self.max_depth, bloom_filter, single,
                 seed_chains=seed_chains, prebuilt_sbd=sbd)
             all_counts.update(chains)
-            log_debug(f"Phase 2 elapsed: {time.time()-ts:.1f}s")
+            log_debug(f"STAGE 2 elapsed: {time.time()-ts:.1f}s")
 
-        # --- Phase 3: Genetic Algorithm Rule Evolution (optional) ---
+        # --- STAGE 3: Genetic Algorithm Rule Evolution (optional) ---
         if self.genetic and self.max_depth >= 2:
-            log_section("PHASE 3 — Genetic Algorithm Rule Evolution")
+            log_section("STAGE 3 — Genetic Algorithm Rule Evolution")
 
             # Build the rule pool from Phase-1 validated rules.
             rule_pool = HashcatRuleValidator.validate_rules_for_gpu(rules_phase1)
@@ -4826,18 +4826,18 @@ class GPUExtractor:
 
             if ga_budget < 5.0:
                 log_warn(
-                    f"[GA]   Only {ga_budget:.1f}s available — "
-                    "consider raising --target-hours for Phase 3."
+                    f"[S3]    Only {ga_budget:.1f}s available — "
+                    "consider raising --target-hours for STAGE 3."
                 )
             else:
                 log_info(
-                    f"[GA]   Reserved budget for Phase 3: "
+                    f"[S3]    Reserved budget for STAGE 3: "
                     f"{bold(f'{ga_budget:.0f}s')}  "
                     f"(target={self.params['TARGET_SECONDS']:.0f}s, "
                     f"used={elapsed_p12s:.0f}s)"
                 )
 
-            # Pass all rules already discovered (Phase 1 + Phase S + Phase 2)
+            # Pass all rules already discovered (STAGE 1 + STAGE S + STAGE 2)
             known_rules_set = set(all_counts.keys())
 
             evolver = GeneticRuleEvolver(
@@ -4862,8 +4862,8 @@ class GPUExtractor:
             new_from_ga   = len(all_counts) - before
             n_truly_novel = sum(1 for r in ga_hits if r not in known_rules_set)
             log_info(
-                f"[GA]   {bold(cyan(str(new_from_ga)))} net new rules added "
-                f"by Phase 3  ({bold(green(str(len(ga_hits))))} total GA hits, "
+                f"[S3]    {bold(cyan(str(new_from_ga)))} net new rules added "
+                f"by STAGE 3  ({bold(green(str(len(ga_hits))))} total GA hits, "
                 f"{bold(cyan(str(n_truly_novel)))} genuinely novel)"
             )
 
@@ -4932,10 +4932,10 @@ def main() -> None:
                     help=f'Bloom filter size in MB (default: {BLOOM_FILTER_MAX_MB})')
     ap.add_argument('--seed-rules',   default=None,
                     help='Path to a file of seed rules. Single-rule seeds are '
-                         'injected into Phase 1 as standalone extraction candidates '
-                         'AND used as prioritised chain atoms in Phase 2. '
+                         'injected into STAGE 1 as standalone extraction candidates '
+                         'AND used as prioritised chain atoms in STAGE 2. '
                          'Multi-rule chain seeds are tested directly against the '
-                         'bloom filter in Phase 2 (not only as chain building blocks).')
+                         'bloom filter in STAGE 2 (not only as chain building blocks).')
 
     # ---- Depth overrides -----------------------------------------
     for i in range(2, 11):
@@ -4950,18 +4950,18 @@ def main() -> None:
     ap.add_argument('--allow-reject-rules', action='store_true',
                     help='Allow rules that hashcat would reject (reject-class opcodes)')
     ap.add_argument('--no-builtin-seeds', action='store_true',
-                    help='Disable the built-in seed families (Phase S: '
+                    help='Disable the built-in seed families (STAGE S: '
                          'pure prepend/append, mixed, transform+digit, date patterns, '
                          'special-char families F–I: append/prepend special chars, '
                          'transform+special, number+special combos, and new families '
                          'J–M: leet substitutions, double-transform, special-before-digit, '
                          'leet+transform). '
-                         'By default Phase S always runs; pass this flag to skip it '
-                         'and rely solely on Phase 1 atomic rules and Phase 2 random chains.')
+                         'By default STAGE S always runs; pass this flag to skip it '
+                         'and rely solely on STAGE 1 atomic rules and STAGE 2 random chains.')
 
-    # ---- Phase 0: Token-Strip ----------------------------------------
+    # ---- STAGE 0: Token-Strip ----------------------------------------
     pt = ap.add_argument_group(
-        'Phase 0 — Token-Strip Rule Extraction',
+        'STAGE 0 — Token-Strip Rule Extraction',
         'Optional CPU-only pre-pass that decomposes target passwords into\n'
         'token categories (lowercase=stem, uppercase=case rules,\n'
         'leet chars=substitution rules, boundary digits/specials=prepend/append)\n'
@@ -4970,9 +4970,9 @@ def main() -> None:
     )
     pt.add_argument(
         '--token-strip', action='store_true',
-        help='Enable Phase 0: empirical CPU-only rule extraction by decomposing '
+        help='Enable STAGE 0: empirical CPU-only rule extraction by decomposing '
              'target passwords into stem + transform rules.  Discovered rules are '
-             'injected into the Phase 1 atomic pool (single-rule) and Phase S sbd '
+             'injected into the STAGE 1 atomic pool (single-rule) and STAGE S sbd '
              '(multi-rule chains) before any GPU work begins.',
     )
     pt.add_argument(
@@ -4999,7 +4999,7 @@ def main() -> None:
     )
     pt.add_argument(
         '--token-strip-workers', type=int, default=0, metavar='N',
-        help='Worker processes for Phase 0 (default: 0 = all CPU cores). '
+        help='Worker processes for STAGE 0 (default: 0 = all CPU cores). '
              'Set to 1 to disable multiprocessing.',
     )
     pt.add_argument(
@@ -5014,17 +5014,17 @@ def main() -> None:
              'five modes (letter, digit, reverse, delete-edge, dup/fold).',
     )
 
-    # ---- Phase 3: Genetic Algorithm ----------------------------------
+    # ---- STAGE 3: Genetic Algorithm ----------------------------------
     ga = ap.add_argument_group(
-        'Phase 3 — Genetic Algorithm',
-        'Optional evolutionary search that runs after Phase 2 and guides '
+        'STAGE 3 — Genetic Algorithm',
+        'Optional evolutionary search that runs after STAGE 2 and guides '
         'chain generation toward high-coverage rules. '
         'Activated with --genetic.'
     )
     ga.add_argument(
         '--genetic', action='store_true',
-        help='Enable Phase 3 genetic algorithm rule evolution '
-             '(runs after Phase 2, uses remaining time budget).',
+        help='Enable STAGE 3 genetic algorithm rule evolution '
+             '(runs after STAGE 2, uses remaining time budget).',
     )
     ga.add_argument(
         '--genetic-generations', type=int, default=50,
@@ -5084,14 +5084,14 @@ def main() -> None:
              f"hours: {bold(str(args.target_hours))}  |  "
              f"bloom: {bold(str(args.bloom_mb or BLOOM_FILTER_MAX_MB))}MB")
     _bs_status = red('DISABLED (--no-builtin-seeds)') if args.no_builtin_seeds else green('enabled (families A–M)')
-    log_info(f"  builtin seeds (Phase S) : {_bs_status}")
-    # Phase 0 status
+    log_info(f"  builtin seeds (STAGE S) : {_bs_status}")
+    # STAGE 0 status
     if args.token_strip:
-        _ts_inj = green('→ Phase S sbd') if not args.no_builtin_seeds else yellow('→ Phase 1 only (Phase S disabled)')
+        _ts_inj = green('→ STAGE S sbd') if not args.no_builtin_seeds else yellow('→ STAGE 1 only (STAGE S disabled)')
         _ts_modes = yellow('5 modes (new disabled)') if args.token_strip_no_new_modes else green('14 modes')
         _ts_workers = bold(str(args.token_strip_workers or mp.cpu_count()))
         log_info(
-            f"  {bold(cyan('Phase 0 token-strip'))} : "
+            f"  {bold(cyan('STAGE 0 token-strip'))} : "
             f"{green('enabled')}  |  "
             f"min-stem={bold(str(args.token_strip_min_stem))}  "
             f"prefix={bold(str(args.token_strip_max_prefix))}  "
@@ -5103,14 +5103,14 @@ def main() -> None:
         )
     if args.seed_rules:
         log_info(f"  seeds     : {bold(args.seed_rules)}  "
-                 f"{dim('(singles -> Phase 1 + Phase 2 atoms | chains -> Phase 2 direct)')}")
+                 f"{dim('(singles -> STAGE 1 + STAGE 2 atoms | chains -> STAGE 2 direct)')}")
     if args.genetic:
         # Validate --genetic-elite range
         if not 0.0 < args.genetic_elite < 1.0:
             log_error("--genetic-elite must be between 0.0 and 1.0 (exclusive).")
             sys.exit(1)
         log_info(
-            f"  {bold(green('Phase 3 GA'))} : "
+            f"  {bold(green('STAGE 3 GA'))} : "
             f"enabled  |  "
             f"pop={bold(str(args.genetic_pop))}  "
             f"gen={bold(str(args.genetic_generations))}  "
@@ -5145,7 +5145,7 @@ def main() -> None:
         token_strip_no_new_modes  = args.token_strip_no_new_modes,
     )
 
-    extractor._output_path = args.output   # used by Phase 0 debug dump
+    extractor._output_path = args.output   # used by STAGE 0 debug dump
 
     depth_overrides = {f'depth{i}_override': getattr(args, f'depth{i}_chains')
                        for i in range(2, 11)}
@@ -5189,7 +5189,7 @@ def main() -> None:
         f.write(f"# Depth          : 1–{args.max_depth}\n")
         f.write(f"# Bloom          : {args.bloom_mb or BLOOM_FILTER_MAX_MB} MB\n")
         if args.genetic:
-            f.write(f"# Phase 3 GA     : enabled  "
+            f.write(f"# STAGE 3 GA     : enabled  "
                     f"pop={args.genetic_pop}  "
                     f"gen={args.genetic_generations}  "
                     f"elite={args.genetic_elite:.0%}\n")
@@ -5223,7 +5223,7 @@ def main() -> None:
     log_info(cyan(sep))
     log_info(f"  GPU raw candidates : {bold(str(len(raw_counts)))}")
     if args.genetic:
-        log_info(f"  Phase 3 GA         : {bold(green('enabled'))}  "
+        log_info(f"  STAGE 3 GA         : {bold(green('enabled'))}  "
                  f"pop={args.genetic_pop}  gen={args.genetic_generations}")
     log_info(f"  Rules kept         : {bold(green(str(final_rules)))}  "
              f"{dim('('+depth_summary+')')}")
