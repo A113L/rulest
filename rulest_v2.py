@@ -2700,12 +2700,28 @@ class GPUEngine:
         self.kernel_chain        = None
         self._consecutive_errors = 0      # consecutive batch failures — triggers graceful exit
         self._MAX_CONSECUTIVE_ERRORS = 5  # give up GPU STAGE after this many in a row
+        # FIX 2: VRAM / max-alloc queried once at init, not on every kernel call
+        self._cached_free_vram   = None
+        self._cached_max_alloc   = None
+        # FIX 3: persistent GPU buffers for rules (constant across all word batches)
+        self._rules_buf          = None
+        self._rules_offsets_buf  = None
+        self._rules_lengths_buf  = None
+        self._rules_buf_key      = None   # id() of gpu_rules list these were built from
 
     def get_free_vram(self):      return estimate_free_vram(self.device)
     def get_max_allocation(self): return get_max_allocation(self.device)
 
+    def _refresh_cached_limits(self):
+        """Cache VRAM / max-alloc once — never query driver on every kernel call."""
+        self._cached_free_vram = estimate_free_vram(self.device)
+        self._cached_max_alloc = get_max_allocation(self.device)
+
     def safe_output_buffer_size(self, words_count, chains_count):
-        avail = min(self.get_free_vram(), self.get_max_allocation()) - 5*1024**2
+        # FIX 2: use cached values instead of driver round-trip per kernel call
+        fv    = self._cached_free_vram if self._cached_free_vram is not None else self.get_free_vram()
+        ma    = self._cached_max_alloc if self._cached_max_alloc is not None else self.get_max_allocation()
+        avail = min(fv, ma) - 5*1024**2
         return min(max(avail, 0) // MAX_CHAIN_STRING_LEN,
                    self.params['MAX_SAFE_RESULTS_PER_BATCH'],
                    words_count * chains_count,
@@ -2720,7 +2736,8 @@ class GPUEngine:
             self.local_work_size = min(self.local_work_size, self.max_work_group_size)
             while self.max_work_group_size % self.local_work_size != 0 and self.local_work_size > 32:
                 self.local_work_size //= 2
-            vram_gb = self.get_free_vram() / 1024**3
+            self._refresh_cached_limits()               # FIX 2: cache once at init
+            vram_gb = self._cached_free_vram / 1024**3
             log_info(f"[GPU]  {bold(self.device.name.strip())}")
             log_debug(f"       WGS={self.local_work_size}, VRAM~{vram_gb:.1f}GB, "
                       f"CU={self.device.get_info(cl.device_info.MAX_COMPUTE_UNITS)}")
@@ -2807,6 +2824,15 @@ class GPUEngine:
                 except Exception: pass
             setattr(self, attr, None)
 
+        # FIX 3: rule buffers belong to the dead context — must be re-created
+        for attr in ('_rules_buf', '_rules_offsets_buf', '_rules_lengths_buf'):
+            b = getattr(self, attr, None)
+            if b is not None:
+                try: b.release()
+                except Exception: pass
+            setattr(self, attr, None)
+        self._rules_buf_key = None
+
         if self.device is None:
             log_error("[GPU] No device reference — cannot recover context")
             return False
@@ -2821,6 +2847,7 @@ class GPUEngine:
             if not self.compile_kernel():
                 log_error("[GPU] Context reset: kernel recompile failed")
                 return False
+            self._refresh_cached_limits()               # FIX 2: refresh after reset
             if self.bloom_np is not None:
                 self.upload_bloom_filter(self.bloom_np)
             log_info("[GPU] Context reset successful — resuming")
@@ -2829,23 +2856,49 @@ class GPUEngine:
             log_error(f"[GPU] Context reset failed: {exc}")
             return False
 
+    _QUEUE_FINISH_TIMEOUT = 90  # seconds before we declare a GPU stall
+
     def _safe_queue_finish(self) -> bool:
         """
-        Call ``self.queue.finish()`` and return True on success.
+        Call queue.finish() on a daemon thread with a hard timeout.
 
-        On any OpenCL error, attempt a full context reset via ``_reset_gpu``
-        and return False.  The caller is responsible for deciding whether to
-        continue, skip the batch, or abort the phase.
+        Without a timeout, queue.finish() blocks the main thread forever
+        when the GPU stalls (TDR, driver crash, kernel infinite loop) —
+        this was the root cause of the "hang at 2% of Stage 1" bug.
+
+        Returns True on success.  On timeout or OpenCL exception, triggers
+        a full context reset via _reset_gpu and returns False.
         """
         if self.queue is None:
             return False
-        try:
-            self.queue.finish()
-            return True
-        except Exception as exc:
-            log_warn(f"[GPU] queue.finish() failed: {exc}")
-            self._reset_gpu(exc)
+
+        result: list = [None]   # None = not yet done, True = ok, Exception = error
+
+        def _finish():
+            try:
+                self.queue.finish()
+                result[0] = True
+            except Exception as exc:
+                result[0] = exc
+
+        t = threading.Thread(target=_finish, daemon=True)
+        t.start()
+        t.join(timeout=self._QUEUE_FINISH_TIMEOUT)
+
+        if t.is_alive():
+            log_warn(
+                f"[GPU] queue.finish() hung for {self._QUEUE_FINISH_TIMEOUT}s "
+                f"— GPU stall / TDR detected; forcing context reset"
+            )
+            self._reset_gpu(RuntimeError("queue.finish timeout — GPU stall"))
             return False
+
+        if isinstance(result[0], Exception):
+            log_warn(f"[GPU] queue.finish() raised: {result[0]}")
+            self._reset_gpu(result[0])
+            return False
+
+        return True
 
     def generate_bloom_filter(self, target_words):
         bsz = self.params['BLOOM_FILTER_SIZE'] // 8
@@ -2889,6 +2942,36 @@ class GPUEngine:
                     rules_flat=rf, rule_offsets=ro, rule_lengths=rl,
                     num_words=len(words), num_rules=len(rules))
 
+    def prepare_words_data(self, words):
+        """FIX 3: flatten only words — rules stay in persistent GPU buffers."""
+        wf, wo, wl = self._flatten(words)
+        return dict(words_flat=wf, word_offsets=wo, word_lengths=wl,
+                    num_words=len(words), num_rules=len(self.gpu_rules))
+
+    def _get_rules_buffers(self, mf):
+        """
+        FIX 3: return (and lazily create) persistent GPU buffers for self.gpu_rules.
+
+        Rules are constant for the entire duration of Stage 1 and Stage 2, so
+        there is no reason to re-encode and re-upload them on every word batch.
+        We allocate the three buffers once and reuse them, rebuilding only when
+        gpu_rules changes identity (i.e. after a context reset or stage change).
+        """
+        key = id(self.gpu_rules)
+        if self._rules_buf_key != key:
+            # Release any stale buffers from a previous context
+            for attr in ('_rules_buf', '_rules_offsets_buf', '_rules_lengths_buf'):
+                b = getattr(self, attr, None)
+                if b is not None:
+                    try: b.release()
+                    except Exception: pass
+            rf, ro, rl = self._flatten(self.gpu_rules)
+            self._rules_buf         = cl.Buffer(self.context, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=rf)
+            self._rules_offsets_buf = cl.Buffer(self.context, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=ro)
+            self._rules_lengths_buf = cl.Buffer(self.context, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=rl)
+            self._rules_buf_key     = key
+        return self._rules_buf, self._rules_offsets_buf, self._rules_lengths_buf
+
     # ---------------------------------------------------------------- STAGE 1
     def process_all_words_single_rule(self, base_words, rules, bloom_filter):
         self.upload_bloom_filter(bloom_filter)
@@ -2910,7 +2993,7 @@ class GPUEngine:
             for i in range(0, len(base_words), bs):
                 batch = base_words[i:i+bs]
                 if batch:
-                    found = self._run_single_kernel(self.prepare_batch_data(batch, self.gpu_rules))
+                    found = self._run_single_kernel(self.prepare_words_data(batch))
                     if found:
                         self._consecutive_errors = 0
                         counter.update(found)
@@ -2931,9 +3014,8 @@ class GPUEngine:
                         log_warn("[GPU] queue.finish() repeatedly failing — "
                                  "aborting STAGE 1 gracefully")
                         break
-                else:
-                    gc.collect()
 
+        gc.collect()
         log_info(f"[S1]    {bold(green(str(len(counter))))} unique rules passed bloom filter")
         log_debug(f"STAGE 1 complete: {len(counter)} rules in counter")
         return counter
@@ -2946,7 +3028,8 @@ class GPUEngine:
                 bufs.append(b); return b
 
             bb=B(bd['words_flat']); bbo=B(bd['word_offsets']); bbl=B(bd['word_lengths'])
-            rb=B(bd['rules_flat']); rbo=B(bd['rule_offsets']); rbl=B(bd['rule_lengths'])
+            # FIX 3: reuse persistent rule buffers — no re-upload per batch
+            rb, rbo, rbl = self._get_rules_buffers(mf)
             outs = self.safe_output_buffer_size(bd['num_words'], bd['num_rules'])
             fo = cl.Buffer(self.context, mf.WRITE_ONLY, outs*MAX_CHAIN_STRING_LEN); bufs.append(fo)
             fc = cl.Buffer(self.context, mf.READ_WRITE, 4);                         bufs.append(fc)
@@ -2957,7 +3040,9 @@ class GPUEngine:
             self.kernel_single.set_args(bb,bbo,bbl,rb,rbo,rbl,self.bloom_buf,
                                         np.int32(bd['num_words']),np.int32(bd['num_rules']),fo,fc)
             cl.enqueue_nd_range_kernel(self.queue, self.kernel_single, (gs,), (self.local_work_size,))
-            self.queue.finish()
+            # FIX 1: use timed finish — bare queue.finish() hangs forever on GPU stall
+            if not self._safe_queue_finish():
+                return []
 
             cnt = np.zeros(1, dtype=np.int32)
             cl.enqueue_copy(self.queue, cnt, fc)
@@ -3653,8 +3738,10 @@ class GPUEngine:
 
                 pbar.update(1)
                 pbar.set_postfix({"rules": cyan(str(len(counter)))}, refresh=False)
-                gc.collect()
+                # FIX 4: gc.collect() was called inside the tight chain-batch loop;
+                # moved to after the full Stage to avoid GC pauses mid-pipeline.
 
+        gc.collect()
         log_info(f"[S2]    {bold(green(str(len(counter))))} unique chain rules passed bloom filter")
         log_debug(f"STAGE 2 complete: {len(counter)} chain rules in counter")
         return counter
@@ -3667,7 +3754,7 @@ class GPUEngine:
             while len(idxs) < self.params['MAX_CHAIN_DEPTH']: idxs.append(-1)
             seqs.extend(idxs)
 
-        bd = self.prepare_batch_data(words, self.gpu_rules)
+        bd = self.prepare_words_data(words)
         mf = cl.mem_flags; bufs = []
         try:
             def B(arr, f=mf.READ_ONLY):
@@ -3675,7 +3762,8 @@ class GPUEngine:
                 bufs.append(b); return b
 
             bb=B(bd['words_flat']); bbo=B(bd['word_offsets']); bbl=B(bd['word_lengths'])
-            rb=B(bd['rules_flat']); rbo=B(bd['rule_offsets']); rbl=B(bd['rule_lengths'])
+            # FIX 3: reuse persistent rule buffers — no re-upload per batch
+            rb, rbo, rbl = self._get_rules_buffers(mf)
             csb=B(np.array(seqs,   dtype=np.int32))
             cdb=B(np.array(depths, dtype=np.int32))
             outs = self.safe_output_buffer_size(len(words), len(chains))
@@ -3689,7 +3777,9 @@ class GPUEngine:
                                        np.int32(len(words)),np.int32(len(chains)),
                                        np.int32(self.params['MAX_CHAIN_DEPTH']),fo,fc)
             cl.enqueue_nd_range_kernel(self.queue, self.kernel_chain, (gs,), (self.local_work_size,))
-            self.queue.finish()
+            # FIX 1: use timed finish — bare queue.finish() hangs forever on GPU stall
+            if not self._safe_queue_finish():
+                return []
 
             cnt = np.zeros(1, dtype=np.int32)
             cl.enqueue_copy(self.queue, cnt, fc)
