@@ -2999,21 +2999,16 @@ class GPUEngine:
                         counter.update(found)
                         pbar.set_postfix({"rules": cyan(str(len(counter)))}, refresh=False)
                     elif self.queue is None:
-                        # _reset_gpu failed — GPU is unrecoverable
+                        # _reset_gpu failed inside kernel — GPU is unrecoverable
                         self._consecutive_errors += 1
                         if self._consecutive_errors >= self._MAX_CONSECUTIVE_ERRORS:
                             log_warn(f"[GPU] {self._consecutive_errors} consecutive failures — "
                                      f"aborting STAGE 1 gracefully")
                             break
                 pbar.update(len(batch))
-                # Use _safe_queue_finish — never let an unprotected queue.finish()
-                # crash the process.  A failure here triggers _reset_gpu internally.
-                if not self._safe_queue_finish():
-                    self._consecutive_errors += 1
-                    if self._consecutive_errors >= self._MAX_CONSECUTIVE_ERRORS:
-                        log_warn("[GPU] queue.finish() repeatedly failing — "
-                                 "aborting STAGE 1 gracefully")
-                        break
+                # NOTE: no outer _safe_queue_finish() here — the kernel already
+                # calls it internally with a hard timeout (FIX 1).  A second
+                # call would spin up a redundant thread on every batch.
 
         gc.collect()
         log_info(f"[S1]    {bold(green(str(len(counter))))} unique rules passed bloom filter")
@@ -3622,8 +3617,7 @@ class GPUEngine:
                             counter.update(found)
                         elif self.queue is None:
                             self._consecutive_errors += 1
-                    if not self._safe_queue_finish():
-                        self._consecutive_errors += 1
+                        # NOTE: no outer _safe_queue_finish() — kernel handles it internally
 
                 if self._consecutive_errors >= self._MAX_CONSECUTIVE_ERRORS:
                     log_warn(f"[GPU] {self._consecutive_errors} consecutive failures — "
@@ -3728,8 +3722,7 @@ class GPUEngine:
                             counter.update(found)
                         elif self.queue is None:
                             self._consecutive_errors += 1
-                    if not self._safe_queue_finish():
-                        self._consecutive_errors += 1
+                        # NOTE: no outer _safe_queue_finish() — kernel handles it internally
 
                 if self._consecutive_errors >= self._MAX_CONSECUTIVE_ERRORS:
                     log_warn(f"[GPU] {self._consecutive_errors} consecutive failures — "
@@ -4260,7 +4253,7 @@ class GeneticRuleEvolver:
                     found = self.gpu_engine._run_chain_kernel(wb, cb)
                     if found:
                         batch_hits.update(found)
-            self.gpu_engine._safe_queue_finish()
+            # NOTE: no outer _safe_queue_finish() — kernel handles it internally
 
         raw_map.update(batch_hits)
         return raw_map
