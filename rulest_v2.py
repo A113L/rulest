@@ -2816,20 +2816,34 @@ class GPUEngine:
         """
         log_warn(f"[GPU] Fatal kernel error: {error}  — attempting full context reset")
         # ── tear down ──────────────────────────────────────────────────────
+        # Release each OpenCL object in a daemon thread so that a stuck
+        # driver cannot deadlock the main process.  We give each release
+        # 5 s; if it times out we abandon the object and carry on.
+        _RELEASE_TIMEOUT = 5.0
+
+        def _timed_release(obj):
+            def _do():
+                try: obj.release()
+                except Exception: pass
+            t = threading.Thread(target=_do, daemon=True)
+            t.start()
+            t.join(timeout=_RELEASE_TIMEOUT)
+            # If t is still alive after the timeout the driver is stuck;
+            # we abandon the object — it will be cleaned up by the OS when
+            # the process exits, which is acceptable.
+
         for attr in ('bloom_buf', 'program', 'kernel_single', 'kernel_chain',
                      'queue', 'context'):
             obj = getattr(self, attr, None)
             if obj is not None:
-                try: obj.release()
-                except Exception: pass
+                _timed_release(obj)
             setattr(self, attr, None)
 
         # FIX 3: rule buffers belong to the dead context — must be re-created
         for attr in ('_rules_buf', '_rules_offsets_buf', '_rules_lengths_buf'):
             b = getattr(self, attr, None)
             if b is not None:
-                try: b.release()
-                except Exception: pass
+                _timed_release(b)
             setattr(self, attr, None)
         self._rules_buf_key = None
 
@@ -3006,14 +3020,14 @@ class GPUEngine:
                                      f"aborting STAGE 1 gracefully")
                             break
                 pbar.update(len(batch))
-                # Use _safe_queue_finish — never let an unprotected queue.finish()
-                # crash the process.  A failure here triggers _reset_gpu internally.
-                if not self._safe_queue_finish():
-                    self._consecutive_errors += 1
-                    if self._consecutive_errors >= self._MAX_CONSECUTIVE_ERRORS:
-                        log_warn("[GPU] queue.finish() repeatedly failing — "
-                                 "aborting STAGE 1 gracefully")
-                        break
+                # NOTE: _safe_queue_finish() is intentionally NOT called here.
+                # _run_single_kernel() already calls _safe_queue_finish() internally
+                # (after the kernel dispatch) AND performs blocking cl.enqueue_copy
+                # result readbacks before returning.  The queue is fully drained
+                # before this point.  Calling queue.finish() a second time on an
+                # already-empty queue triggers a driver-level deadlock on several
+                # OpenCL implementations (Intel/AMD iGPU), causing the process to
+                # hang silently after the progress bar reaches 100 %.
 
         gc.collect()
         log_info(f"[S1]    {bold(green(str(len(counter))))} unique rules passed bloom filter")
