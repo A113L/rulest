@@ -887,7 +887,6 @@ sa@ $0
 | Reduce terminal noise | Set `VERBOSE = False` in the script header or omit `--debug` |
 | Increase hot-rule aggressiveness | Raise `HOT_RULE_RATIO` toward `1.0` (reduces random exploration) |
 | Enable token-strip pre-pass | Add `--token-strip` — most effective when the target wordlist contains structured transformations (leet speak, capitalized words, boundary digits) |
-| Maximize Phase 0 coverage | Leave `--token-strip-no-new-modes` off (default) to run all 14 modes; the 9 v1.1 modes (insert, swap, range, char-dup, ascii-transform, truncate, purge, repeat, sep-title) find patterns the original 5 miss entirely |
 | Speed up Phase 0 | Add `--token-strip-no-new-modes` to restrict to the original 5 modes; or lower `--token-strip-max-prefix` / `--token-strip-max-suffix` |
 | Tune Phase 0 parallelism | `--token-strip-workers N` — default 0 uses all cores; set to 1 to force single-process; tune `--token-strip-chunk-size` for progress granularity vs dispatch overhead |
 | Tune token-strip leet scope | Raise `--token-strip-min-leet-amb` (e.g. `5`) to decode more ambiguous leet chars at the cost of more branching |
