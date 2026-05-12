@@ -341,78 +341,38 @@ MAX_GPU_RULES = 255
 _UNSUPPORTED_SENTINEL = object()
 
 # ── Minimization constants ───────────────────────────────────────────────────
-# Above this rule count, minimize_by_signature switches to a disk-backed
-# SQLite path to avoid storing millions of signature tuples in Python heap.
-# Each in-memory signature tuple costs ~2.5 KB (40 probe-word outputs).
-# At 8 M rules that is ~20 GB RAM → OOM / core dump.
-# The disk path caps peak Python heap to O(MINIMIZE_DISK_BATCH_SIZE) rows.
-MINIMIZE_DISK_THRESHOLD  = 500_000   # rules; switch to disk above this value
-MINIMIZE_DISK_BATCH_SIZE =  10_000   # rows per SQLite executemany call
+MINIMIZE_DISK_THRESHOLD  = 500_000
+MINIMIZE_DISK_BATCH_SIZE =  10_000
 
 # ── Special-character seed constants ────────────────────────────────────────
-# Ordered by real-world frequency of appearance as password suffix/prefix.
 SPECIAL_CHARS_TOP  = ['!', '@', '#', '$', '%', '^', '&', '*',
                       '?', '.', '-', '_', '+', '(', ')']
-# Reduced "core" set used where combinatorial explosion must be limited.
 SPECIAL_CHARS_CORE = ['!', '@', '#', '$', '%', '*', '?']
 
 # ── Leet-substitution seed constants (Family J / M) ─────────────────────────
-# Ten most common character→character leet mappings found in real passwords,
-# ordered by real-world frequency.  Each entry is (original, replacement).
 LEET_SUBS: List[Tuple[str, str]] = [
-    ('a', '@'),   # p@ssword
-    ('e', '3'),   # s3cur1ty
-    ('o', '0'),   # passw0rd
-    ('i', '1'),   # pass1word
-    ('l', '1'),   # 1eet
-    ('s', '5'),   # pa55word
-    ('s', '$'),   # pa$$word
-    ('t', '7'),   # 7error
-    ('a', '4'),   # p4ssword
-    ('i', '!'),   # pass!word
+    ('a', '@'), ('e', '3'), ('o', '0'), ('i', '1'), ('l', '1'),
+    ('s', '5'), ('s', '$'), ('t', '7'), ('a', '4'), ('i', '!'),
 ]
-# Pre-built hashcat rule strings derived from LEET_SUBS (e.g. "sa@").
 LEET_OPS: List[str] = [f's{orig}{rep}' for orig, rep in LEET_SUBS]
 
 # ── Token-Strip constants (STAGE 0) ──────────────────────────────────────────
-# Leet decode table used in STAGE 0 to reverse substitutions found in target
-# passwords.  Each entry is (encoded_char, base_char, hashcat_sub_rule).
-# Multiple entries may share the same encoded_char (e.g. '1' → 'i' or 'l').
 TOKEN_STRIP_LEET_TABLE: List[Tuple[str, str, str]] = [
-    ('@', 'a', 'sa@'),   # p@ssword  ← password
-    ('3', 'e', 'se3'),   # s3cur1ty  ← security
-    ('0', 'o', 'so0'),   # passw0rd  ← password
-    ('1', 'i', 'si1'),   # pass1word ← passiword  (ambiguous: also 'l')
-    ('1', 'l', 'sl1'),   # 1eet      ← leet
-    ('5', 's', 'ss5'),   # pa55word  ← password
-    ('$', 's', 'ss$'),   # pa$$word  ← password
-    ('7', 't', 'st7'),   # 7error    ← terror
-    ('4', 'a', 'sa4'),   # p4ssword  ← password
-    ('!', 'i', 'si!'),   # pass!word ← passiword
+    ('@', 'a', 'sa@'), ('3', 'e', 'se3'), ('0', 'o', 'so0'),
+    ('1', 'i', 'si1'), ('1', 'l', 'sl1'), ('5', 's', 'ss5'),
+    ('$', 's', 'ss$'), ('7', 't', 'st7'), ('4', 'a', 'sa4'), ('!', 'i', 'si!'),
 ]
-
-# Per-char lookup: encoded_char → [(base_char, rule_str), ...]
 _TOKEN_STRIP_LEET_BY_CHAR: Dict[str, List[Tuple[str, str]]] = defaultdict(list)
 for _ts_enc, _ts_base, _ts_rule in TOKEN_STRIP_LEET_TABLE:
     _TOKEN_STRIP_LEET_BY_CHAR[_ts_enc].append((_ts_base, _ts_rule))
 
-# Set of characters that can be leet-decoded inside a middle segment
 TOKEN_STRIP_LEET_CHARS: Set[str] = set(_TOKEN_STRIP_LEET_BY_CHAR.keys())
-
-# Characters allowed in boundary prefix/suffix positions (digits + common specials)
-# Used in LETTER mode: letters form the stem, digits/specials are boundary (^/$).
 TOKEN_STRIP_BOUNDARY: Set[str] = set('0123456789!@#$%^&*?.-_+()')
-
-# Boundary set for DIGIT mode: letters + specials form the boundary (^/$),
-# pure digit sequences form the stem.  Selected when target word has more
-# digits than letters — common for passwords like "123abc456" or "abc2024".
 TOKEN_STRIP_ALPHA_BOUNDARY: Set[str] = (
     set(string.ascii_letters) | set('!@#$%^&*?.-_+()')
 )
 
 # ── STAGE 0 multiprocessing worker globals ───────────────────────────────────
-# Set before Pool() creation so forked workers inherit via CoW (zero-copy).
-# On Windows/macOS-spawn, _worker_init_p0 re-assigns them from initargs.
 _p0_worker_base_set:       Set[str]                       = set()
 _p0_worker_base_by_len:    Dict[int, Set[str]]            = {}
 _p0_worker_base_lower_idx: Dict[str, Set[str]]            = {}
@@ -421,85 +381,37 @@ _p0_worker_substr_idx:     Dict[str, Set[str]]            = {}
 _p0_worker_omit_idx:       Dict[str, Set[str]]            = {}
 _p0_worker_prefix_idx:     Dict[str, Set[str]]            = {}
 _p0_worker_ascii_idx:      Dict[str, Set[Tuple[str,str]]] = {}
+_p0_worker_overwrite_idx:  Dict[str, Set[str]]            = {}
 
 # ====================================================================
-# --- BUILT-IN PROBE SET (hand‑curated, covers all important cases) ---
+# --- BUILT-IN PROBE SET ---
 # ====================================================================
-# This set replaces the old sampling‑based probe set.  It ensures that
-# functional equivalence is detected even when the base wordlist lacks
-# long words or has an unusual distribution.
 BUILTIN_PROBES: List[str] = [
-    # ── very short — edge cases for k, K, {, }, [, ] ────────────────
-    "ab",
-    "abc",
-    "abcd",
-    # ── short alphanumeric (len 4–6) ─────────────────────────────────
-    "pass",
-    "root",
-    "test",
-    "admin",
-    "login",
-    # ── typical password base words (len 7–9) ────────────────────────
-    "letmein",          # len 7
-    "welcome",          # len 7
-    "password",         # len 8
-    "sunshine",         # len 8
-    "football",         # len 8
-    "baseball",         # len 8
-    "princess",         # len 8
-    "dragon12",         # len 8, ends with digits
-    # ── longer words (len 10+) — truncation / repeat ops ─────────────
-    "qwertyuiop",       # len 10
-    "iloveyou12",       # len 10, trailing digits
-    "monkey12345",      # len 11
-    "superman123",      # len 11
-    "mustang2024",      # len 11
-    # ── mixed-case — l/u/c/C/t/E/T/k/K ─────────────────────────────
-    "Password",
-    "AdminUser",
-    "MySecret",
-    "HelloWorld",
-    # ── words with embedded digits — s, o, @, T ──────────────────────
-    "pass123",
-    "admin2024",
-    "test1234",
-    "user9999",
-    # ── words with special chars — @ removal, s substitution ─────────
-    "p@ssw0rd",
-    "s3cur1ty",
-    # ── leet-substitution targets — exercises Family J/M ─────────────
-    "master",           # sa@ → m@ster, se3 → mast3r
-    "leet",             # sl1 → 1eet
-    "elite",            # si1 → e11te
-    "access",           # sa@ → @ccess, ss$ → acce$$
-    # ── repeated chars — q (double each), z/Z (extend) ───────────────
-    "aaaa",
-    "bbbb",
+    "ab", "abc", "abcd",
+    "pass", "root", "test", "admin", "login",
+    "letmein", "welcome", "password", "sunshine", "football",
+    "baseball", "princess", "dragon12",
+    "qwertyuiop", "iloveyou12", "monkey12345", "superman123", "mustang2024",
+    "Password", "AdminUser", "MySecret", "HelloWorld",
+    "pass123", "admin2024", "test1234", "user9999",
+    "p@ssw0rd", "s3cur1ty",
+    "master", "leet", "elite", "access",
+    "aaaa", "bbbb",
 ]
-# Deduplicate while preserving order (already unique, but safe)
-_seen = set()
-_deduped = []
+_seen = set(); _d = []
 for w in BUILTIN_PROBES:
-    if w not in _seen:
-        _seen.add(w)
-        _deduped.append(w)
-BUILTIN_PROBES = _deduped
-del _seen, _deduped, w
+    if w not in _seen: _seen.add(w); _d.append(w)
+BUILTIN_PROBES = _d; del _seen, _d, w
 
 # ====================================================================
 # --- RULE EXCLUSION FILTER ---
 # ====================================================================
 def should_exclude_rule(rule: str) -> bool:
-    if ALLOW_REJECT_RULES:
-        return False
-    if not rule:
-        return False
-    if len(rule) == 1 and rule in ('_', 'M', '4', '6', 'Q'):
-        return True
-    if len(rule) == 2 and rule[0] in ('!', '/', '(', ')', '<', '>', '_'):
-        return True
-    if len(rule) == 3 and rule[0] in ('?', '=', 'v'):
-        return True
+    if ALLOW_REJECT_RULES: return False
+    if not rule: return False
+    if len(rule) == 1 and rule in ('_', 'M', '4', '6', 'Q'): return True
+    if len(rule) == 2 and rule[0] in ('!', '/', '(', ')', '<', '>', '_'): return True
+    if len(rule) == 3 and rule[0] in ('?', '=', 'v'): return True
     return False
 
 # ====================================================================
@@ -514,20 +426,15 @@ class HashcatRuleValidator:
 
     @staticmethod
     def validate_rule_for_gpu(rule_str: str) -> bool:
-        if should_exclude_rule(rule_str):
-            return False
+        if should_exclude_rule(rule_str): return False
         pos = 0; cnt = 0; n = len(rule_str)
         isd = HashcatRuleValidator.is_digit
         while pos < n:
             c = rule_str[pos]
-            if c == ' ':
-                pos += 1; continue
-            # p / z / Z  — digit suffix is OPTIONAL
+            if c == ' ': pos += 1; continue
             if c in ('p', 'z', 'Z'):
-                cnt += 1
-                pos += 1
-                if pos < n and isd(rule_str[pos]):
-                    pos += 1
+                cnt += 1; pos += 1
+                if pos < n and isd(rule_str[pos]): pos += 1
                 continue
             if c in (':', 'l', 'u', 'c', 'C', 't', 'r', 'd', 'f',
                      'a', 'q', 'k', 'K', 'E', '{', '}', '[', ']'):
@@ -581,9 +488,7 @@ def fnv1a_32(data, seed=FNV1A_SEED1):
 # --- PYTHON-SIDE RULE APPLICATOR ---
 # ====================================================================
 def _py_apply_single_rule(rule: str, word: str) -> Optional[str]:
-    """Apply one hashcat rule. Returns None for unsupported opcodes."""
-    if not rule:
-        return word
+    if not rule: return word
     w   = list(word.encode('latin-1'))
     cmd = rule[0]
     def dg(c): return ord(c) - 48 if '0' <= c <= '9' else -1
@@ -715,7 +620,6 @@ def _py_apply_single_rule(rule: str, word: str) -> Optional[str]:
 
 
 def py_apply_chain(chain: str, word: str) -> Optional[str]:
-    """Apply space-separated rule chain. Returns None if any opcode unsupported."""
     cur = word
     for r in chain.split():
         cur = _py_apply_single_rule(r, cur)
@@ -728,14 +632,6 @@ def py_apply_chain(chain: str, word: str) -> Optional[str]:
 # ====================================================================
 
 def compute_rule_signature(rule: str, probe_words: List[str]) -> tuple:
-    """
-    Compute the functional signature of *rule* over *probe_words*.
-
-    The signature is a tuple of outputs (one per probe word).  When the rule
-    contains an unsupported opcode, the entire tuple is replaced by the
-    single-element tuple ``('__UNSUPPORTED__',)`` so that all unsupported rules
-    are bucketed together and the highest-GPU-count one survives.
-    """
     outputs = []
     for word in probe_words:
         out = py_apply_chain(rule, word)
@@ -749,33 +645,6 @@ def minimize_by_signature(
     rule_counter: Counter,
     probe_words:  List[str],
 ) -> Counter:
-    """
-    Deduplicate *rule_counter* by functional signature.
-
-    Dispatcher — selects in-memory or disk-backed path based on
-    ``MINIMIZE_DISK_THRESHOLD``:
-
-    * ``len(rule_counter) <= MINIMIZE_DISK_THRESHOLD`` → ``_minimize_mem``
-      Classic in-memory dict approach.  Fast for small/medium sets.
-
-    * ``len(rule_counter) > MINIMIZE_DISK_THRESHOLD``  → ``_minimize_disk``
-      SQLite-backed path.  Keeps Python heap to O(MINIMIZE_DISK_BATCH_SIZE)
-      rows regardless of total rule count — safe for 8 M+ candidates.
-
-    Both paths produce identical output (same tie-breaking, same Counter).
-
-    Parameters
-    ----------
-    rule_counter : Counter
-        Raw GPU bloom-filter hit counts keyed by rule string.
-    probe_words : list
-        Fixed list of words used to compute signatures.
-
-    Returns
-    -------
-    Counter
-        Surviving rules mapped to their original GPU hit-counts.
-    """
     if not rule_counter:
         return Counter()
 
@@ -798,26 +667,6 @@ def _minimize_mem(
     rule_counter: Counter,
     probe_words:  List[str],
 ) -> Counter:
-    """
-    In-memory signature minimization (original v1 algorithm).
-
-    Stores all signature tuples as Python dict keys.  Each signature is a
-    tuple of ``len(probe_words)`` strings.  Peak heap usage is proportional
-    to ``len(rule_counter) * len(probe_words) * avg_output_length``.
-
-    Safe up to roughly ``MINIMIZE_DISK_THRESHOLD`` rules (default 500 k).
-    Above that the heap cost (~2.5 KB × N rules) causes OOM / core dumps on
-    typical machines; use ``_minimize_disk`` instead.
-
-    Algorithm
-    ---------
-    1. Compute signature = tuple of transformed probe outputs for every rule.
-    2. Group rules sharing the same signature into equivalence classes.
-    3. Keep the best representative per class (highest GPU hit-count;
-       ties broken by shortest chain depth, then lexicographic rule order).
-    4. Return a Counter of survivors with their original GPU counts.
-    """
-    # sig_map[signature] = list of (rule, gpu_count)
     sig_map: Dict[tuple, List[Tuple[str, int]]] = defaultdict(list)
     rule_items = list(rule_counter.items())
 
@@ -856,72 +705,6 @@ def _minimize_disk(
     rule_counter: Counter,
     probe_words:  List[str],
 ) -> Counter:
-    """
-    Disk-backed signature minimization for large rule sets (8 M+ candidates).
-
-    Why in-memory fails at scale
-    ----------------------------
-    The in-memory path (``_minimize_mem``) stores every signature as a Python
-    tuple of ``len(probe_words)`` strings in a dict.  Each tuple costs
-    ~2.5 KB of heap (40 probe words × ~57 B/string + tuple overhead).
-    At 8 M rules that is **~20 GB** of Python heap — well beyond what most
-    machines can provide, causing an OOM kill or C-extension crash (core dump).
-
-    How this path avoids the problem
-    ---------------------------------
-    Instead of keeping all signatures alive simultaneously, this function:
-
-    1. Computes the signature for one rule at a time.
-    2. Converts the signature to a compact SHA-1 hex digest (40 bytes) and
-       immediately discards the full tuple.
-    3. Writes ``(sig_hash, rule, count, depth)`` to a **temporary SQLite
-       database on disk** in batches of ``MINIMIZE_DISK_BATCH_SIZE`` rows.
-       SQLite's B-tree storage keeps only a small page cache in RAM
-       (configured to 128 MB here).
-    4. Uses ``INSERT … ON CONFLICT DO UPDATE`` so the table holds *at most
-       one row per equivalence class* at all times — the best representative
-       is kept in-place as better candidates arrive.
-    5. After all rules are processed, reads the final survivors in a single
-       ``SELECT rule, count FROM sig_best`` scan.
-    6. Deletes the temporary file in a ``finally`` block.
-
-    Peak Python heap is O(MINIMIZE_DISK_BATCH_SIZE × avg_rule_length) —
-    roughly a few hundred KB regardless of total rule count.
-
-    Tie-breaking
-    ------------
-    The SQL ``ON CONFLICT DO UPDATE`` clause implements the same three-level
-    tie-break as the in-memory path:
-        1. Highest GPU hit-count wins.
-        2. Equal count → shorter chain depth wins.
-        3. Equal count and depth → lexicographically smaller rule string wins.
-
-    Hash collisions
-    ---------------
-    SHA-1 produces a 160-bit digest.  For 8 M rules the birthday-collision
-    probability is ~(8e6)² / 2^161 ≈ 2.5 × 10⁻³⁵ — negligible in practice.
-    The ``__UNSUPPORTED__`` sentinel signature is hashed identically to all
-    other signatures; one representative survives as usual.
-
-    SQLite version requirement
-    --------------------------
-    ``ON CONFLICT DO UPDATE`` (upsert) requires SQLite ≥ 3.24 (June 2018).
-    Python 3.8 ships with SQLite ≥ 3.31, so this is universally available
-    on supported Python versions.
-
-    Parameters
-    ----------
-    rule_counter : Counter
-        Raw GPU bloom-filter hit counts keyed by rule string.
-    probe_words : list
-        Fixed list of words used to compute signatures.
-
-    Returns
-    -------
-    Counter
-        Surviving rules mapped to their original GPU hit-counts.
-        Identical to what ``_minimize_mem`` would return.
-    """
     tmp_fd, tmp_path = tempfile.mkstemp(
         suffix='.db', prefix='rulest_minimize_'
     )
@@ -929,13 +712,10 @@ def _minimize_disk(
 
     try:
         conn = sqlite3.connect(tmp_path)
-
-        # Performance pragmas — we accept losing the last batch on a hard
-        # crash (acceptable for a disposable temp file).
         conn.execute('PRAGMA journal_mode = WAL')
         conn.execute('PRAGMA synchronous  = OFF')
         conn.execute('PRAGMA temp_store   = MEMORY')
-        conn.execute('PRAGMA cache_size   = -131072')   # 128 MB page cache
+        conn.execute('PRAGMA cache_size   = -131072')
 
         conn.execute('''
             CREATE TABLE sig_best (
@@ -947,8 +727,6 @@ def _minimize_disk(
         ''')
         conn.commit()
 
-        # ON CONFLICT DO UPDATE — keep the best (rule, count, depth) per
-        # equivalence class in a single pass, no post-processing needed.
         _UPSERT = '''
             INSERT INTO sig_best (sig_hash, rule, count, depth)
             VALUES (?, ?, ?, ?)
@@ -983,11 +761,9 @@ def _minimize_disk(
         rule_items  = list(rule_counter.items())
         n_total     = len(rule_items)
         batch: List[Tuple[str, str, int, int]] = []
-        n_committed = 0    # rows flushed to SQLite so far (for unique-sig estimate)
+        n_committed = 0
 
-        log_info(
-            f"[MINIMIZE] Temp DB     : {dim(tmp_path)}"
-        )
+        log_info(f"[MINIMIZE] Temp DB     : {dim(tmp_path)}")
 
         with tqdm(
             total=n_total,
@@ -999,9 +775,6 @@ def _minimize_disk(
         ) as pbar:
             for rule, count in rule_items:
                 sig        = compute_rule_signature(rule, probe_words)
-                # Encode the full signature as a single Latin-1 string
-                # using the NULL byte (0x00) as a field separator — it
-                # cannot appear in normal hashcat rule outputs.
                 sig_str    = '\x00'.join(sig)
                 sig_hash   = hashlib.sha1(
                     sig_str.encode('latin-1', errors='replace')
@@ -1015,7 +788,6 @@ def _minimize_disk(
                     n_committed += len(batch)
                     batch.clear()
 
-                    # Cheap estimate of unique signatures seen so far
                     (n_sigs,) = conn.execute(
                         'SELECT COUNT(*) FROM sig_best'
                     ).fetchone()
@@ -1024,13 +796,11 @@ def _minimize_disk(
                     )
                     pbar.update(MINIMIZE_DISK_BATCH_SIZE)
 
-            # Flush the final (partial) batch
             if batch:
                 conn.executemany(_UPSERT, batch)
                 conn.commit()
                 pbar.update(len(batch))
 
-        # Read survivors — one row per equivalence class
         survivors   = Counter()
         (n_sigs,)   = conn.execute('SELECT COUNT(*) FROM sig_best').fetchone()
         cursor      = conn.execute('SELECT rule, count FROM sig_best')
@@ -1039,12 +809,9 @@ def _minimize_disk(
 
         conn.close()
 
-        # n_unsupported: rows whose sig_hash matches the SHA-1 of '__UNSUPPORTED__'
         _unsup_hash = hashlib.sha1(
             '__UNSUPPORTED__'.encode('latin-1')
         ).hexdigest()
-        # We can't count unsupported accurately post-upsert (only 1 row kept).
-        # Report 0 to keep the stats consistent with the memory path.
         _log_minimize_stats(n_total, survivors, n_sigs, n_unsupported=0)
         return survivors
 
@@ -1062,7 +829,6 @@ def _log_minimize_stats(
     n_groups:      int,
     n_unsupported: int,
 ) -> None:
-    """Print post-minimization statistics (shared by both paths)."""
     removed = n_input - len(survivors)
     log_info(f"[MINIMIZE] {green('Done')}")
     log_info(f"           Unique signatures : {bold(cyan(str(n_groups))):>12s}")
@@ -1084,11 +850,6 @@ def _log_minimize_stats(
 # ====================================================================
 
 def _hashcat_title_case(s: str) -> str:
-    """
-    Simulate hashcat's 'E' (title-case) rule on an all-lowercase string.
-    Capitalises the first letter and any letter immediately following a
-    space, hyphen, or underscore.
-    """
     result    = list(s)
     cap_next  = True
     for i, c in enumerate(result):
@@ -1101,63 +862,30 @@ def _hashcat_title_case(s: str) -> str:
 
 
 def _infer_case_rules(cased_stem: str) -> List[List[str]]:
-    """
-    Given a string of letters (possibly mixed case), return all candidate
-    lists of hashcat case-transform ops that convert ``cased_stem.lower()``
-    into ``cased_stem``.
-
-    Candidates are ordered from shortest to longest so callers can try
-    the cheapest option first.  Each inner list is one complete set of ops
-    (e.g. ``['c']`` or ``['T0', 'T3']``).
-
-    Returns an empty list if no pattern can be expressed within positions
-    0–9 (hashcat's positional-op limit).
-    """
     stem_lower = cased_stem.lower()
-
     if cased_stem == stem_lower:
-        return [[]]                           # already lowercase — no op needed
-
+        return [[]]
     candidates: List[List[str]] = []
-
-    # ── Single-op patterns (depth 1) ──────────────────────────────────────────
-    # u — uppercase all
     if cased_stem == stem_lower.upper():
         candidates.append(['u'])
-
-    # c — capitalize (first char upper, rest lower)
     if (len(cased_stem) >= 1
             and cased_stem[0] == cased_stem[0].upper()
             and cased_stem[1:] == cased_stem[1:].lower()):
         candidates.append(['c'])
-
-    # C — lowercase first char, uppercase rest
     if (len(cased_stem) >= 1
             and cased_stem[0] == cased_stem[0].lower()
             and cased_stem[1:] == cased_stem[1:].upper()):
         candidates.append(['C'])
-
-    # t — toggle every character's case
     toggled = ''.join(c.lower() if c.isupper() else c.upper() for c in stem_lower)
     if cased_stem == toggled:
         candidates.append(['t'])
-
-    # E — title case (first letter of each word)
     if cased_stem == _hashcat_title_case(stem_lower):
         candidates.append(['E'])
-
-    # ── Per-position TN ops (depth N) ─────────────────────────────────────────
-    # TN toggles position N.  Only positions 0–9 are addressable.
-    # Only emit TN ops when no single-op candidate (u/c/C/t/E) already
-    # covers the pattern — TN ops are a fallback for irregular mixed-case
-    # patterns that can't be expressed more compactly.
     if not candidates:
         uppercase_positions = [i for i, c in enumerate(cased_stem)
-                               if c != stem_lower[i]]    # differs from lowercase
+                               if c != stem_lower[i]]
         if uppercase_positions and all(p <= 9 for p in uppercase_positions):
-            tn_ops = [f'T{p}' for p in uppercase_positions]
-            candidates.append(tn_ops)
-
+            candidates.append([f'T{p}' for p in uppercase_positions])
     return candidates
 
 
@@ -1165,43 +893,20 @@ def _leet_decode_variants(
     middle: str,
     max_ambiguous: int = 3,
 ) -> Iterator[Tuple[str, frozenset]]:
-    """
-    Yield ``(decoded, leet_rules)`` pairs for every way to replace leet
-    characters in *middle* with their base-letter equivalents.
-
-    decoded    : *middle* with leet chars substituted by letters (may still
-                 contain uppercase letters from the original).
-    leet_rules : ``frozenset`` of hashcat ``s`` rule strings applied.
-
-    Only yields variants whose decoded form consists entirely of ASCII
-    letters (a-z, A-Z) — non-decodable chars abort the generator.
-
-    The branching factor is capped at *max_ambiguous* positions that have
-    more than one possible mapping (e.g. ``'1'`` → ``'i'`` or ``'l'``).
-    """
-    # Abort early if any char is not a letter and not a known leet char
     for ch in middle:
         if not ch.isalpha() and ch not in TOKEN_STRIP_LEET_CHARS:
             return
-
-    # Find leet positions and their candidate decodings
     leet_positions: List[Tuple[int, str, List[Tuple[str, str]]]] = []
     for i, ch in enumerate(middle):
         if ch in TOKEN_STRIP_LEET_CHARS:
-            options = _TOKEN_STRIP_LEET_BY_CHAR[ch]  # [(base_char, rule_str), ...]
+            options = _TOKEN_STRIP_LEET_BY_CHAR[ch]
             leet_positions.append((i, ch, options))
-
     if not leet_positions:
-        # No leet chars — yield as-is (already all letters due to guard above)
         yield (middle, frozenset())
         return
-
-    # Limit combinatorial explosion from ambiguous positions
     n_ambiguous = sum(1 for _, _, opts in leet_positions if len(opts) > 1)
     if n_ambiguous > max_ambiguous:
         return
-
-    # Enumerate all combinations of decodings
     choices_per_pos = [opts for _, _, opts in leet_positions]
     for combo in itertools.product(*choices_per_pos):
         decoded  = list(middle)
@@ -1218,23 +923,12 @@ def _decode_middle(
     middle: str,
     max_ambiguous: int = 3,
 ) -> Iterator[Tuple[str, frozenset, List[List[str]]]]:
-    """
-    Yield ``(stem, leet_rules, case_candidates)`` triples for every way
-    to decode the *middle* segment of a target password.
-
-    stem            : all-lowercase base string to look up in the wordlist
-    leet_rules      : ``frozenset`` of ``s`` rule strings for leet subs
-    case_candidates : list of lists — each inner list is one set of case-
-                      transform ops that converts *stem* into the cased
-                      form of *middle* after leet decoding
-    """
     for leet_decoded, leet_rules in _leet_decode_variants(middle, max_ambiguous):
-        # leet_decoded is all ASCII letters (a-z / A-Z)
         cased_stem      = leet_decoded
         stem            = cased_stem.lower()
         case_candidates = _infer_case_rules(cased_stem)
         if not case_candidates:
-            case_candidates = [[]]   # fall back: no case op (stem stays lowercase)
+            case_candidates = [[]]
         yield (stem, leet_rules, case_candidates)
 
 
@@ -1245,41 +939,22 @@ def _rule_chain_orderings(
     append_ops:  List[str],
     leading_ops: Optional[List[str]] = None,
 ) -> List[List[str]]:
-    """
-    Return candidate rule-chain orderings for the four op groups.
-
-    leading_ops   : optional fixed prefix (e.g. ['r'], ['d'], ['[']) that is
-                    prepended to every ordering unchanged.
-
-    Canonical ordering : [leading] case → leet → prepend → append
-    Alternative 1      : [leading] leet → case → prepend → append
-    Alternative 2      : [leading] prepend → case → leet → append
-
-    All orderings are verified by the caller via py_apply_chain.
-    """
     lead = leading_ops or []
     seen: Set[tuple] = set()
     result: List[List[str]] = []
-
     def _add(ops: List[str]) -> None:
         full = lead + ops
         key  = tuple(full)
         if key not in seen:
             seen.add(key)
             result.append(full)
-
-    _add(case_ops + leet_ops + prepend_ops + append_ops)          # canonical
+    _add(case_ops + leet_ops + prepend_ops + append_ops)
     if case_ops and leet_ops:
-        _add(leet_ops + case_ops + prepend_ops + append_ops)       # leet-first
+        _add(leet_ops + case_ops + prepend_ops + append_ops)
     if prepend_ops and (case_ops or leet_ops):
-        _add(prepend_ops + case_ops + leet_ops + append_ops)       # prefix-first
-
+        _add(prepend_ops + case_ops + leet_ops + append_ops)
     return result
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Internal helpers called by extract_token_strip_rules
-# ──────────────────────────────────────────────────────────────────────────────
 
 def _boundary_scan(
     word:           str,
@@ -1288,16 +963,6 @@ def _boundary_scan(
     max_suffix_len: int,
     min_stem_len:   int,
 ) -> List[Tuple[str, str, str]]:
-    """
-    Return (prefix, middle, suffix) triples from *word* where:
-      • prefix  consists entirely of *boundary_chars* (length 0..max_prefix_len)
-      • suffix  consists entirely of *boundary_chars* (length 0..max_suffix_len)
-      • middle  contains at least *min_stem_len* characters
-
-    The boundary scan terminates early (break) as soon as a non-boundary
-    character is encountered, matching the left-to-right scanning order used
-    in the original extraction.
-    """
     wlen    = len(word)
     triples: List[Tuple[str, str, str]] = []
     for p in range(0, min(max_prefix_len + 1, wlen + 1)):
@@ -1327,26 +992,13 @@ def _chains_from_middle(
     max_leet_amb:    int,
     leading_ops:     Optional[List[str]] = None,
 ) -> Set[str]:
-    """
-    Try to build rule chains that transform a base-wordlist stem into *middle*
-    (after prepend/append boundary ops from *prefix*/*suffix* are applied).
-
-    Handles leet decoding and case inference.  Verifies every candidate chain
-    against the original target via py_apply_chain.
-    """
-    # The full original target word is always prefix + middle + suffix.
-    # py_apply_chain(chain, stem) must equal this exactly.
     target_word = prefix + middle + suffix
-
     lead      = leading_ops or []
     lead_depth = len(lead)
-
     prepend_ops: List[str] = [f'^{c}' for c in reversed(prefix)]
     append_ops:  List[str] = [f'${c}' for c in suffix]
     boundary_depth = len(prepend_ops) + len(append_ops)
-
     found: Set[str] = set()
-
     for stem, leet_rules, case_candidates in _decode_middle(middle, max_leet_amb):
         if len(stem) < min_stem_len or stem not in base_set:
             continue
@@ -1379,14 +1031,6 @@ def _extract_letter_mode(
     max_suffix_len: int,
     max_leet_amb:   int,
 ) -> Set[str]:
-    """
-    LETTER MODE (original behaviour).
-    Boundary chars = digits + specials; middle = letters (+ leet).
-    Reconstructs target passwords of the form:
-        [digits/specials] STEM [digits/specials]
-    where STEM is a (possibly case-transformed / leet-substituted) word
-    from the base wordlist.
-    """
     found: Set[str] = set()
     for prefix, middle, suffix in _boundary_scan(
         word, TOKEN_STRIP_BOUNDARY, max_prefix_len, max_suffix_len, min_stem_len
@@ -1406,16 +1050,6 @@ def _extract_digit_mode(
     max_prefix_len: int,
     max_suffix_len: int,
 ) -> Set[str]:
-    """
-    DIGIT MODE (new, dynamic boundary).
-    Boundary chars = letters + specials; middle = pure digit sequence.
-    Used when the target word contains more digits than letters, e.g.:
-        "abc2024"  → stem "2024", boundary "abc" → rule '^c ^b ^a'
-        "12345abc" → stem "12345", boundary "abc" → rule '$a $b $c'
-    The digit sequence is looked up verbatim in the base wordlist (common
-    numeric passwords such as "123456" appear in rockyou-style lists).
-    No leet or case transforms apply to a pure-digit middle segment.
-    """
     found: Set[str] = set()
     for prefix, middle, suffix in _boundary_scan(
         word, TOKEN_STRIP_ALPHA_BOUNDARY, max_prefix_len, max_suffix_len, min_stem_len
@@ -1445,17 +1079,6 @@ def _extract_reverse_mode(
     max_suffix_len: int,
     max_leet_amb:   int,
 ) -> Set[str]:
-    """
-    REVERSE MODE — chain starts with 'r'.
-    Checks whether the middle segment of the target, when reversed, decodes
-    to a base-wordlist stem.  Handles leet and case transforms on the
-    reversed middle, combined with boundary prepend/append ops.
-
-    Example:
-        target  "drowssap!"   stem "password" → rule  'r $!'
-        target  "1drowssap"   stem "password" → rule  'r ^1'
-        target  "3DROWSSAP"   stem "password" → rule  'r u se3'
-    """
     found: Set[str] = set()
     if max_depth < 1:
         return found
@@ -1477,18 +1100,8 @@ def _extract_duplicate_mode(
     max_depth:    int,
     min_stem_len: int,
 ) -> Set[str]:
-    """
-    DUPLICATE / FOLD MODE — detect passwords formed by duplicating or folding
-    a base-wordlist word, optionally with leading/trailing boundary ops.
-
-    'd' (duplicate)  : stem → stem+stem
-        e.g. "passwordpassword" from "password"  → rule 'd'
-    'f' (fold)        : stem → stem+reverse(stem)
-        e.g. "passworddrowssap" from "password"  → rule 'f'
-    """
     found:  Set[str] = set()
     wlen   = len(word)
-
     for op, builder in (
         ('d', lambda s: s + s),
         ('f', lambda s: s + s[::-1]),
@@ -1513,16 +1126,6 @@ def _extract_delete_edge_mode(
     max_suffix_len: int,
     max_leet_amb:   int,
 ) -> Set[str]:
-    """
-    DELETE-EDGE MODE — chain starts with '[' (delete first) or ']' (delete last).
-    Useful when the target word has one extra character at the start or end
-    that does not fit the normal boundary model.
-
-    Example:
-        target "Xpassword!"  stem "password" — the 'X' prefix char is not a
-        typical boundary digit/special.  Trying '[' on 'Xpassword' after
-        stripping the '!' suffix finds the stem.
-    """
     found: Set[str] = set()
     if max_depth < 1 or len(word) < min_stem_len + 1:
         return found
@@ -1531,9 +1134,6 @@ def _extract_delete_edge_mode(
             trimmed, TOKEN_STRIP_BOUNDARY,
             max_prefix_len, max_suffix_len, min_stem_len
         ):
-            # The full original word must be reconstructed:
-            # op transforms "prefix+middle+suffix_in_trimmed" which came from
-            # original word.  py_apply_chain(chain, stem) == word handles this.
             found |= _chains_from_middle(
                 middle, prefix, suffix, base_set,
                 max_depth, min_stem_len, max_leet_amb,
@@ -1554,16 +1154,10 @@ def _extract_insert_mode(
     max_leet_amb: int,
     base_by_len: Dict[int, Set[str]],
 ) -> Set[str]:
-    """
-    INSERT MODE — detect iNX (insert char X at position N) rules.
-    Generates stem candidates by removing 1–2 characters from the word,
-    then checks base_set membership in O(1) per candidate.
-    """
     found: Set[str] = set()
     if max_depth < 2:
         return found
     wlen = len(word)
-    # ── Single insertion ────────────────────────────────────────────
     if wlen - 1 >= min_stem_len:
         for pos in range(min(wlen, 10)):
             candidate = word[:pos] + word[pos + 1:]
@@ -1572,7 +1166,6 @@ def _extract_insert_mode(
                 if HashcatRuleValidator.validate_rule_for_gpu(rule):
                     if py_apply_chain(rule, candidate) == word:
                         found.add(rule)
-    # ── Double insertion ─────────────────────────────────────────────
     if max_depth >= 3 and wlen - 2 >= min_stem_len:
         for i in range(min(wlen, 10)):
             for j in range(i + 1, min(wlen, 10)):
@@ -1594,31 +1187,24 @@ def _extract_swap_mode(
     min_stem_len: int,
     max_leet_amb: int,
 ) -> Set[str]:
-    """
-    SWAP MODE — detect *MN, k, K transposition rules.
-    Checks if the target is a transposition of a base-wordlist word.
-    """
     found: Set[str] = set()
     if max_depth < 1:
         return found
     wlen = len(word)
     if wlen < 2:
         return found
-    # k: swap first two chars
     k_sw = word[1] + word[0] + word[2:]
     if len(k_sw) >= min_stem_len and k_sw in base_set:
         rule = 'k'
         if HashcatRuleValidator.validate_rule_for_gpu(rule):
             if py_apply_chain(rule, k_sw) == word:
                 found.add(rule)
-    # K: swap last two chars
     K_sw = word[:-2] + word[-1] + word[-2]
     if len(K_sw) >= min_stem_len and K_sw in base_set:
         rule = 'K'
         if HashcatRuleValidator.validate_rule_for_gpu(rule):
             if py_apply_chain(rule, K_sw) == word:
                 found.add(rule)
-    # *MN: swap positions M and N
     max_pos = min(wlen - 1, 9)
     for m in range(max_pos + 1):
         for n in range(m + 1, max_pos + 1):
@@ -1641,15 +1227,10 @@ def _extract_range_mode(
     substr_idx: Dict[str, Set[str]],
     omit_idx:   Dict[str, Set[str]],
 ) -> Set[str]:
-    """
-    RANGE MODE — detect xNM (extract range) and ONM (omit range) rules.
-    Uses precomputed inverted indexes for O(1) stem lookup.
-    """
     found: Set[str] = set()
     if max_depth < 1:
         return found
     wlen = len(word)
-    # xNM: word is a contiguous slice of a base stem
     for stem in substr_idx.get(word, set()):
         if len(stem) < min_stem_len:
             continue
@@ -1663,7 +1244,6 @@ def _extract_range_mode(
                 if HashcatRuleValidator.validate_rule_for_gpu(rule):
                     if py_apply_chain(rule, stem) == word:
                         found.add(rule)
-    # ONM: word is stem with a contiguous range removed
     for stem in omit_idx.get(word, set()):
         if len(stem) < min_stem_len or len(stem) <= wlen:
             continue
@@ -1686,17 +1266,12 @@ def _extract_char_duplicate_mode(
     max_depth:   int,
     min_stem_len: int,
 ) -> Set[str]:
-    """
-    CHAR-DUP MODE — detect zN (prepend N copies of first char),
-    ZN (append N copies of last char), and q (duplicate every char) rules.
-    """
     found: Set[str] = set()
     if max_depth < 1:
         return found
     wlen = len(word)
     if wlen < 2:
         return found
-    # q: duplicate every char — word[::2] must equal base stem
     if wlen % 2 == 0:
         q_cand = word[::2]
         if len(q_cand) >= min_stem_len and q_cand in base_set:
@@ -1705,7 +1280,6 @@ def _extract_char_duplicate_mode(
                 if HashcatRuleValidator.validate_rule_for_gpu(rule):
                     if py_apply_chain(rule, q_cand) == word:
                         found.add(rule)
-    # zN: N extra copies of first char prepended
     for n in range(1, min(10, wlen)):
         if wlen <= n:
             continue
@@ -1716,7 +1290,6 @@ def _extract_char_duplicate_mode(
                 if HashcatRuleValidator.validate_rule_for_gpu(rule):
                     if py_apply_chain(rule, candidate) == word:
                         found.add(rule)
-    # ZN: N extra copies of last char appended
     for n in range(1, min(10, wlen)):
         if wlen <= n:
             continue
@@ -1739,10 +1312,6 @@ def _extract_ascii_transform_mode(
     base_by_len: Dict[int, Set[str]],
     ascii_idx:   Dict[str, Set[Tuple[str, str]]],
 ) -> Set[str]:
-    """
-    ASCII TRANSFORM MODE — detect +N, -N, LN, RN rules.
-    All lookups are O(1) via precomputed ascii_idx.
-    """
     found: Set[str] = set()
     if max_depth < 1:
         return found
@@ -1765,10 +1334,6 @@ def _extract_truncate_mode(
     max_leet_amb: int,
     prefix_idx:  Dict[str, Set[str]],
 ) -> Set[str]:
-    """
-    TRUNCATE MODE — detect 'N (truncate at position N) rules.
-    prefix_idx[word] gives all stems whose prefix equals word.
-    """
     found: Set[str] = set()
     if max_depth < 1:
         return found
@@ -1794,10 +1359,6 @@ def _extract_purge_mode(
     max_leet_amb: int,
     purge_idx:   Dict[str, Set[str]],
 ) -> Set[str]:
-    """
-    PURGE MODE — detect @X (remove all instances of char X) rules.
-    purge_idx[word] gives all stems s such that s.replace(c,'') == word.
-    """
     found: Set[str] = set()
     if max_depth < 1:
         return found
@@ -1821,10 +1382,6 @@ def _extract_repeat_mode(
     max_depth:   int,
     min_stem_len: int,
 ) -> Set[str]:
-    """
-    REPEAT MODE — detect pN (repeat word N times) rules.
-    Generalisation of 'd' for repetition counts > 2.
-    """
     found: Set[str] = set()
     if max_depth < 1:
         return found
@@ -1854,11 +1411,6 @@ def _extract_separator_title_mode(
     max_leet_amb:   int,
     base_lower_idx: Dict[str, Set[str]],
 ) -> Set[str]:
-    """
-    SEPARATOR TITLE-CASE MODE — detect eX rules.
-    Covers passwords like 'Pass-Word' from 'pass-word' using 'e-'.
-    Uses precomputed base_lower_idx for O(1) case-folded lookup.
-    """
     found: Set[str] = set()
     if max_depth < 1:
         return found
@@ -1887,6 +1439,36 @@ def _extract_separator_title_mode(
     return found
 
 
+def _extract_overwrite_mode(
+    word:        str,
+    base_set:    Set[str],
+    max_depth:   int,
+    min_stem_len: int,
+    overwrite_idx: Dict[str, Set[str]],
+) -> Set[str]:
+    """OVERWRITE MODE — detect oNX (overwrite char at position N with X) rules."""
+    found: Set[str] = set()
+    if max_depth < 1:
+        return found
+    wlen = len(word)
+    if wlen < min_stem_len:
+        return found
+    for pos in range(min(wlen, 10)):
+        key = word[:pos] + '\x00' + word[pos+1:]
+        stems = overwrite_idx.get(key)
+        if not stems:
+            continue
+        char = word[pos]
+        for stem in stems:
+            if len(stem) < min_stem_len or stem[pos] == char:
+                continue
+            rule = f"o{pos}{char}"
+            if HashcatRuleValidator.validate_rule_for_gpu(rule):
+                if py_apply_chain(rule, stem) == word:
+                    found.add(rule)
+    return found
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # STAGE 0 multiprocessing infrastructure
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1894,15 +1476,11 @@ def _extract_separator_title_mode(
 def _worker_init_p0(
     base_set=None, base_by_len=None, base_lower_idx=None,
     purge_idx=None, substr_idx=None, omit_idx=None,
-    prefix_idx=None, ascii_idx=None,
+    prefix_idx=None, ascii_idx=None, overwrite_idx=None,
 ) -> None:
-    """Pool initialiser for STAGE 0 workers.
-    With fork, globals are inherited via CoW — all args are None.
-    With spawn (Windows / macOS), they must be passed explicitly.
-    """
     global _p0_worker_base_set, _p0_worker_base_by_len, _p0_worker_base_lower_idx
     global _p0_worker_purge_idx, _p0_worker_substr_idx, _p0_worker_omit_idx
-    global _p0_worker_prefix_idx, _p0_worker_ascii_idx
+    global _p0_worker_prefix_idx, _p0_worker_ascii_idx, _p0_worker_overwrite_idx
     if base_set       is not None: _p0_worker_base_set       = base_set
     if base_by_len    is not None: _p0_worker_base_by_len    = base_by_len
     if base_lower_idx is not None: _p0_worker_base_lower_idx = base_lower_idx
@@ -1911,12 +1489,10 @@ def _worker_init_p0(
     if omit_idx       is not None: _p0_worker_omit_idx       = omit_idx
     if prefix_idx     is not None: _p0_worker_prefix_idx     = prefix_idx
     if ascii_idx      is not None: _p0_worker_ascii_idx      = ascii_idx
+    if overwrite_idx  is not None: _p0_worker_overwrite_idx  = overwrite_idx
 
 
 def _process_chunk_p0(args: Tuple) -> Set[str]:
-    """Worker function — process one chunk of target words for STAGE 0.
-    Returns the set of discovered rule chains for the chunk.
-    """
     (words_chunk, max_depth, min_stem_len, max_leet_amb,
      max_prefix_len, max_suffix_len, enable_new_modes) = args
 
@@ -1928,6 +1504,7 @@ def _process_chunk_p0(args: Tuple) -> Set[str]:
     omit_idx       = _p0_worker_omit_idx
     prefix_idx     = _p0_worker_prefix_idx
     ascii_idx      = _p0_worker_ascii_idx
+    overwrite_idx  = _p0_worker_overwrite_idx
     found: Set[str] = set()
 
     for word in words_chunk:
@@ -1937,7 +1514,6 @@ def _process_chunk_p0(args: Tuple) -> Set[str]:
         n_alpha   = sum(1 for c in word if c.isalpha())
         digit_primary = n_digits > n_alpha
 
-        # ── Original five modes ─────────────────────────────────────
         if digit_primary:
             found |= _extract_digit_mode(
                 word, base_set, max_depth, min_stem_len,
@@ -1972,7 +1548,6 @@ def _process_chunk_p0(args: Tuple) -> Set[str]:
                 word, base_set, max_depth, min_stem_len,
             )
 
-        # ── New v1.1 modes ─────────────────────────────────────────
         if enable_new_modes:
             if max_depth >= 2:
                 found |= _extract_insert_mode(
@@ -2010,68 +1585,33 @@ def _process_chunk_p0(args: Tuple) -> Set[str]:
                     word, base_set, max_depth, min_stem_len, max_leet_amb,
                     base_lower_idx,
                 )
+                found |= _extract_overwrite_mode(
+                    word, base_set, max_depth, min_stem_len, overwrite_idx,
+                )
     return found
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Toggle-chain seed generator (T0..TN patterns for STAGE 2 injection)
-# ──────────────────────────────────────────────────────────────────────────────
-
 def _generate_toggle_chain_seeds(max_depth: int) -> List[str]:
-    """
-    Generate T-position toggle chains for direct injection into STAGE 2 as
-    seed chains.  These are NOT derived from stem lookups — they are
-    deterministic patterns that the empirical evidence shows produce large
-    numbers of Phase-2 hits when used as seed scaffolding.
-
-    Patterns generated
-    ──────────────────
-    1. Sequential  T0 T1 … TN   (N = 0..min(9, max_depth-1))
-       Toggles the first N+1 characters.  Combined with every leet op.
-
-    2. Even-position  T0 T2 T4 T6 T8
-       Toggles even positions.  Combined with every leet op.
-
-    3. Odd-position   T1 T3 T5 T7 T9
-       Toggles odd positions.  Combined with every leet op.
-
-    4. Single T0 prepended to every leet op (depth 2, highest utility per
-       observation: "T0 se3", "T0 si1", "T0 sa@", …).
-
-    Leet ops combined
-    ─────────────────
-    Each toggle base pattern is paired with:
-      • every single leet op (depth base+1)
-      • the two most common double-leet combos: se3+si1, sa@+so0 (depth base+2)
-
-    All chains are validated via HashcatRuleValidator before being included.
-    """
     LEET_OPS = ['sa@', 'se3', 'so0', 'si1', 'sl1', 'ss5', 'ss$', 'st7', 'sa4', 'si!']
     DOUBLE_LEET = [('se3', 'si1'), ('se3', 'sl1'), ('sa@', 'so0'), ('ss5', 'so0'),
                    ('si1', 'so0'), ('se3', 'so0'), ('ss$', 'se3'), ('sa4', 'sl1')]
-
     seeds: Set[str] = set()
-
     def _add(ops: List[str]) -> None:
         if not ops or len(ops) > max_depth:
             return
         chain = ' '.join(ops)
         if HashcatRuleValidator.validate_rule_for_gpu(chain):
             seeds.add(chain)
-
-    # ── 1. Sequential T0 T1 … TN ──────────────────────────────────────────────
-    for n in range(0, min(10, max_depth)):           # T0 alone … T0..T9
+    for n in range(0, min(10, max_depth)):
         t_ops = [f'T{i}' for i in range(n + 1)]
-        _add(t_ops)                                   # pure toggle chain
+        _add(t_ops)
         for leet in LEET_OPS:
-            _add(t_ops + [leet])                      # toggle then leet
+            _add(t_ops + [leet])
             if n >= 1:
-                _add([leet] + t_ops)                  # leet then toggle
+                _add([leet] + t_ops)
         for l1, l2 in DOUBLE_LEET:
-            _add(t_ops + [l1, l2])                    # toggle + double leet
-            _add([l1] + t_ops + [l2])                 # leet before and after
-
-    # ── 2. Even positions T0 T2 T4 T6 T8 ─────────────────────────────────────
+            _add(t_ops + [l1, l2])
+            _add([l1] + t_ops + [l2])
     for n in range(1, min(5, max_depth)):
         t_ops = [f'T{i * 2}' for i in range(n + 1)]
         _add(t_ops)
@@ -2080,8 +1620,6 @@ def _generate_toggle_chain_seeds(max_depth: int) -> List[str]:
             _add([leet] + t_ops)
         for l1, l2 in DOUBLE_LEET:
             _add(t_ops + [l1, l2])
-
-    # ── 3. Odd positions T1 T3 T5 T7 T9 ──────────────────────────────────────
     for n in range(1, min(5, max_depth)):
         t_ops = [f'T{i * 2 + 1}' for i in range(n + 1)]
         _add(t_ops)
@@ -2090,12 +1628,9 @@ def _generate_toggle_chain_seeds(max_depth: int) -> List[str]:
             _add([leet] + t_ops)
         for l1, l2 in DOUBLE_LEET:
             _add(t_ops + [l1, l2])
-
-    # ── 4. T0 + single leet (highest-utility depth-2 seeds) ───────────────────
     for leet in LEET_OPS:
         _add(['T0', leet])
         _add([leet, 'T0'])
-
     return sorted(seeds)
 
 
@@ -2111,53 +1646,6 @@ def extract_token_strip_rules(
     chunk_size:         int  = 0,
     enable_new_modes:   bool = True,
 ) -> List[str]:
-    """
-    STAGE 0 — Token-Strip rule extraction (multiprocessing, 14 modes).
-
-    Original five modes
-    ───────────────────
-    LETTER MODE      boundary = digits+specials   → stem = letters (+leet)
-    DIGIT MODE       boundary = letters+specials  → stem = pure digit run
-    REVERSE MODE     chain prefix 'r'
-    DELETE-EDGE MODE chain prefix '[' or ']'
-    DUPLICATE/FOLD   chain 'd' or 'f'
-
-    New v1.1 modes (enabled by default, disable with enable_new_modes=False)
-    ──────────────────────────────────────────────────────────────────────────
-    INSERT MODE      iNX — intra-word character insertions
-    SWAP MODE        *MN, k, K — transposition detection
-    RANGE MODE       xNM, ONM — contiguous extract/omit
-    CHAR-DUP MODE    zN, ZN, q — character-level duplication
-    ASCII MODE       +N, -N, LN, RN — single-char ASCII offset
-    TRUNCATE MODE    'N — position-based truncation
-    PURGE MODE       @X — remove all instances of char X
-    REPEAT MODE      pN — word-level repetition (>2 copies)
-    SEP-TITLE MODE   eX — title-case after separator char X
-
-    Parallelism
-    ───────────
-    workers=0 (default) → use all CPU cores.
-    The base-set inverted indexes (purge, substr, omit, prefix, ascii) are
-    built once in the main process and inherited by forked workers via CoW
-    (Linux/macOS).  On Windows/spawn, they are passed via initargs.
-
-    Parameters
-    ----------
-    target_words       : words from the target wordlist
-    base_set           : set of words from the base wordlist (lowercase)
-    max_depth          : maximum rule chain length; 0 = MAX_HASHCAT_CHAIN
-    min_stem_len       : reject stems shorter than this (default 4)
-    max_prefix_len     : maximum boundary prefix length to try (default 4)
-    max_suffix_len     : maximum boundary suffix length to try (default 4)
-    max_leet_ambiguity : max ambiguous leet positions per word (default 3)
-    workers            : worker processes (0 = cpu_count)
-    chunk_size         : words per chunk (0 = auto)
-    enable_new_modes   : include v1.1 extraction modes (default True)
-
-    Returns
-    -------
-    Sorted, deduplicated list of valid hashcat rule strings.
-    """
     if max_depth <= 0:
         max_depth = MAX_HASHCAT_CHAIN
 
@@ -2166,8 +1654,6 @@ def extract_token_strip_rules(
     if chunk_size <= 0:
         chunk_size = max(500, n_words // (n_workers * 4) + 1)
 
-    # ── Build inverted indexes once in main process ──────────────────────────
-    # Workers inherit them via CoW fork (zero copy) on Linux/macOS.
     log_debug("[S0]    Building lookup indexes …")
     base_by_len:    Dict[int, Set[str]]            = defaultdict(set)
     base_lower_idx: Dict[str, Set[str]]            = defaultdict(set)
@@ -2176,6 +1662,7 @@ def extract_token_strip_rules(
     omit_idx:       Dict[str, Set[str]]            = defaultdict(set)
     prefix_idx:     Dict[str, Set[str]]            = defaultdict(set)
     ascii_idx:      Dict[str, Set[Tuple[str, str]]] = defaultdict(set)
+    overwrite_idx:  Dict[str, Set[str]]            = defaultdict(set)
 
     for w in base_set:
         wlen = len(w)
@@ -2204,12 +1691,14 @@ def extract_token_strip_rules(
                 (chr((sc >> 1) & 0xFF), 'R'),
             ):
                 ascii_idx[w[:pos] + shifted + w[pos + 1:]].add((w, f"{rchar}{pos}"))
-        # Full-word uniform +1/-1 shift (covers "+0 +1 … +N" type chains)
         for delta, rchar in ((1, '+'), (-1, '-')):
             full_t = ''.join(chr((ord(c) + delta) & 0xFF) for c in w)
             if full_t != w:
                 chain_str = ' '.join(f"{rchar}{p}" for p in range(min(wlen, 10)))
                 ascii_idx[full_t].add((w, chain_str))
+        if enable_new_modes:
+            for pos in range(min(wlen, 10)):
+                overwrite_idx[w[:pos] + '\x00' + w[pos+1:]].add(w)
 
     base_by_len    = dict(base_by_len)
     base_lower_idx = dict(base_lower_idx)
@@ -2218,14 +1707,15 @@ def extract_token_strip_rules(
     omit_idx       = dict(omit_idx)
     prefix_idx     = dict(prefix_idx)
     ascii_idx      = dict(ascii_idx)
+    overwrite_idx  = dict(overwrite_idx)
     log_debug(f"[S0]    Indexes built  purge:{len(purge_idx)}  "
               f"substr:{len(substr_idx)}  omit:{len(omit_idx)}  "
-              f"prefix:{len(prefix_idx)}  ascii:{len(ascii_idx)}")
+              f"prefix:{len(prefix_idx)}  ascii:{len(ascii_idx)}  "
+              f"overwrite:{len(overwrite_idx)}")
 
-    # ── Expose globals before Pool() so forked workers CoW-inherit them ──────
     global _p0_worker_base_set, _p0_worker_base_by_len, _p0_worker_base_lower_idx
     global _p0_worker_purge_idx, _p0_worker_substr_idx, _p0_worker_omit_idx
-    global _p0_worker_prefix_idx, _p0_worker_ascii_idx
+    global _p0_worker_prefix_idx, _p0_worker_ascii_idx, _p0_worker_overwrite_idx
     _p0_worker_base_set       = base_set
     _p0_worker_base_by_len    = base_by_len
     _p0_worker_base_lower_idx = base_lower_idx
@@ -2234,8 +1724,8 @@ def extract_token_strip_rules(
     _p0_worker_omit_idx       = omit_idx
     _p0_worker_prefix_idx     = prefix_idx
     _p0_worker_ascii_idx      = ascii_idx
+    _p0_worker_overwrite_idx  = overwrite_idx
 
-    # ── Build task chunks ─────────────────────────────────────────────────────
     chunks    = [target_words[i:i + chunk_size] for i in range(0, n_words, chunk_size)]
     n_chunks  = len(chunks)
     task_args = [
@@ -2244,7 +1734,7 @@ def extract_token_strip_rules(
         for chunk in chunks
     ]
 
-    mode_label = green('14 modes') if enable_new_modes else yellow('5 modes')
+    mode_label = green('15 modes') if enable_new_modes else yellow('5 modes')
     log_info(
         f"[S0]    Workers: {bold(str(n_workers))}  |  "
         f"chunks: {bold(str(n_chunks))} × ~{chunk_size}  |  "
@@ -2263,7 +1753,7 @@ def extract_token_strip_rules(
             initializer = _worker_init_p0,
             initargs    = (base_set, base_by_len, base_lower_idx,
                            purge_idx, substr_idx, omit_idx,
-                           prefix_idx, ascii_idx),
+                           prefix_idx, ascii_idx, overwrite_idx),
         )
 
     with ctx.Pool(**pool_kw) as pool:
@@ -2282,6 +1772,18 @@ def extract_token_strip_rules(
                 pbar.set_postfix({"rules": cyan(str(len(found)))}, refresh=False)
                 pbar.update(len(task_arg[0]))
 
+    # Clear worker globals immediately to free memory
+    _p0_worker_base_set       = set()
+    _p0_worker_base_by_len    = {}
+    _p0_worker_base_lower_idx = {}
+    _p0_worker_purge_idx      = {}
+    _p0_worker_substr_idx     = {}
+    _p0_worker_omit_idx       = {}
+    _p0_worker_prefix_idx     = {}
+    _p0_worker_ascii_idx      = {}
+    _p0_worker_overwrite_idx  = {}
+    log_debug("[S0]    Worker globals cleared — RAM released")
+
     return sorted(found)
 
 
@@ -2290,12 +1792,10 @@ def _log_token_strip_stats(
     rules:       List[str],
     inject_sbd:  bool,
 ) -> None:
-    """Print STAGE 0 summary statistics with per-mode rule prefix breakdown."""
     if not rules:
         log_info(f"[S0]    {yellow('0')} rules extracted by token-strip "
                  f"({n_words:,} target words scanned)")
         return
-
     depth_dist: Dict[int, int] = defaultdict(int)
     mode_counts: Dict[str, int] = defaultdict(int)
     for r in rules:
@@ -2338,12 +1838,13 @@ def _log_token_strip_stats(
             mode_counts['repeat']      += 1
         elif first.startswith('e') and len(first) == 2:
             mode_counts['sep-title']   += 1
+        elif first.startswith('o') and len(first) == 3:
+            mode_counts['overwrite']   += 1
         elif all(c.isdigit() or c in ('^', '$', ' ')
                  for c in r) and any(c.isdigit() for c in r):
             mode_counts['digit-bnd']   += 1
         else:
             mode_counts['letter']      += 1
-
     depth_summary = '  '.join(f"d{d}:{depth_dist[d]:,}" for d in sorted(depth_dist))
     inj = green('injected into STAGE S sbd') if inject_sbd else dim('STAGE S inactive')
     mode_str = '  '.join(f"{k}:{v}" for k, v in sorted(mode_counts.items()) if v)
@@ -2482,50 +1983,34 @@ class GPUCompatibleRulesGenerator:
     def generate_gpu_compatible_rules(self):
         rules  = set()
         digits = '0123456789'
-
-        # Single‑letter rules (excluding p, z, Z because they need a digit)
         rules.update(['l','u','c','C','t','r','d','f',
                       'q','E','{','}','[',']','k','K',':'])
-
-        # Two‑letter rules that need a digit
         for cmd in ('T','D','L','R','+','-','.',',', "'", 'z','Z','y','Y'):
             for pos in digits: rules.add(f'{cmd}{pos}')
-
-        # Two‑letter rules that need a digit (p)
         for pos in digits:
             rules.add(f'p{pos}')
-
-        # Three‑letter rules that need two digits
         for cmd in ('x','*','O'):
             for p1 in digits:
                 for p2 in digits: rules.add(f'{cmd}{p1}{p2}')
-
         for i in range(33, 127):
             ch = chr(i)
             rules.add(f'^{ch}'); rules.add(f'${ch}'); rules.add(f'@{ch}')
-
         for orig in string.ascii_lowercase + string.ascii_uppercase:
             for sub in string.digits + string.punctuation:
                 if orig != sub: rules.add(f's{orig}{sub}')
-
         chars = string.ascii_letters + string.digits + '!@#$%^&*()_+-=[]{}|;:,.<>?/~'
         for pos in digits:
             for ch in chars:
                 rules.add(f'i{pos}{ch}'); rules.add(f'o{pos}{ch}')
-
         for n in range(1, 10):
             for ch in ('p','y','Y','z','Z'): rules.add(f'{ch}{n}')
-
         for sep in '-_.,;:|/\\+*&^%$#@!~`':
             rules.add(f'e{sep}')
-
         chars2 = string.ascii_letters + string.digits + '!@#$%^&*()_+-=[]{}|;:,.<>?/~'
         for n in digits:
             for sep in chars2: rules.add(f'3{n}{sep}')
-
         valid = [r for r in rules
                  if self.validator.validate_rule_for_gpu(r) and 1 <= len(r) <= MAX_RULE_LEN]
-
         log_debug(f"Generated {len(valid):,} GPU-compatible atomic rules")
         return valid
 
@@ -2646,8 +2131,6 @@ __kernel void find_single_rules_gpu(
     }}
 }}
 
-/* Chain kernel: do NOT abort on result==0 (rule had no effect on this particular
-   word — still a valid chain step).  Only abort if the word becomes empty.      */
 __kernel void find_rule_chains_gpu(
     __global const unsigned char *bw,__global const int *bo,__global const int *bl,
     __global const unsigned char *rs,__global const int *ro,__global const int *rl,
@@ -2693,32 +2176,28 @@ class GPUEngine:
         self.max_work_group_size = 512
         self.local_work_size     = params.get('LOCAL_WORK_SIZE', 512)
         self.bloom_buf           = None
-        self.bloom_np            = None   # keep a copy so _reset_gpu can re-upload
+        self.bloom_np            = None
         self.rule_index          = {}
         self.gpu_rules           = []
         self.kernel_single       = None
         self.kernel_chain        = None
-        self._consecutive_errors = 0      # consecutive batch failures — triggers graceful exit
-        self._MAX_CONSECUTIVE_ERRORS = 5  # give up GPU STAGE after this many in a row
-        # FIX 2: VRAM / max-alloc queried once at init, not on every kernel call
+        self._consecutive_errors = 0
+        self._MAX_CONSECUTIVE_ERRORS = 5
         self._cached_free_vram   = None
         self._cached_max_alloc   = None
-        # FIX 3: persistent GPU buffers for rules (constant across all word batches)
         self._rules_buf          = None
         self._rules_offsets_buf  = None
         self._rules_lengths_buf  = None
-        self._rules_buf_key      = None   # id() of gpu_rules list these were built from
+        self._rules_buf_key      = None
 
     def get_free_vram(self):      return estimate_free_vram(self.device)
     def get_max_allocation(self): return get_max_allocation(self.device)
 
     def _refresh_cached_limits(self):
-        """Cache VRAM / max-alloc once — never query driver on every kernel call."""
         self._cached_free_vram = estimate_free_vram(self.device)
         self._cached_max_alloc = get_max_allocation(self.device)
 
     def safe_output_buffer_size(self, words_count, chains_count):
-        # FIX 2: use cached values instead of driver round-trip per kernel call
         fv    = self._cached_free_vram if self._cached_free_vram is not None else self.get_free_vram()
         ma    = self._cached_max_alloc if self._cached_max_alloc is not None else self.get_max_allocation()
         avail = min(fv, ma) - 5*1024**2
@@ -2736,7 +2215,7 @@ class GPUEngine:
             self.local_work_size = min(self.local_work_size, self.max_work_group_size)
             while self.max_work_group_size % self.local_work_size != 0 and self.local_work_size > 32:
                 self.local_work_size //= 2
-            self._refresh_cached_limits()               # FIX 2: cache once at init
+            self._refresh_cached_limits()
             vram_gb = self._cached_free_vram / 1024**3
             log_info(f"[GPU]  {bold(self.device.name.strip())}")
             log_debug(f"       WGS={self.local_work_size}, VRAM~{vram_gb:.1f}GB, "
@@ -2747,11 +2226,11 @@ class GPUEngine:
 
     def compile_kernel(self):
         """
-        Compile the OpenCL kernels.  Both cl.Program() and build() are run
-        on a background thread so the main thread can print a progress ticker
-        immediately — on some NVIDIA drivers the Program constructor itself
-        blocks before build() is even called.
+        Idempotency guard — kernel is compiled once per GPU context.
         """
+        if self.program is not None:
+            log_debug("compile_kernel: already compiled — skipping")
+            return self.program
         try:
             src = GPU_KERNEL_TEMPLATE.format(
                 BLOOM_FILTER_SIZE          = self.params['BLOOM_FILTER_SIZE'],
@@ -2764,7 +2243,7 @@ class GPUEngine:
                 BLOOM_HASH_FUNCTIONS       = BLOOM_HASH_FUNCTIONS,
             )
             context = self.context
-            result: list = [None]   # [program | Exception]
+            result: list = [None]
 
             def _build():
                 try:
@@ -2796,31 +2275,8 @@ class GPUEngine:
             log_error(f"Kernel compile failed: {e}"); return None
 
     def _reset_gpu(self, error: Exception) -> bool:
-        """
-        Attempt a full GPU context recovery after a fatal OpenCL error.
-
-        ``INVALID_COMMAND_QUEUE`` almost always means the underlying OpenCL
-        context is lost (GPU TDR / driver reset / VRAM fault).  Recreating
-        only the ``CommandQueue`` (the old approach) leaves ``self.context``
-        pointing at a dead object, so the very next GPU call raises the same
-        error again.
-
-        This method tears down *everything* — context, queue, program, bloom
-        buffer — and rebuilds from scratch using the device reference that was
-        captured during ``initialize_gpu``.  The cached bloom numpy array
-        (``self.bloom_np``) is re-uploaded so subsequent batches can continue
-        without recomputing it.
-
-        Returns True if recovery succeeded, False if it failed (caller should
-        then abort the GPU STAGE gracefully).
-        """
         log_warn(f"[GPU] Fatal kernel error: {error}  — attempting full context reset")
-        # ── tear down ──────────────────────────────────────────────────────
-        # Release each OpenCL object in a daemon thread so that a stuck
-        # driver cannot deadlock the main process.  We give each release
-        # 5 s; if it times out we abandon the object and carry on.
         _RELEASE_TIMEOUT = 5.0
-
         def _timed_release(obj):
             def _do():
                 try: obj.release()
@@ -2828,29 +2284,21 @@ class GPUEngine:
             t = threading.Thread(target=_do, daemon=True)
             t.start()
             t.join(timeout=_RELEASE_TIMEOUT)
-            # If t is still alive after the timeout the driver is stuck;
-            # we abandon the object — it will be cleaned up by the OS when
-            # the process exits, which is acceptable.
-
         for attr in ('bloom_buf', 'program', 'kernel_single', 'kernel_chain',
                      'queue', 'context'):
             obj = getattr(self, attr, None)
             if obj is not None:
                 _timed_release(obj)
             setattr(self, attr, None)
-
-        # FIX 3: rule buffers belong to the dead context — must be re-created
         for attr in ('_rules_buf', '_rules_offsets_buf', '_rules_lengths_buf'):
             b = getattr(self, attr, None)
             if b is not None:
                 _timed_release(b)
             setattr(self, attr, None)
         self._rules_buf_key = None
-
         if self.device is None:
             log_error("[GPU] No device reference — cannot recover context")
             return False
-
         try:
             self.context         = cl.Context([self.device])
             self.queue           = cl.CommandQueue(self.context)
@@ -2861,7 +2309,7 @@ class GPUEngine:
             if not self.compile_kernel():
                 log_error("[GPU] Context reset: kernel recompile failed")
                 return False
-            self._refresh_cached_limits()               # FIX 2: refresh after reset
+            self._refresh_cached_limits()
             if self.bloom_np is not None:
                 self.upload_bloom_filter(self.bloom_np)
             log_info("[GPU] Context reset successful — resuming")
@@ -2870,35 +2318,21 @@ class GPUEngine:
             log_error(f"[GPU] Context reset failed: {exc}")
             return False
 
-    _QUEUE_FINISH_TIMEOUT = 90  # seconds before we declare a GPU stall
+    _QUEUE_FINISH_TIMEOUT = 90
 
     def _safe_queue_finish(self) -> bool:
-        """
-        Call queue.finish() on a daemon thread with a hard timeout.
-
-        Without a timeout, queue.finish() blocks the main thread forever
-        when the GPU stalls (TDR, driver crash, kernel infinite loop) —
-        this was the root cause of the "hang at 2% of Stage 1" bug.
-
-        Returns True on success.  On timeout or OpenCL exception, triggers
-        a full context reset via _reset_gpu and returns False.
-        """
         if self.queue is None:
             return False
-
-        result: list = [None]   # None = not yet done, True = ok, Exception = error
-
+        result: list = [None]
         def _finish():
             try:
                 self.queue.finish()
                 result[0] = True
             except Exception as exc:
                 result[0] = exc
-
         t = threading.Thread(target=_finish, daemon=True)
         t.start()
         t.join(timeout=self._QUEUE_FINISH_TIMEOUT)
-
         if t.is_alive():
             log_warn(
                 f"[GPU] queue.finish() hung for {self._QUEUE_FINISH_TIMEOUT}s "
@@ -2906,12 +2340,10 @@ class GPUEngine:
             )
             self._reset_gpu(RuntimeError("queue.finish timeout — GPU stall"))
             return False
-
         if isinstance(result[0], Exception):
             log_warn(f"[GPU] queue.finish() raised: {result[0]}")
             self._reset_gpu(result[0])
             return False
-
         return True
 
     def generate_bloom_filter(self, target_words):
@@ -2936,7 +2368,7 @@ class GPUEngine:
         if self.bloom_buf:
             try: self.bloom_buf.release()
             except Exception: pass
-        self.bloom_np  = bf                       # keep a copy for context recovery
+        self.bloom_np  = bf
         self.bloom_buf = cl.Buffer(self.context, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=bf)
 
     def _flatten(self, items):
@@ -2957,23 +2389,13 @@ class GPUEngine:
                     num_words=len(words), num_rules=len(rules))
 
     def prepare_words_data(self, words):
-        """FIX 3: flatten only words — rules stay in persistent GPU buffers."""
         wf, wo, wl = self._flatten(words)
         return dict(words_flat=wf, word_offsets=wo, word_lengths=wl,
                     num_words=len(words), num_rules=len(self.gpu_rules))
 
     def _get_rules_buffers(self, mf):
-        """
-        FIX 3: return (and lazily create) persistent GPU buffers for self.gpu_rules.
-
-        Rules are constant for the entire duration of Stage 1 and Stage 2, so
-        there is no reason to re-encode and re-upload them on every word batch.
-        We allocate the three buffers once and reuse them, rebuilding only when
-        gpu_rules changes identity (i.e. after a context reset or stage change).
-        """
         key = id(self.gpu_rules)
         if self._rules_buf_key != key:
-            # Release any stale buffers from a previous context
             for attr in ('_rules_buf', '_rules_offsets_buf', '_rules_lengths_buf'):
                 b = getattr(self, attr, None)
                 if b is not None:
@@ -3013,21 +2435,12 @@ class GPUEngine:
                         counter.update(found)
                         pbar.set_postfix({"rules": cyan(str(len(counter)))}, refresh=False)
                     elif self.queue is None:
-                        # _reset_gpu failed — GPU is unrecoverable
                         self._consecutive_errors += 1
                         if self._consecutive_errors >= self._MAX_CONSECUTIVE_ERRORS:
                             log_warn(f"[GPU] {self._consecutive_errors} consecutive failures — "
                                      f"aborting STAGE 1 gracefully")
                             break
                 pbar.update(len(batch))
-                # NOTE: _safe_queue_finish() is intentionally NOT called here.
-                # _run_single_kernel() already calls _safe_queue_finish() internally
-                # (after the kernel dispatch) AND performs blocking cl.enqueue_copy
-                # result readbacks before returning.  The queue is fully drained
-                # before this point.  Calling queue.finish() a second time on an
-                # already-empty queue triggers a driver-level deadlock on several
-                # OpenCL implementations (Intel/AMD iGPU), causing the process to
-                # hang silently after the progress bar reaches 100 %.
 
         gc.collect()
         log_info(f"[S1]    {bold(green(str(len(counter))))} unique rules passed bloom filter")
@@ -3042,7 +2455,6 @@ class GPUEngine:
                 bufs.append(b); return b
 
             bb=B(bd['words_flat']); bbo=B(bd['word_offsets']); bbl=B(bd['word_lengths'])
-            # FIX 3: reuse persistent rule buffers — no re-upload per batch
             rb, rbo, rbl = self._get_rules_buffers(mf)
             outs = self.safe_output_buffer_size(bd['num_words'], bd['num_rules'])
             fo = cl.Buffer(self.context, mf.WRITE_ONLY, outs*MAX_CHAIN_STRING_LEN); bufs.append(fo)
@@ -3051,10 +2463,12 @@ class GPUEngine:
 
             tot = bd['num_words'] * bd['num_rules']
             gs  = ((tot+self.local_work_size-1)//self.local_work_size)*self.local_work_size
-            self.kernel_single.set_args(bb,bbo,bbl,rb,rbo,rbl,self.bloom_buf,
-                                        np.int32(bd['num_words']),np.int32(bd['num_rules']),fo,fc)
+            # Używamy np.int32, nie int – unikamy INVALID_VALUE
+            self.kernel_single.set_args(bb, bbo, bbl, rb, rbo, rbl, self.bloom_buf,
+                                        np.int32(bd['num_words']),
+                                        np.int32(bd['num_rules']),
+                                        fo, fc)
             cl.enqueue_nd_range_kernel(self.queue, self.kernel_single, (gs,), (self.local_work_size,))
-            # FIX 1: use timed finish — bare queue.finish() hangs forever on GPU stall
             if not self._safe_queue_finish():
                 return []
 
@@ -3098,150 +2512,29 @@ class GPUEngine:
         return gen
 
     def build_numeric_seed_families(self, max_depth: int = 4) -> dict:
-        """
-        Build nine seed families for STAGE S direct extraction.
-
-        Every family produces chains that are tested against the bloom filter
-        individually via the GPU chain kernel — they are extraction candidates
-        first, not only scaffolding for random chain generation.
-
-        ── Numeric families (A–E) ──────────────────────────────────────────
-
-        Family A — Pure Prepend (depths 1–4)
-            One ^digit op per digit, right-to-left so the number reads
-            correctly.  e.g. prepend 12 → "^2 ^1".
-            Counts per depth: 10, 100, 1 000, 10 000.
-
-        Family B — Pure Append (depths 1–4)
-            One $digit op per digit, left-to-right.
-            e.g. append 1990 → "$1 $9 $9 $0".
-            Counts per depth: same as Family A.
-
-        Family C — Mixed Prepend/Append (depths 1–4)
-            All {^d, $d}^depth × digits^depth combinations, covering numeric
-            bookends and interleaved prefix/suffix patterns.
-            Counts per depth: 20^depth (20, 400, 8 000, 160 000).
-
-        Family D — Transform + Digit/Bracket (depths 2–4)
-            A single case-/position-transformation op at position 1
-            (l u c C t r d f E k K { } [ ]), followed by 1–3 digit ops
-            (^d, $d) or bracket ops ([ ]).  Depth 4 is the maximum.
-            depth 2: transform + 1 op   e.g. "u $1", "l ^7", "c ["
-            depth 3: transform + 2 ops  e.g. "u ^1 $9", "c [ ]", "t [ ["
-            depth 4: transform + 3 ops  e.g. "u ^1 $2 ^9", "c [ ] ["
-
-        Family E — Date Patterns (depths 4–9)
-            Append and prepend orientations for the most common numeric date
-            formats found in real passwords.  Date ranges:
-              days 01–31, months 01–12,
-              2-digit years 60–99 ∪ 00–30,
-              4-digit years 1960–2030.
-            depth 4:  DDMM, MMDD, YYYY          → append / prepend
-            depth 5:  transform + 4-digit date   → all transform variants
-            depth 6:  DDMMYY, MMDDYY            → append / prepend
-            depth 6–8: 2–4 brackets + 4-digit date → bracket-prefix a/p
-            depth 7–8: 1–2 brackets + 6-digit date → bracket-prefix a/p
-            depth 8:  DDMMYYYY, MMDDYYYY        → append / prepend
-            depth 9:  1 bracket  + 8-digit date  → bracket-prefix a/p
-            (at most 4 bracket ops total)
-
-        ── Special-character families (F–I) ────────────────────────────────
-
-        Special chars used (by real-world frequency):
-            TOP  (15): ! @ # $ % ^ & * ? . - _ + ( )
-            CORE  (7): ! @ # $ % * ?   ← used where combos must stay bounded
-
-        Family F — Pure Append Special Chars (depths 1–2)
-            One or two $X ops for the top 15 special characters.
-            depth 1 : 15 chains  ($!, $@, ...)
-            depth 2 : up to 15² = 225 chains  ($! $!, $! $@, $1 $!, ...)
-
-        Family G — Pure Prepend Special Chars (depths 1–2)
-            One or two ^X ops (right-to-left order so the string reads
-            correctly).
-            depth 1 : 15 chains  (^!, ^@, ...)
-            depth 2 : up to 15² chains
-
-        Family H — Transform + Special Char (depths 2–3)
-            A single transform op followed by 1–2 special-char append/
-            prepend ops.  Uses the full top-15 set.
-            depth 2: 15 transforms × 30 ops   = 450 chains
-            depth 3: 15 transforms × 30² ops  = 13 500 chains
-
-        Family I — Number + Special Char Combos (depths 2–4)
-            The most common real-world suffix pattern: digits followed by
-            a special character (e.g. "password1!", "password123!").
-            Uses the CORE 7 special chars to keep depth-4 counts reasonable.
-            depth 2: 1 digit  + 1 special char → 10 × 7 = 70 chains (append)
-                                                  10 × 7 = 70 chains (prepend)
-            depth 3: 2 digits + 1 special char → 100 × 7 = 700 + 700 chains
-            depth 4: 3 digits + 1 special char → 1 000 × 7 = 7 000 + 7 000
-
-            Append orientation : $d₁ … $dₙ $sp  → word<digits><sp>
-            Prepend orientation: ^sp ^dₙ … ^d₁  → <sp><digits>word
-              (prepend ops are applied right-to-left so the final string
-               reads <digits><sp> as a prefix — no, see note below)
-
-            Note on prepend order in hashcat:
-              Each ^X prepends X on top of the current word.
-              To obtain "<sp><digits>word" the ops must be applied in reverse
-              reading order: last character prepended first, first character
-              prepended last.
-              e.g. to get "1!word" → apply ^! first → "!word", then ^1 → "1!word"
-              So the rule chain is: ^! ^1  (special char first, then digits)
-
-        Parameters
-        ----------
-        max_depth : int
-            Upper bound on chain depth.  Seeds deeper than max_depth are
-            skipped — the chain kernel cannot handle them anyway.
-
-        Returns
-        -------
-        dict  depth -> set[str chain]
-        """
         digits = '0123456789'
         sbd: Dict[int, set] = defaultdict(set)
 
-        # ── Family A: Pure Prepend ────────────────────────────────────────
-        # depths 1–4  (capped by max_depth so we never exceed the kernel limit)
-        # Each depth d produces 10^d chains.
+        # A
         a_cnt: Dict[int, int] = defaultdict(int)
         for depth in range(1, min(4, max_depth) + 1):
             for combo in itertools.product(digits, repeat=depth):
-                # right-to-left: prepending "12" → "^2 ^1"
                 sbd[depth].add(' '.join(f'^{ch}' for ch in reversed(combo)))
                 a_cnt[depth] += 1
-
-        # ── Family B: Pure Append ─────────────────────────────────────────
-        # depths 1–4  (capped by max_depth)
-        # Each depth d produces 10^d chains.
+        # B
         b_cnt: Dict[int, int] = defaultdict(int)
         for depth in range(1, min(4, max_depth) + 1):
             for combo in itertools.product(digits, repeat=depth):
-                # left-to-right: appending "1990" → "$1 $9 $9 $0"
                 sbd[depth].add(' '.join(f'${ch}' for ch in combo))
                 b_cnt[depth] += 1
-
-        # ── Family C: Mixed Prepend/Append ────────────────────────────────
-        # depths 1–4  (capped by max_depth)
-        # All {^d, $d}^depth × digits^depth combinations → 20^depth per depth.
+        # C
         for depth in range(1, min(4, max_depth) + 1):
             for ops in itertools.product(['^', '$'], repeat=depth):
                 for digs in itertools.product(digits, repeat=depth):
                     sbd[depth].add(' '.join(f'{o}{d}' for o, d in zip(ops, digs)))
-
-        # ── Family D: Transform + Digit/Bracket (depths 2–4) ──────────────
-        # Only depths 2 to min(4, max_depth) are generated.
-        transform_ops = [
-            'l', 'u', 'c', 'C', 't', 'r', 'd', 'f',
-            'E', 'k', 'K', '{', '}', '[', ']',
-        ]
-        t_digit_ops = (
-            [f'^{d}' for d in digits] +
-            [f'${d}' for d in digits] +
-            ['[', ']']
-        )
+        # D
+        transform_ops = ['l','u','c','C','t','r','d','f','E','k','K','{','}','[',']']
+        t_digit_ops = [f'^{d}' for d in digits] + [f'${d}' for d in digits] + ['[', ']']
         d_cnt: Dict[int, int] = defaultdict(int)
         for depth in range(2, min(4, max_depth) + 1):
             for t_op in transform_ops:
@@ -3250,40 +2543,32 @@ class GPUEngine:
                     if HashcatRuleValidator.validate_rule_for_gpu(seed):
                         sbd[depth].add(seed)
                         d_cnt[depth] += 1
-
-        # ── Family E: Date Patterns ───────────────────────────────────────
+        # E
         _days   = [f"{d:02d}" for d in range(1, 32)]
         _months = [f"{m:02d}" for m in range(1, 13)]
         _years2 = ([f"{y:02d}" for y in range(60, 100)] +
                    [f"{y:02d}" for y in range(0,  31)])
         _years4 = [str(y) for y in range(1960, 2031)]
-
-        _date4: set = set()   # DDMM, MMDD, YYYY   → depth 4
-        _date6: set = set()   # DDMMYY, MMDDYY     → depth 6
-        _date8: set = set()   # DDMMYYYY, MMDDYYYY  → depth 8
-
+        _date4: set = set()
+        _date6: set = set()
+        _date8: set = set()
         for _d in _days:
             for _m in _months:
                 _date4.add(_d + _m)
                 _date4.add(_m + _d)
         for _y in _years4:
             _date4.add(_y)
-
         for _d in _days:
             for _m in _months:
                 for _y in _years2:
                     _date6.add(_d + _m + _y)
                     _date6.add(_m + _d + _y)
-
         for _d in _days:
             for _m in _months:
                 for _y in _years4:
                     _date8.add(_d + _m + _y)
                     _date8.add(_m + _d + _y)
-
         e_cnt: Dict[int, int] = defaultdict(int)
-
-        # Base depth 4 / 6 / 8 → append + prepend
         for _ds_set, _base_depth in ((_date4, 4), (_date6, 6), (_date8, 8)):
             if _base_depth > max_depth:
                 continue
@@ -3292,8 +2577,6 @@ class GPUEngine:
                 _pre = ' '.join(f'^{c}' for c in reversed(_ds))
                 sbd[_base_depth].add(_app); e_cnt[_base_depth] += 1
                 sbd[_base_depth].add(_pre); e_cnt[_base_depth] += 1
-
-        # depth 5: transform + 4-digit date (all transform variants)
         if max_depth >= 5:
             for _ds in _date4:
                 _app = ' '.join(f'${c}' for c in _ds)
@@ -3302,16 +2585,11 @@ class GPUEngine:
                     for _chain in (f"{t_op} {_app}", f"{t_op} {_pre}"):
                         if HashcatRuleValidator.validate_rule_for_gpu(_chain):
                             sbd[5].add(_chain); e_cnt[5] += 1
-
-        # Bracket-prefix date variants (at most 4 bracket ops total):
-        #   2–4 brackets + 4-digit date  → new depths 6, 7, 8
-        #   1–2 brackets + 6-digit date  → new depths 7, 8
-        #   1   bracket  + 8-digit date  → new depth  9
         _bracket_ops = ['[', ']']
         _bracket_date_schedule = [
-            (_date4, 4, range(2, 5)),  # +2, +3, +4 → depth 6, 7, 8
-            (_date6, 6, range(1, 3)),  # +1, +2     → depth 7, 8
-            (_date8, 8, range(1, 2)),  # +1          → depth 9
+            (_date4, 4, range(2, 5)),
+            (_date6, 6, range(1, 3)),
+            (_date8, 8, range(1, 2)),
         ]
         for _bds, _bdepth, _brange in _bracket_date_schedule:
             for _num_b in _brange:
@@ -3327,12 +2605,7 @@ class GPUEngine:
                             if HashcatRuleValidator.validate_rule_for_gpu(_chain):
                                 sbd[_new_depth].add(_chain)
                                 e_cnt[_new_depth] += 1
-
-        # ── Family F: Pure Append Special Chars ──────────────────────────
-        # depths 1–3  (capped by max_depth)
-        # Covers the 15 most commonly appended special characters in real
-        # passwords.  Depth 2 covers two-character suffixes (!!, !@, @!, …).
-        # Depth 3 covers three-character suffixes such as "!!!" or "!@#".
+        # F
         f_cnt: Dict[int, int] = defaultdict(int)
         for depth in range(1, min(3, max_depth) + 1):
             for combo in itertools.product(SPECIAL_CHARS_TOP, repeat=depth):
@@ -3340,26 +2613,15 @@ class GPUEngine:
                 if HashcatRuleValidator.validate_rule_for_gpu(chain):
                     sbd[depth].add(chain)
                     f_cnt[depth] += 1
-
-        # ── Family G: Pure Prepend Special Chars ─────────────────────────
-        # depths 1–3  (capped by max_depth)
-        # Mirror of Family F but using the ^ (prepend) operator.
-        # right-to-left order so the final string reads left-to-right.
-        # Depth 3 adds three-char prefixes such as "!!!" or "!@#".
+        # G
         g_cnt: Dict[int, int] = defaultdict(int)
         for depth in range(1, min(3, max_depth) + 1):
             for combo in itertools.product(SPECIAL_CHARS_TOP, repeat=depth):
-                # e.g. prepend "!@" → "^@ ^!"  (@ applied first, ! on top)
                 chain = ' '.join(f'^{ch}' for ch in reversed(combo))
                 if HashcatRuleValidator.validate_rule_for_gpu(chain):
                     sbd[depth].add(chain)
                     g_cnt[depth] += 1
-
-        # ── Family H: Transform + Special Char (depths 2–3) ──────────────
-        # A single case-/position-transform op followed by 1–2 special-char
-        # append/prepend ops (both ^ and $, top-15 special chars each).
-        # depth 2: 15 transforms × 30 ops        =   450 seeds
-        # depth 3: 15 transforms × 30² ops        = 13 500 seeds
+        # H
         sp_ops_top = (
             [f'${ch}' for ch in SPECIAL_CHARS_TOP] +
             [f'^{ch}' for ch in SPECIAL_CHARS_TOP]
@@ -3372,59 +2634,26 @@ class GPUEngine:
                     if HashcatRuleValidator.validate_rule_for_gpu(seed):
                         sbd[depth].add(seed)
                         h_cnt[depth] += 1
-
-        # ── Family I: Number + Special Char Combos (depths 2–4) ──────────
-        # Real-world pattern: word followed by digits then a special char,
-        # e.g. "password1!", "password123!".
-        # Uses SPECIAL_CHARS_CORE (7 chars) to limit depth-4 cardinality.
-        #
-        # Append orientation:  $d₁ … $dₙ $sp  → word<digits><sp>
-        # Prepend orientation: ^sp ^dₙ … ^d₁  → <sp><digits>word
-        #   (each ^ prepends on top, so the last char prepended ends up first)
+        # I
         i_cnt: Dict[int, int] = defaultdict(int)
         for depth in range(2, min(4, max_depth) + 1):
-            n_digits = depth - 1   # number of digit ops; 1 slot for the special char
+            n_digits = depth - 1
             for digit_combo in itertools.product(digits, repeat=n_digits):
                 for sp in SPECIAL_CHARS_CORE:
-                    # ---- Append: $d1 $d2 ... $sp  (e.g. "$1 $2 $3 $!")
                     app = ' '.join(f'${d}' for d in digit_combo) + f' ${sp}'
                     if HashcatRuleValidator.validate_rule_for_gpu(app):
                         sbd[depth].add(app)
                         i_cnt[depth] += 1
-                    # ---- Prepend: ^sp ^dn ... ^d1
-                    # Result: <sp><digits>word
-                    # e.g. to prepend "1!" → apply ^! first → "!word",
-                    #      then ^1 → "1!word", chain: "^! ^1"
                     pre = f'^{sp} ' + ' '.join(f'^{d}' for d in reversed(digit_combo))
                     if HashcatRuleValidator.validate_rule_for_gpu(pre):
                         sbd[depth].add(pre)
                         i_cnt[depth] += 1
-
-        # ── Family J: Leet Substitutions (depths 1–2) ────────────────────
-        # Ten most common character→character leet substitutions, drawn from
-        # LEET_OPS (defined at module level).
-        #
-        # Depth 1: single leet op (e.g. "sa@" → "p@ssword" from "password").
-        #   ~10 seeds — negligible cost, extremely high practical value.
-        #
-        # Depth 2a — leet + digit/special append or prepend:
-        #   Each leet op combined with every digit/special append or prepend
-        #   from SPECIAL_CHARS_CORE.
-        #   10 leet × (10 $d + 10 ^d + 7 $sp + 7 ^sp) = 10 × 34 = 340 seeds
-        #   Catches "p@ssword1", "p@ssword!", "1p@ssword", etc.
-        #
-        # Depth 2b — double-leet chains:
-        #   Two distinct leet ops in sequence; covers passwords with multiple
-        #   simultaneous substitutions (e.g. "sa@ so0" → "p@ssw0rd").
-        #   10 × 9 = 90 seeds.
+        # J
         j_cnt: Dict[int, int] = defaultdict(int)
-
-        # Depth 1: pure leet substitutions
         for op in LEET_OPS:
             if HashcatRuleValidator.validate_rule_for_gpu(op):
                 sbd[1].add(op)
                 j_cnt[1] += 1
-
         if max_depth >= 2:
             leet_followup = (
                 [f'${d}' for d in digits] +
@@ -3432,14 +2661,12 @@ class GPUEngine:
                 [f'${ch}' for ch in SPECIAL_CHARS_CORE] +
                 [f'^{ch}' for ch in SPECIAL_CHARS_CORE]
             )
-            # 2a: leet + one append/prepend op
             for leet_op in LEET_OPS:
                 for follow in leet_followup:
                     chain = f"{leet_op} {follow}"
                     if HashcatRuleValidator.validate_rule_for_gpu(chain):
                         sbd[2].add(chain)
                         j_cnt[2] += 1
-            # 2b: two distinct leet substitutions (double-leet)
             for i_l, l1 in enumerate(LEET_OPS):
                 for l2 in LEET_OPS:
                     if l1 != l2:
@@ -3447,18 +2674,7 @@ class GPUEngine:
                         if HashcatRuleValidator.validate_rule_for_gpu(chain):
                             sbd[2].add(chain)
                             j_cnt[2] += 1
-
-        # ── Family K: Double-Transform Chains (depth 2) ──────────────────
-        # All ordered pairs of pure transformation ops from transform_ops
-        # (l u c C t r d f E k K { } [ ]).  No digit or special-char
-        # appends; pure structural transforms only.
-        #
-        # depth 2: 15 × 15 = 225 pairs
-        # Covers patterns like "c r" (capitalize+reverse), "u d"
-        # (uppercase+duplicate), "t f" (toggle+fold), "E l" (title+lower),
-        # "c {" (capitalize+rotate-left), "l ]" (lowercase+drop-last), etc.
-        # None of these are generated by any other family, so there is
-        # zero overlap and full coverage gain.
+        # K
         k_cnt: Dict[int, int] = defaultdict(int)
         if max_depth >= 2:
             for t1 in transform_ops:
@@ -3467,131 +2683,40 @@ class GPUEngine:
                     if HashcatRuleValidator.validate_rule_for_gpu(chain):
                         sbd[2].add(chain)
                         k_cnt[2] += 1
-
-        # ── Family L: Special-before-Digit patterns (depths 2–3) ─────────
-        # Reverse orientation of Family I: the special character is placed
-        # BEFORE (not after) the digit sequence.
-        # Captures the "word!1", "word@12", "!1word", "@12word" class that
-        # Family I does not cover.
-        # Uses SPECIAL_CHARS_CORE (7 chars) to keep cardinality bounded.
-        #
-        # Append orientation:  $sp $d₁ … $dₙ  → word<sp><digits>
-        # Prepend orientation: ^dₙ … ^d₁ ^sp  → <digits><sp>word
-        #   (prepend last char first; applying ^sp last puts sp leftmost)
-        #
-        # depth 2: 7 sp × 10 d = 70 append + 70 prepend = 140 seeds
-        # depth 3: 7 sp × 100 dd = 700 append + 700 prepend = 1 400 seeds
+        # L
         l_cnt: Dict[int, int] = defaultdict(int)
         for depth in range(2, min(3, max_depth) + 1):
             n_digits = depth - 1
             for sp in SPECIAL_CHARS_CORE:
                 for digit_combo in itertools.product(digits, repeat=n_digits):
-                    # ---- Append: $sp $d1 ... $dn  (e.g. "$! $1 $2" → "word!12")
                     app = f'${sp} ' + ' '.join(f'${d}' for d in digit_combo)
                     if HashcatRuleValidator.validate_rule_for_gpu(app):
                         sbd[depth].add(app)
                         l_cnt[depth] += 1
-                    # ---- Prepend: ^dn ... ^d1 ^sp  → "<digits><sp>word"
-                    # To get "12!word": apply ^! first, then ^2, then ^1.
-                    # Chain: "^! ^2 ^1"  (digits in reverse reading order,
-                    #                     special char last in the rule chain)
                     pre = ' '.join(f'^{d}' for d in digit_combo) + f' ^{sp}'
                     if HashcatRuleValidator.validate_rule_for_gpu(pre):
                         sbd[depth].add(pre)
                         l_cnt[depth] += 1
-
-        # ── Family M: Leet + Transform chains (depth 2) ──────────────────
-        # A leet substitution op paired with a structural transform op in
-        # both orderings (leet-then-transform and transform-then-leet).
-        #
-        # leet-then-transform: apply the substitution first, then transform
-        #   e.g. "sa@ c" → "p@ssword" → "P@ssword"  (leet then capitalise)
-        #   e.g. "so0 u" → "passw0rd" → "PASSW0RD"  (leet then upper)
-        # transform-then-leet: transform first, then substitute
-        #   e.g. "c sa@" → "Password" → "P@ssword"  (capitalise then leet)
-        #   e.g. "u so0" → "PASSWORD" → "PASSW0RD"  (upper then leet)
-        #
-        # depth 2: 10 leet × 15 transforms × 2 orderings = 300 seeds
-        # After dedup (a few orderings produce identical output on some
-        # words) the real count is typically ~280–295.
+        # M
         m_cnt: Dict[int, int] = defaultdict(int)
         if max_depth >= 2:
             for leet_op in LEET_OPS:
                 for t_op in transform_ops:
-                    # leet → transform
                     chain_lt = f"{leet_op} {t_op}"
                     if HashcatRuleValidator.validate_rule_for_gpu(chain_lt):
                         sbd[2].add(chain_lt)
                         m_cnt[2] += 1
-                    # transform → leet
                     chain_tl = f"{t_op} {leet_op}"
                     if HashcatRuleValidator.validate_rule_for_gpu(chain_tl):
                         sbd[2].add(chain_tl)
                         m_cnt[2] += 1
 
-        # ── Debug summary ─────────────────────────────────────────────────
-        c_total = sum(20 ** d for d in range(1, min(4, max_depth) + 1))
-        log_debug(f"Seed families  max_depth={max_depth}")
-        log_debug("  A (pure ^)           : " +
-                  ", ".join(f"d{d}={a_cnt[d]:,}" for d in sorted(a_cnt)) +
-                  f"  [{sum(a_cnt.values()):,} total]")
-        log_debug("  B (pure $)           : " +
-                  ", ".join(f"d{d}={b_cnt[d]:,}" for d in sorted(b_cnt)) +
-                  f"  [{sum(b_cnt.values()):,} total]")
-        log_debug(f"  C (mixed ^/$)        : [{c_total:,} total]")
-        log_debug("  D (transform+digit)  : " +
-                  ", ".join(f"d{d}={d_cnt[d]:,}" for d in sorted(d_cnt)) +
-                  f"  [{sum(d_cnt.values()):,} total]")
-        log_debug("  E (dates)            : " +
-                  ", ".join(f"d{d}={e_cnt[d]:,}" for d in sorted(e_cnt)) +
-                  f"  [{sum(e_cnt.values()):,} total]")
-        log_debug("  F (append special)   : " +
-                  ", ".join(f"d{d}={f_cnt[d]:,}" for d in sorted(f_cnt)) +
-                  f"  [{sum(f_cnt.values()):,} total]")
-        log_debug("  G (prepend special)  : " +
-                  ", ".join(f"d{d}={g_cnt[d]:,}" for d in sorted(g_cnt)) +
-                  f"  [{sum(g_cnt.values()):,} total]")
-        log_debug("  H (transform+spec.)  : " +
-                  ", ".join(f"d{d}={h_cnt[d]:,}" for d in sorted(h_cnt)) +
-                  f"  [{sum(h_cnt.values()):,} total]")
-        log_debug("  I (num+special)      : " +
-                  ", ".join(f"d{d}={i_cnt[d]:,}" for d in sorted(i_cnt)) +
-                  f"  [{sum(i_cnt.values()):,} total]")
-        log_debug("  J (leet subs)        : " +
-                  ", ".join(f"d{d}={j_cnt[d]:,}" for d in sorted(j_cnt)) +
-                  f"  [{sum(j_cnt.values()):,} total]")
-        log_debug("  K (double transform) : " +
-                  ", ".join(f"d{d}={k_cnt[d]:,}" for d in sorted(k_cnt)) +
-                  f"  [{sum(k_cnt.values()):,} total]")
-        log_debug("  L (special-b-digit)  : " +
-                  ", ".join(f"d{d}={l_cnt[d]:,}" for d in sorted(l_cnt)) +
-                  f"  [{sum(l_cnt.values()):,} total]")
-        log_debug("  M (leet+transform)   : " +
-                  ", ".join(f"d{d}={m_cnt[d]:,}" for d in sorted(m_cnt)) +
-                  f"  [{sum(m_cnt.values()):,} total]")
-        log_debug("  A∪…∪M (all seeds)    : " +
-                  ", ".join(f"d{d}={len(sbd[d]):,}" for d in sorted(sbd)) +
-                  f"  [{sum(len(v) for v in sbd.values()):,} total]")
+        log_debug(f"Seed families built max_depth={max_depth} "
+                  f"total={sum(len(v) for v in sbd.values()):,}")
         return dict(sbd)
 
     def run_seed_extraction_pass(self, base_words: list, sbd: dict,
                                   bloom_filter, phase1_rules: list) -> Counter:
-        """
-        Run the numeric seed families as a *dedicated direct extraction pass*.
-
-        Every seed chain is tested against the bloom filter individually via
-        the GPU chain kernel — they are extraction candidates first, not only
-        chain-building atoms.
-
-        Depth-1 seeds are single rules (e.g. "^5") that are already covered
-        by STAGE 1; they are skipped here to avoid double-counting.
-        Depth >= 2 seeds (e.g. "^1 ^2", "$3 $1 $4") are always run here,
-        independent of --max-depth and the random-chain time budget.
-
-        The method ensures self.rule_index is populated (reuses STAGE 1's
-        index) and runs the chain kernel in the same batches used by STAGE 2.
-        """
-        # Ensure kernel + bloom filter are ready (STAGE 1 sets these up)
         if self.bloom_buf is None:
             self.upload_bloom_filter(bloom_filter)
         if not self.program:
@@ -3600,14 +2725,13 @@ class GPUEngine:
             self.gpu_rules  = HashcatRuleValidator.validate_rules_for_gpu(phase1_rules)
             self.rule_index = {r: i for i, r in enumerate(self.gpu_rules)}
 
-        # Collect only depth >= 2 seeds (depth-1 already done in STAGE 1)
         multi_seeds: List[str] = []
         for depth, chains in sorted(sbd.items()):
             if depth >= 2:
                 multi_seeds.extend(chains)
 
         if not multi_seeds:
-            log_info("[SEED]    No multi-depth seeds to test (max_seed_depth=1 or none generated)")
+            log_info("[SEED]    No multi-depth seeds to test")
             return Counter()
 
         total = sum(len(v) for d, v in sbd.items() if d >= 2)
@@ -3638,70 +2762,38 @@ class GPUEngine:
                             self._consecutive_errors += 1
                     if not self._safe_queue_finish():
                         self._consecutive_errors += 1
-
                 if self._consecutive_errors >= self._MAX_CONSECUTIVE_ERRORS:
                     log_warn(f"[GPU] {self._consecutive_errors} consecutive failures — "
                              "aborting seed pass gracefully")
                     break
-
                 pbar.update(1)
                 pbar.set_postfix({"hits": cyan(str(len(counter)))}, refresh=False)
-
         log_info(f"[SEED]    {bold(green(str(len(counter))))} unique seed chains passed bloom filter")
-        log_debug(f"Seed extraction pass complete: {len(counter)} hits")
         return counter
 
     def generate_informed_chains(self, rules, single_found, max_depth,
                                    seed_chains=None, prebuilt_sbd=None):
-        """
-        Generate random chain candidates for STAGE 2.
-
-        Chains are built entirely from atomic rules discovered in STAGE 1
-        (valid / hot).  Seeds play no role here:
-          - Built-in seed families (A–E) are tested in STAGE S only and are
-            never used as scaffolding or candidates in this phase.
-          - User-supplied single-rule seeds are already present in *valid*.
-          - User-supplied multi-rule seed chains are injected as direct
-            STAGE 2 candidates but are NOT used as building blocks for
-            further chain extension.
-
-        *prebuilt_sbd* is accepted for signature compatibility but ignored.
-        """
-        # Cap max_depth to hashcat limit
         max_depth = min(max_depth, MAX_HASHCAT_CHAIN)
         valid   = [r for r in rules if HashcatRuleValidator.validate_rule_for_gpu(r)]
         if not valid: return []
         found_s = set(single_found.keys()) if single_found else set()
         hot     = [r for r in valid if r in found_s]
-        # STAGE 2 candidate set — starts with atomic rules only.
         chains  = set(valid)
-
-        # ── User-supplied multi-rule seed chains (direct candidates only) ─────
-        # Single-rule user seeds are already captured in *valid* above.
-        # Multi-rule chains are added directly as candidates; they are not
-        # used as building blocks for further extension.
         n_user_direct = 0
         if seed_chains:
             for sc in seed_chains:
-                if sc.count(' ') >= 1:      # depth >= 2
+                if sc.count(' ') >= 1:
                     chains.add(sc)
                     n_user_direct += 1
             if n_user_direct:
-                log_debug(f"User seed chains injected as STAGE 2 candidates: "
-                          f"{n_user_direct}")
-
-        # ── Random chain extension (atomic rules only) ────────────────────────
-        # _gen_random_chains builds from *valid* / *hot* atoms exclusively.
+                log_debug(f"User seed chains injected as STAGE 2 candidates: {n_user_direct}")
         for depth in range(2, max_depth + 1):
             budget = self.params.get(f'CHAIN_GEN_LIMIT_{depth}', 0)
             if budget <= 0: continue
             budget = min(budget, len(valid) ** depth)
             new    = self._gen_random_chains(depth, budget, valid, hot, chains, set())
             chains.update(new)
-            log_debug(f"Depth {depth}: budget={budget:,}, generated={len(new):,}")
-
-        log_debug(f"Total STAGE 2 candidates: {len(chains):,}  "
-                  f"(atomic rules + user chains + random extensions)")
+        log_debug(f"Total STAGE 2 candidates: {len(chains):,}")
         return list(chains)
 
     def process_all_words_chain_rules(self, base_words, rules, max_depth,
@@ -3712,25 +2804,20 @@ class GPUEngine:
             if not self.compile_kernel(): return Counter()
         if not self.rule_index:
             self.rule_index = {r: i for i, r in enumerate(self.gpu_rules)}
-
         chains = self.generate_informed_chains(rules, single_counter, max_depth, seed_chains,
                                                     prebuilt_sbd=prebuilt_sbd)
         if not chains: return Counter()
-
         log_debug(f"STAGE 2: {len(chains):,} chains × {len(base_words):,} words")
-
         counter = Counter()
         cbs     = self.params['CHAINS_PER_BATCH']
         wsb     = self.params['WORD_SUB_BATCH']
         n_batches = (len(chains)+cbs-1)//cbs
-
         with tqdm(total=n_batches,
                   desc=green("  STAGE 2 "),
                   unit="batch",
                   ncols=88,
                   bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}",
                   ) as pbar:
-
             for ci in range(0, len(chains), cbs):
                 cb = chains[ci:ci+cbs]
                 for wi in range(0, len(base_words), wsb):
@@ -3744,20 +2831,14 @@ class GPUEngine:
                             self._consecutive_errors += 1
                     if not self._safe_queue_finish():
                         self._consecutive_errors += 1
-
                 if self._consecutive_errors >= self._MAX_CONSECUTIVE_ERRORS:
                     log_warn(f"[GPU] {self._consecutive_errors} consecutive failures — "
                              "aborting STAGE 2 gracefully")
                     break
-
                 pbar.update(1)
                 pbar.set_postfix({"rules": cyan(str(len(counter)))}, refresh=False)
-                # FIX 4: gc.collect() was called inside the tight chain-batch loop;
-                # moved to after the full Stage to avoid GC pauses mid-pipeline.
-
         gc.collect()
         log_info(f"[S2]    {bold(green(str(len(counter))))} unique chain rules passed bloom filter")
-        log_debug(f"STAGE 2 complete: {len(counter)} chain rules in counter")
         return counter
 
     def _run_chain_kernel(self, words, chains):
@@ -3767,16 +2848,13 @@ class GPUEngine:
             idxs  = [self.rule_index.get(r,-1) for r in parts]
             while len(idxs) < self.params['MAX_CHAIN_DEPTH']: idxs.append(-1)
             seqs.extend(idxs)
-
         bd = self.prepare_words_data(words)
         mf = cl.mem_flags; bufs = []
         try:
             def B(arr, f=mf.READ_ONLY):
                 b = cl.Buffer(self.context, f | mf.COPY_HOST_PTR, hostbuf=arr)
                 bufs.append(b); return b
-
             bb=B(bd['words_flat']); bbo=B(bd['word_offsets']); bbl=B(bd['word_lengths'])
-            # FIX 3: reuse persistent rule buffers — no re-upload per batch
             rb, rbo, rbl = self._get_rules_buffers(mf)
             csb=B(np.array(seqs,   dtype=np.int32))
             cdb=B(np.array(depths, dtype=np.int32))
@@ -3784,17 +2862,17 @@ class GPUEngine:
             fo = cl.Buffer(self.context, mf.WRITE_ONLY, outs*MAX_CHAIN_STRING_LEN); bufs.append(fo)
             fc = cl.Buffer(self.context, mf.READ_WRITE, 4);                         bufs.append(fc)
             cl.enqueue_copy(self.queue, fc, np.array([0], dtype=np.int32))
-
             tot = len(words)*len(chains)
             gs  = ((tot+self.local_work_size-1)//self.local_work_size)*self.local_work_size
-            self.kernel_chain.set_args(bb,bbo,bbl,rb,rbo,rbl,csb,cdb,self.bloom_buf,
-                                       np.int32(len(words)),np.int32(len(chains)),
-                                       np.int32(self.params['MAX_CHAIN_DEPTH']),fo,fc)
+            # Używamy np.int32
+            self.kernel_chain.set_args(bb, bbo, bbl, rb, rbo, rbl, csb, cdb, self.bloom_buf,
+                                       np.int32(len(words)),
+                                       np.int32(len(chains)),
+                                       np.int32(self.params['MAX_CHAIN_DEPTH']),
+                                       fo, fc)
             cl.enqueue_nd_range_kernel(self.queue, self.kernel_chain, (gs,), (self.local_work_size,))
-            # FIX 1: use timed finish — bare queue.finish() hangs forever on GPU stall
             if not self._safe_queue_finish():
                 return []
-
             cnt = np.zeros(1, dtype=np.int32)
             cl.enqueue_copy(self.queue, cnt, fc)
             n = min(cnt[0], outs); out = []
@@ -3818,105 +2896,7 @@ class GPUEngine:
 # ====================================================================
 # --- STAGE 3 — GENETIC ALGORITHM RULE EVOLVER ---
 # ====================================================================
-#
-# Motivation
-# ----------
-# STAGE 2 samples rule chains *uniformly at random* from the atomic-rule
-# pool.  For long chains (depth >= 3) the search space grows as
-# |pool|^depth, which makes random sampling extremely inefficient — most
-# candidates score zero hits.
-#
-# A genetic algorithm (GA) addresses this by directing the search: chains
-# that produce many bloom-filter hits ("high-fitness individuals") are
-# preferentially recombined and mutated, so successive generations
-# concentrate probability mass on promising regions of the rule space.
-#
-# Fitness function
-# ----------------
-# The fitness of a candidate chain is the number of unique base-word
-# transformations that pass the bloom filter — identical to the hit-count
-# already computed in Phases 1 and 2.  No new GPU infrastructure is
-# required; the existing `_run_chain_kernel` is reused directly.
-#
-# Algorithm
-# ---------
-# 1. Initial population  — hot Phase-1 rules seeded into depth-2 combos
-#                          plus random chains from the full rule pool.
-# 2. Fitness evaluation  — GPU batch via _run_chain_kernel.
-# 3. Tournament selection (k = 4)
-# 4. One-point crossover on rule-token lists (crossover_p = 0.80)
-# 5. Mutation            — replace / insert / delete one token
-# 6. Elitism             — top <elite_frac> carried unchanged
-# 7. Diversity guard     — duplicate individuals are re-seeded randomly
-# 8. Repeat until <generations> reached or wall-clock budget exhausted.
-#
-# Integration
-# -----------
-# Activated by --genetic flag.  Runs after STAGE 2, consuming whatever
-# time remains from --target-hours.  Newly discovered chains are merged
-# into `all_counts` before signature minimisation.
-#
-# v2 improvement: the original 40 % purely random portion of the initial
-# population is now replaced by high-hit chains from STAGE S (families A–M)
-# when builtin seeds are enabled. This dramatically improves starting
-# coverage while gracefully falling back to random when --no-builtin-seeds
-# is used.
-
 class GeneticRuleEvolver:
-    """
-    STAGE 3 — Genetic Algorithm to evolve high-coverage hashcat rule chains.
-
-    Parameters
-    ----------
-    gpu_engine      : GPUEngine instance (provides _run_chain_kernel).
-    base_words      : List of base words to transform.
-    rule_pool       : Validated atomic rules (Phase-1 rule set).
-    max_depth       : Maximum rule chain length (tokens per chain).
-    pop_size        : Number of individuals in each generation.
-    elite_frac      : Fraction of the population kept unchanged (elites).
-    tournament_k    : Tournament size for parent selection.
-    crossover_p     : Probability that two parents exchange genetic material.
-    mut_replace_p   : Relative probability of a replace mutation.
-    mut_insert_p    : Relative probability of an insert mutation.
-    mut_delete_p    : Relative probability of a delete mutation.
-    seed_hits       : Optional Counter of Phase-S seed chains (high-hit
-                      chains from families A–M). If provided, the original
-                      40 % random portion of the initial population is
-                      replaced by top-scoring Phase-S chains. Falls back
-                      gracefully when STAGE S is disabled.
-    known_rules     : Optional set of chain strings already discovered by
-                      STAGE 1 / STAGE S / STAGE 2.  Used to:
-                        (a) compute the novelty bonus in fitness evaluation
-                        (b) prefer unexplored Phase-S chains in seeding
-                        (c) seed the incremental signature registry so that
-                            representatives are reported as known immediately.
-
-    Improvements (v2)
-    -----------------
-    1. Incremental signature registry (_sig_to_best)
-       After every GPU evaluation, chains with raw_hits > 0 are indexed by
-       their functional signature (via compute_rule_signature / BUILTIN_PROBES).
-       The representative of each equivalence class is added to known_rules so
-       that the novelty bonus in subsequent generations is functionally aware,
-       not just string-aware.  A chain that is functionally identical to an
-       already-discovered rule receives no bonus even if it has a different
-       string representation.
-
-    2. Signature-based offspring filter
-       Before accepting a child into next_pop the GA checks whether its
-       functional signature is already present in _sig_to_best.  Covered
-       offspring are escape-mutated; if still covered they are replaced by a
-       fresh random chain.  This keeps the population structurally diverse and
-       prevents it from filling up with equivalent rules.
-
-    3. Adaptive mutation (_mutate_adaptive)
-       The standard mutation is applied first.  If the result is functionally
-       equivalent to a known sig, up to two additional escape mutations are
-       attempted.  This costs at most 3× the single-mutation overhead per
-       offspring and dramatically reduces the fraction of offspring that fall
-       into already-covered equivalence classes.
-    """
-
     def __init__(
         self,
         gpu_engine,
@@ -3941,8 +2921,6 @@ class GeneticRuleEvolver:
         self.elite_frac   = elite_frac
         self.tournament_k = tournament_k
         self.crossover_p  = crossover_p
-
-        # Normalise mutation probabilities so they always sum to 1.0
         _total = mut_replace_p + mut_insert_p + mut_delete_p
         if _total <= 0:
             _total = 1.0
@@ -3951,88 +2929,31 @@ class GeneticRuleEvolver:
             mut_insert_p  / _total,
             mut_delete_p  / _total,
         ]
-
-        # v2: STAGE S seed chains replace the original 40 % random portion
         self.seed_hits = seed_hits or Counter()
         self.seed_chains_sorted: List[str] = [
-            r for r, _ in sorted(
-                self.seed_hits.items(), key=lambda kv: -kv[1]
-            )
+            r for r, _ in sorted(self.seed_hits.items(), key=lambda kv: -kv[1])
         ] if self.seed_hits else []
-
-        # v2: known_rules — chains already discovered by STAGE 1 / STAGE S / STAGE 2.
-        # Used to compute the novelty bonus in evaluate_population and to seed
-        # the initial population with *unexplored* Phase-S chains.
-        # v2: also updated dynamically as GA discovers new sig representatives.
         self.known_rules: set = known_rules if known_rules is not None else set()
-
-        # v2: Incremental signature registry.
-        #
-        # _sig_cache  : lazy memoized signatures  (chain_str → tuple)
-        # _sig_to_best: best-per-equivalence-class discovered during the GA
-        #               (signature tuple → (chain_str, raw_hit_count))
-        #
-        # Updated by _update_sig_registry() after every GPU evaluation.
-        # Used by _sig_is_covered() and _mutate_adaptive().
         self._sig_cache:   Dict[str, tuple]             = {}
         self._sig_to_best: Dict[tuple, Tuple[str, int]] = {}
 
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-
     def _random_chain(self, depth: int = 0) -> list:
-        """Return a random chain of atomic rules as a token list."""
         if depth <= 0:
             depth = random.randint(2, self.max_depth)
         return [random.choice(self.rule_pool) for _ in range(depth)]
 
     def _clamp(self, tokens: list) -> list:
-        """Ensure a token list has between 2 and max_depth elements."""
         lo, hi = 2, self.max_depth
         if len(tokens) < lo:
             tokens = tokens + self._random_chain(lo - len(tokens))
         return tokens[:hi]
 
-    # ------------------------------------------------------------------
-    # v2 — Signature registry helpers (Improvements 1, 2, 3)
-    # ------------------------------------------------------------------
-
     def _get_sig(self, chain_str: str) -> tuple:
-        """
-        Return the functional signature of *chain_str*, computing and
-        caching it on first access.
-
-        The signature is the tuple of outputs produced by applying the chain
-        to every word in BUILTIN_PROBES.  Rules with unsupported opcodes
-        receive the sentinel ('__UNSUPPORTED__',).
-        """
         if chain_str not in self._sig_cache:
-            self._sig_cache[chain_str] = compute_rule_signature(
-                chain_str, BUILTIN_PROBES
-            )
+            self._sig_cache[chain_str] = compute_rule_signature(chain_str, BUILTIN_PROBES)
         return self._sig_cache[chain_str]
 
     def _update_sig_registry(self, raw_hit_map: dict) -> int:
-        """
-        Update _sig_to_best from *raw_hit_map* (chain_str → raw GPU hits).
-
-        Only chains with raw_hits > 0 are indexed — zero-hit chains carry
-        no functionally useful information.
-
-        Algorithm
-        ---------
-        For each chain with hits > 0:
-          1. Compute (or retrieve cached) functional signature.
-          2. If the signature is new, add the chain as the representative.
-          3. If the signature already exists and this chain has a higher
-             hit count, promote it to representative.
-        After updating _sig_to_best, every representative is added to
-        self.known_rules so that the novelty bonus in subsequent generations
-        is functionally aware.
-
-        Returns the number of *new* distinct signatures added in this call.
-        """
         new_sigs = 0
         for chain_str, raw_hits in raw_hit_map.items():
             if raw_hits <= 0:
@@ -4045,30 +2966,12 @@ class GeneticRuleEvolver:
                 self._sig_to_best[sig] = (chain_str, raw_hits)
                 new_sigs += 1
             elif raw_hits > existing[1]:
-                # Better representative found — update but do NOT
-                # remove the old one from known_rules (it's harmless there).
                 self._sig_to_best[sig] = (chain_str, raw_hits)
-
-        # Expose all current representatives via known_rules.
-        # This ensures the novelty bonus fires correctly in the next
-        # generation: any chain whose sig is already covered scores × 1.
         for _sig, (best_chain, _cnt) in self._sig_to_best.items():
             self.known_rules.add(best_chain)
-
         return new_sigs
 
     def _sig_is_covered(self, chain_str: str) -> bool:
-        """
-        Return True when *chain_str* is functionally equivalent to a chain
-        already indexed in _sig_to_best.
-
-        Chains with unsupported opcodes are never considered covered —
-        they bypass the filter unconditionally.
-
-        This check is O(probe_words) on a cache miss and O(1) on a hit.
-        With 40 probe words and pop_size = 200, the amortised cost per
-        generation is negligible (< 0.1 s).
-        """
         if not self._sig_to_best:
             return False
         sig = self._get_sig(chain_str)
@@ -4077,25 +2980,7 @@ class GeneticRuleEvolver:
         return sig in self._sig_to_best
 
     def _mutate_adaptive(self, tokens: list) -> list:
-        """
-        Adaptive mutation — Improvement 3.
-
-        Apply the standard mutation operator.  If the resulting chain is
-        functionally equivalent to one already in _sig_to_best, apply up
-        to two additional escape mutations to break out of the covered
-        equivalence class.
-
-        At most three mutations are applied total (1 base + 2 escape
-        attempts), keeping the overhead bounded and the individual still
-        closely related to its parent.
-
-        If all escape attempts fail (the covered equivalence class is very
-        large), the final result is returned as-is; the signature filter in
-        the breeding loop will handle it.
-        """
         tokens = self._mutate(tokens)
-        # Skip the extra check when the registry is empty — avoids paying
-        # signature computation cost during the very first generation.
         if self._sig_to_best:
             for _attempt in range(2):
                 if not self._sig_is_covered(' '.join(tokens)):
@@ -4103,35 +2988,11 @@ class GeneticRuleEvolver:
                 tokens = self._mutate(tokens)
         return tokens
 
-    # ------------------------------------------------------------------
-    # Population initialisation
-    # ------------------------------------------------------------------
-
     def initial_population(self, hot_rules: list) -> list:
-        """
-        Build the initial population using three seeding strategies:
-
-        1. Depth-2 combos of the top-50 hot Phase-1 rules  (30 %)
-           These pairs are already "known good" atoms — crossing them
-           often finds useful depth-2 chains immediately.
-
-        2. Seeded deeper chains: one hot rule + random pool atoms  (30 %)
-           Biased toward depth 3+ when max_depth >= 3 to explore regions
-           that STAGE 2's random sampling may have undersampled.
-
-        3. Phase-S builtin seed families (A–M) — chains NOT already known
-           are preferred (40 %). If all Phase-S seeds are already in
-           known_rules, this portion falls back to random chains so the
-           GA still starts with a diverse, unexplored population.
-        """
         hot = hot_rules[:min(len(hot_rules), 50)]
         pop_set: set = set()
-
         n_hot    = int(self.pop_size * 0.30)
         n_seeded = int(self.pop_size * 0.30)
-        # remainder (40 %) filled by unexplored STAGE S or random
-
-        # 1 — depth-2 hot pairs
         max_tries = n_hot * 20
         tries = 0
         while len(pop_set) < n_hot and tries < max_tries:
@@ -4144,63 +3005,34 @@ class GeneticRuleEvolver:
             else:
                 break
             pop_set.add((a, b))
-
-        # 2 — seeded deeper chains
-        # Bias toward depth 3+ when max_depth >= 3: exploring deeper chains
-        # is more valuable since STAGE 2 already covers depth-2 exhaustively.
         max_tries = n_seeded * 20
         tries = 0
         while len(pop_set) < n_hot + n_seeded and tries < max_tries:
             tries += 1
             if self.max_depth >= 3:
-                # Bias: 70 % chance of depth 3+, 30 % chance of depth 2
                 depth = (random.randint(3, self.max_depth)
                          if random.random() < 0.70
                          else 2)
             else:
                 depth = random.randint(2, self.max_depth)
             if hot:
-                tokens = [random.choice(hot)] + [
-                    random.choice(self.rule_pool) for _ in range(depth - 1)
-                ]
+                tokens = [random.choice(hot)] + [random.choice(self.rule_pool) for _ in range(depth - 1)]
                 random.shuffle(tokens)
             else:
                 tokens = self._random_chain(depth)
             pop_set.add(tuple(tokens))
-
-        # 3 — STAGE S seeds, preferring chains NOT yet in known_rules (40 %)
         n_fill = int(self.pop_size * 0.40)
         fill_set: set = set()
-
         if self.seed_chains_sorted:
-            # Separate novel seeds (not yet discovered) from known seeds
-            novel_seeds = [s for s in self.seed_chains_sorted
-                           if s not in self.known_rules]
-            known_seeds = [s for s in self.seed_chains_sorted
-                           if s in self.known_rules]
-
-            log_debug(
-                f"[S3]    Phase-S seed pool: {len(novel_seeds)} novel, "
-                f"{len(known_seeds)} already known"
-            )
-
-            # Prefer novel seeds; fall back to known ones only if needed
-            candidate_pool = (
-                novel_seeds if len(novel_seeds) >= n_fill // 2
-                else (novel_seeds + known_seeds)
-            )
-
+            novel_seeds = [s for s in self.seed_chains_sorted if s not in self.known_rules]
+            known_seeds = [s for s in self.seed_chains_sorted if s in self.known_rules]
+            candidate_pool = novel_seeds if len(novel_seeds) >= n_fill // 2 else (novel_seeds + known_seeds)
             if candidate_pool:
-                top_candidates = candidate_pool[:max(n_fill * 3, 100)]
-                selected = random.sample(
-                    top_candidates, k=min(n_fill, len(top_candidates))
-                )
+                selected = random.sample(candidate_pool[:max(n_fill * 3, 100)], k=min(n_fill, len(candidate_pool)))
                 for sc_str in selected:
                     tokens = sc_str.split()
                     if 2 <= len(tokens) <= self.max_depth:
                         fill_set.add(tuple(tokens))
-
-            # Pad with random chains (preferring depth 3+) if insufficient
             max_fill_tries = n_fill * 20
             fill_tries = 0
             while len(fill_set) < n_fill and fill_tries < max_fill_tries:
@@ -4210,7 +3042,6 @@ class GeneticRuleEvolver:
                      else random.randint(2, self.max_depth))
                 fill_set.add(tuple(self._random_chain(d)))
         else:
-            # STAGE S disabled or produced zero hits — pure random fallback
             max_tries = n_fill * 20
             tries = 0
             while len(fill_set) < n_fill and tries < max_tries:
@@ -4219,52 +3050,24 @@ class GeneticRuleEvolver:
                      if self.max_depth >= 3 and random.random() < 0.60
                      else random.randint(2, self.max_depth))
                 fill_set.add(tuple(self._random_chain(d)))
-
         for ind in fill_set:
             pop_set.add(ind)
-
         result = [list(ind) for ind in pop_set]
-
-        # Safety: pad to exactly pop_size if set was too sparse
         while len(result) < self.pop_size:
             d = (random.randint(3, self.max_depth)
                  if self.max_depth >= 3 and random.random() < 0.50
                  else random.randint(2, self.max_depth))
             result.append(self._random_chain(d))
-
         return result[:self.pop_size]
 
-    # ------------------------------------------------------------------
-    # Fitness evaluation (GPU-batch)
-    # ------------------------------------------------------------------
-
     def evaluate_population(self, population: list) -> dict:
-        """
-        Evaluate the entire population in batched GPU kernel calls.
-
-        Returns a dict {chain_string: raw_bloom_hit_count}.
-
-        Raw counts (without any bonus multiplier) are returned so that the
-        caller can apply novelty weighting, update the signature registry,
-        and record honest GPU-frequency values — all in one consistent pass.
-
-        Invalid chains (fail the hashcat validator) score 0 but are kept
-        in the pool to maintain population diversity.
-        """
         chain_strs   = [' '.join(tokens) for tokens in population]
-        valid_chains = [
-            c for c in chain_strs
-            if HashcatRuleValidator.validate_rule_for_gpu(c)
-        ]
-
-        # Initialise all scores to 0
+        valid_chains = [c for c in chain_strs if HashcatRuleValidator.validate_rule_for_gpu(c)]
         raw_map: dict = {c: 0 for c in chain_strs}
         if not valid_chains:
             return raw_map
-
-        wsb = self.gpu_engine.params.get('WORD_SUB_BATCH',   20_000)
-        cbs = self.gpu_engine.params.get('CHAINS_PER_BATCH',  2_000)
-
+        wsb = self.gpu_engine.params.get('WORD_SUB_BATCH', 20_000)
+        cbs = self.gpu_engine.params.get('CHAINS_PER_BATCH', 2_000)
         batch_hits: Counter = Counter()
         for ci in range(0, len(valid_chains), cbs):
             cb = valid_chains[ci:ci + cbs]
@@ -4275,230 +3078,94 @@ class GeneticRuleEvolver:
                     if found:
                         batch_hits.update(found)
             self.gpu_engine._safe_queue_finish()
-
         raw_map.update(batch_hits)
         return raw_map
 
-    # ------------------------------------------------------------------
-    # Selection
-    # ------------------------------------------------------------------
-
     def _tournament_select(self, fitness_list: list) -> list:
-        """
-        Tournament selection.
-
-        Randomly draw <tournament_k> individuals; return the token list of
-        the one with the highest fitness score.
-        """
         k          = min(self.tournament_k, len(fitness_list))
         contenders = random.sample(fitness_list, k)
         winner, _  = max(contenders, key=lambda x: x[1])
         return list(winner)
 
-    # ------------------------------------------------------------------
-    # Crossover
-    # ------------------------------------------------------------------
-
     def _crossover(self, p1: list, p2: list) -> tuple:
-        """
-        One-point crossover on rule-token lists.
-
-        A random cut point is chosen independently for each parent.
-        p1[:cut1] + p2[cut2:] forms child 1; p2[:cut2] + p1[cut1:] forms
-        child 2.  Both offspring are clamped to [2, max_depth] tokens.
-
-        If crossover is skipped (random draw > crossover_p) the parents
-        are returned unchanged, ensuring the operation is conservative.
-        """
         if len(p1) < 2 or len(p2) < 2 or random.random() > self.crossover_p:
             return list(p1), list(p2)
-
         cut1 = random.randint(1, len(p1) - 1)
         cut2 = random.randint(1, len(p2) - 1)
-
         child1 = self._clamp(p1[:cut1] + p2[cut2:])
         child2 = self._clamp(p2[:cut2] + p1[cut1:])
         return child1, child2
 
-    # ------------------------------------------------------------------
-    # Mutation
-    # ------------------------------------------------------------------
-
     def _mutate(self, tokens: list) -> list:
-        """
-        Apply a single random mutation to a token list.
-
-        Three operators (weights normalised at init):
-          replace  — swap one token with a rule chosen from rule_pool
-          insert   — insert one rule at a random position
-                     (only if current length < max_depth)
-          delete   — remove one token
-                     (only if current length > 2)
-
-        If the selected operator cannot be applied (length constraint),
-        a replace mutation is performed as fallback.
-        """
         tokens = list(tokens)
-        op     = random.choices(['replace', 'insert', 'delete'],
-                                weights=self._mut_weights)[0]
-
+        op     = random.choices(['replace', 'insert', 'delete'], weights=self._mut_weights)[0]
         if op == 'replace':
             idx         = random.randrange(len(tokens))
             tokens[idx] = random.choice(self.rule_pool)
-
         elif op == 'insert' and len(tokens) < self.max_depth:
             idx = random.randint(0, len(tokens))
             tokens.insert(idx, random.choice(self.rule_pool))
-
         elif op == 'delete' and len(tokens) > 2:
             idx = random.randrange(len(tokens))
             tokens.pop(idx)
-
         else:
-            # Fallback: replace
             idx         = random.randrange(len(tokens))
             tokens[idx] = random.choice(self.rule_pool)
-
         return tokens
 
-    # ------------------------------------------------------------------
-    # Main evolution loop
-    # ------------------------------------------------------------------
-
-    def evolve(
-        self,
-        hot_rules:   list,
-        generations: int,
-        time_budget: float,
-    ) -> Counter:
-        """
-        Run the genetic algorithm for up to *generations* generations or
-        until *time_budget* seconds have elapsed (wall clock).
-
-        Parameters
-        ----------
-        hot_rules     : Phase-1 hit rules, sorted descending by hit count.
-        generations   : Hard cap on generation count.
-        time_budget   : Maximum wall-clock seconds for STAGE 3.
-
-        Returns
-        -------
-        Counter
-            All discovered chains that passed the bloom filter, mapped to
-            their raw (non-bonus) hit count, highest value across all gens.
-        """
+    def evolve(self, hot_rules: list, generations: int, time_budget: float) -> Counter:
         if not self.rule_pool:
             log_warn("[S3]    Rule pool is empty — skipping STAGE 3.")
             return Counter()
-
         if time_budget <= 0:
             log_warn("[S3]    No time budget remaining — skipping STAGE 3.")
             return Counter()
-
-        if self.max_depth < 3:
-            log_warn(
-                "[S3]    max_depth is only 2 — STAGE 2 already covers depth-2 "
-                "exhaustively.  Consider --max-depth 3 or higher to get "
-                "meaningful GA discoveries."
-            )
-
         t_start = time.time()
         all_new: Counter = Counter()
         n_elite = max(1, int(self.pop_size * self.elite_frac))
-
-        # Stagnation tracking
-        STAGNATION_THRESHOLD = 5   # generations without improvement before refresh
+        STAGNATION_THRESHOLD = 5
         stagnation_counter   = 0
         best_ever_score      = 0
-
-        log_info(
-            f"[S3]    pop={self.pop_size}  max_gen={generations}  "
-            f"elite={self.elite_frac:.0%}  budget={time_budget:.0f}s  "
-            f"pool={len(self.rule_pool):,} rules  "
-            f"known={len(self.known_rules):,}"
-        )
-
-        # --- Initialise population ---
+        log_info(f"[S3]    pop={self.pop_size}  max_gen={generations}  "
+                 f"elite={self.elite_frac:.0%}  budget={time_budget:.0f}s  "
+                 f"pool={len(self.rule_pool):,} rules  known={len(self.known_rules):,}")
         pop = self.initial_population(hot_rules)
         last_gen = 0
-
-        with tqdm(
-            total=generations,
-            desc=green("  STAGE 3 "),
-            unit="gen",
-            ncols=88,
-            bar_format=(
-                "{l_bar}{bar}| {n_fmt}/{total_fmt} "
-                "[{elapsed}<{remaining}] {postfix}"
-            ),
-        ) as pbar:
-
+        with tqdm(total=generations,
+                  desc=green("  STAGE 3 "),
+                  unit="gen",
+                  ncols=88,
+                  bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}",
+                  ) as pbar:
             for gen in range(generations):
                 last_gen = gen
-
-                # Time guard — checked at the start of every generation
                 if time.time() - t_start >= time_budget:
                     log_debug(f"[S3]    Time budget exhausted at generation {gen}.")
                     break
-
-                # ── Step 1: GPU fitness evaluation (raw hits, no bonus) ────────
                 raw_map = self.evaluate_population(pop)
-
-                # ── Step 2: Update incremental signature registry (Improvement 1)
-                # Indexes every hit chain by functional signature.  Representatives
-                # are added to known_rules so the novelty bonus is functionally
-                # aware from the next generation onwards.
                 new_sigs = self._update_sig_registry(raw_map)
-
-                # ── Step 3: Update all_new with highest raw hit counts ─────────
-                # pre_ga_known was captured before the GA started (passed in as
-                # the original known_rules set).  We compare against all_new to
-                # count chains that are genuinely new discoveries this generation.
                 n_novel_this_gen = 0
                 for chain_str, raw_hits in raw_map.items():
                     if raw_hits > 0 and HashcatRuleValidator.validate_rule_for_gpu(chain_str):
                         if raw_hits > all_new[chain_str]:
                             all_new[chain_str] = raw_hits
-                        # "Novel this generation" = hit chain not yet in all_new
-                        # before this update (i.e. first time it was discovered).
                         if all_new[chain_str] == raw_hits:
                             n_novel_this_gen += 1
-
-                # ── Step 4: Build novelty-weighted fitness list for selection ──
-                # Novelty bonus: chains not in known_rules score × 2.
-                # known_rules now includes sig representatives discovered so far,
-                # so functionally equivalent variants are penalised correctly.
                 fitness_list = sorted(
-                    [
-                        (
-                            tuple(ind),
-                            raw_map.get(' '.join(ind), 0) * (
-                                2 if ' '.join(ind) not in self.known_rules else 1
-                            ),
-                        )
-                        for ind in pop
-                    ],
+                    [(tuple(ind), raw_map.get(' '.join(ind), 0) *
+                      (2 if ' '.join(ind) not in self.known_rules else 1))
+                     for ind in pop],
                     key=lambda x: -x[1],
                 )
-
                 best_score = fitness_list[0][1] if fitness_list else 0
-
-                # ── Step 5: Stagnation detection ──────────────────────────────
                 if best_score > best_ever_score:
                     best_ever_score    = best_score
                     stagnation_counter = 0
                 else:
                     stagnation_counter += 1
-
                 if stagnation_counter >= STAGNATION_THRESHOLD:
-                    # Refresh the bottom 30 % of non-elite individuals with
-                    # novel random chains to escape local optima.
                     stagnation_counter = 0
                     n_refresh = max(1, int(self.pop_size * 0.30))
-                    log_debug(
-                        f"[S3]    Stagnation ({STAGNATION_THRESHOLD} gens) — "
-                        f"refreshing {n_refresh} individuals with random chains"
-                    )
                     depth_bias = self.max_depth >= 3
                     refresh_chains = []
                     rt = 0
@@ -4516,54 +3183,32 @@ class GeneticRuleEvolver:
                     pop = keep_top + refresh_chains
                     pop = pop[:self.pop_size]
                     pbar.update(1)
-                    pbar.set_postfix(
-                        {"best": cyan(str(best_score)),
-                         "new":  cyan(str(len(all_new))),
-                         "sigs": cyan(str(len(self._sig_to_best))),
-                         "stag": yellow("REFRESH")},
-                        refresh=False,
-                    )
-                    continue   # skip normal breeding this generation
-
-                # ── Step 6: Elitism — carry top individuals unchanged ─────────
+                    pbar.set_postfix({"best": cyan(str(best_score)),
+                                      "new":  cyan(str(len(all_new))),
+                                      "sigs": cyan(str(len(self._sig_to_best))),
+                                      "stag": yellow("REFRESH")},
+                                     refresh=False)
+                    continue
                 elites   = [list(ind) for ind, _ in fitness_list[:n_elite]]
                 next_pop = list(elites)
                 next_set = {tuple(e) for e in elites}
-
-                # ── Step 7: Breed remainder via selection + crossover + mutation
-                # Improvements 2 & 3 are applied here:
-                #   - _mutate_adaptive escapes covered sig classes (Improvement 3)
-                #   - Offspring still landing in a covered sig after escape are
-                #     replaced by a random chain (Improvement 2)
                 depth_bias = self.max_depth >= 3
                 max_breed_attempts = (self.pop_size - len(next_pop)) * 8
                 breed_attempts     = 0
-                n_sig_replaced     = 0   # diagnostic counter
-
+                n_sig_replaced     = 0
                 while len(next_pop) < self.pop_size and breed_attempts < max_breed_attempts:
                     breed_attempts += 1
-
                     p1 = self._tournament_select(fitness_list)
                     p2 = self._tournament_select(fitness_list)
-
                     child1, child2 = self._crossover(p1, p2)
-
-                    # Adaptive mutation (Improvement 3): if child lands in a
-                    # covered sig class, up to 2 extra escape mutations are applied.
                     child1 = self._mutate_adaptive(child1)
                     child2 = self._mutate_adaptive(child2)
-
                     for child in (child1, child2):
                         if len(next_pop) >= self.pop_size:
                             break
                         key = tuple(child)
                         if key in next_set:
                             continue
-
-                        # Improvement 2: signature filter.
-                        # If the child is still functionally covered after
-                        # adaptive mutation, replace it with a random chain.
-                        # This keeps the population structurally diverse.
                         if self._sig_is_covered(' '.join(child)):
                             n_sig_replaced += 1
                             d = (random.randint(3, self.max_depth)
@@ -4573,11 +3218,8 @@ class GeneticRuleEvolver:
                             key   = tuple(child)
                             if key in next_set:
                                 continue
-
                         next_pop.append(child)
                         next_set.add(key)
-
-                # ── Step 8: Diversity fill — pad any remaining slots randomly ─
                 fill_attempts = 0
                 while len(next_pop) < self.pop_size and fill_attempts < self.pop_size * 4:
                     fill_attempts += 1
@@ -4588,46 +3230,19 @@ class GeneticRuleEvolver:
                     if ind not in next_set:
                         next_pop.append(list(ind))
                         next_set.add(ind)
-
                 pop = next_pop[:self.pop_size]
-
-                log_debug(
-                    f"[S3]    gen={gen}  new_sigs={new_sigs}  "
-                    f"sig_replaced={n_sig_replaced}  "
-                    f"total_sigs={len(self._sig_to_best)}"
-                )
                 pbar.update(1)
-                pbar.set_postfix(
-                    {"best": cyan(str(best_score)),
-                     "new":  cyan(str(len(all_new))),
-                     "sigs": cyan(str(len(self._sig_to_best)))},
-                    refresh=False,
-                )
-
+                pbar.set_postfix({"best": cyan(str(best_score)),
+                                  "new":  cyan(str(len(all_new))),
+                                  "sigs": cyan(str(len(self._sig_to_best)))},
+                                 refresh=False)
         elapsed = time.time() - t_start
-
-        # Summary metrics:
-        #   all_new           — every chain with ≥1 bloom hit (includes pre-GA known ones
-        #                       whose score was updated by the GA)
-        #   _sig_to_best      — distinct functional equivalence classes discovered by the GA
-        #   sig_cache         — total signatures computed (chains × probe evaluations cached)
         n_chains      = len(all_new)
         n_sig_classes = len(self._sig_to_best)
-        log_info(
-            f"[S3]    Evolution complete — "
-            f"{bold(green(str(n_chains)))} unique chains passed bloom filter  "
-            f"({bold(cyan(str(n_sig_classes)))} distinct functional signatures)  "
-            f"({elapsed:.1f}s, {last_gen + 1} generation(s))"
-        )
-        log_debug(
-            f"STAGE 3 GA complete: chains={n_chains}, "
-            f"sig_classes={n_sig_classes}, "
-            f"sig_cache={len(self._sig_cache)}, "
-            f"elapsed={elapsed:.1f}s"
-        )
+        log_info(f"[S3]    Evolution complete — {bold(green(str(n_chains)))} unique chains passed bloom filter  "
+                 f"({bold(cyan(str(n_sig_classes)))} distinct functional signatures)  "
+                 f"({elapsed:.1f}s, {last_gen + 1} generation(s))")
         return all_new
-
-
 
 # --------------------------------------------------------------------
 # GPU Extractor
@@ -4655,7 +3270,6 @@ class GPUExtractor:
         self.genetic_generations      = genetic_generations
         self.genetic_pop              = genetic_pop
         self.genetic_elite            = genetic_elite
-        # STAGE 0 — Token-Strip
         self.token_strip              = token_strip
         self.token_strip_min_stem     = token_strip_min_stem
         self.token_strip_max_prefix   = token_strip_max_prefix
@@ -4681,8 +3295,7 @@ class GPUExtractor:
                     if line and not line.startswith('#'):
                         if self.validator.validate_rule_for_gpu(line):
                             seeds.append(line)
-            log_info(f"[SEED] Loaded {bold(str(len(seeds)))} seed rules from {self.seed_rules_file}")
-            log_debug(f"Seed rules file: {self.seed_rules_file}, valid={len(seeds)}")
+            log_info(f"[SEED] Loaded {bold(str(len(seeds)))} seed rules")
         except Exception as e:
             log_warn(f"Seed rules load failed: {e}")
         return seeds
@@ -4690,45 +3303,36 @@ class GPUExtractor:
     def extract_rules(self, base_words, target_words, **depth_overrides):
         all_counts = Counter()
         rules      = self.rules_gen.generate_gpu_compatible_rules()
-
-        # ── STAGE 0: Token-Strip Rule Extraction (CPU‑only, must run before GPU init) ──
         ts_rules_singles: List[str] = []
         ts_rules_chains:  List[str] = []
         ts_sbd: Dict[int, set]      = defaultdict(set)
         ts_extra_singles: List[str] = []
         builtin_set = set(rules)
-        all_seeds   = self.load_seed_rules()   # original seeds (may be empty)
+        all_seeds   = self.load_seed_rules()
 
         if self.token_strip:
             log_section("STAGE 0 — Token-Strip Rule Extraction")
             base_set_for_ts = set(base_words)
-            log_info(
-                f"[S0]    Scanning {len(target_words):,} target words  |  "
-                f"base set {len(base_set_for_ts):,} words  |  "
-                f"min-stem={self.token_strip_min_stem}  "
-                f"max-prefix={self.token_strip_max_prefix}  "
-                f"max-suffix={self.token_strip_max_suffix}  "
-                f"min-leet-amb={self.token_strip_min_leet_amb}"
-            )
+            log_info(f"[S0]    {len(target_words):,} target words  base {len(base_set_for_ts):,}  "
+                     f"min-stem={self.token_strip_min_stem}  "
+                     f"prefix={self.token_strip_max_prefix}  "
+                     f"suffix={self.token_strip_max_suffix}  "
+                     f"leet-amb={self.token_strip_min_leet_amb}")
             _new_modes_label = yellow('disabled (--token-strip-no-new-modes)') \
-                if self.token_strip_no_new_modes else green('enabled (14 modes)')
-            log_info(
-                f"[S0]    Modes: {_new_modes_label}  |  "
-                f"workers: {bold(str(self.token_strip_workers or mp.cpu_count()))}"
-            )
+                if self.token_strip_no_new_modes else green('enabled (15 modes)')
+            log_info(f"[S0]    Modes: {_new_modes_label}  "
+                     f"workers: {self.token_strip_workers or mp.cpu_count()}")
             ts_all = extract_token_strip_rules(
-                target_words,
-                base_set_for_ts,
-                max_depth          = self.max_depth,
-                min_stem_len       = self.token_strip_min_stem,
-                max_prefix_len     = self.token_strip_max_prefix,
-                max_suffix_len     = self.token_strip_max_suffix,
-                max_leet_ambiguity = self.token_strip_min_leet_amb,
-                workers            = self.token_strip_workers,
-                chunk_size         = self.token_strip_chunk_size,
-                enable_new_modes   = not self.token_strip_no_new_modes,
+                target_words, base_set_for_ts,
+                max_depth=self.max_depth,
+                min_stem_len=self.token_strip_min_stem,
+                max_prefix_len=self.token_strip_max_prefix,
+                max_suffix_len=self.token_strip_max_suffix,
+                max_leet_ambiguity=self.token_strip_min_leet_amb,
+                workers=self.token_strip_workers,
+                chunk_size=self.token_strip_chunk_size,
+                enable_new_modes=not self.token_strip_no_new_modes,
             )
-
             for r in ts_all:
                 depth = len(r.split())
                 if depth == 1:
@@ -4737,24 +3341,7 @@ class GPUExtractor:
                     ts_rules_chains.append(r)
                     if depth <= self.max_depth:
                         ts_sbd[depth].add(r)
-
-            _log_token_strip_stats(
-                len(target_words), ts_all, inject_sbd=self.builtin_seeds
-            )
-            if ts_rules_singles:
-                log_info(
-                    f"[S0]    Single-rule discoveries  : "
-                    f"{bold(cyan(str(len(ts_rules_singles))))}  "
-                    f"→ merged into STAGE 1 atomic pool"
-                )
-            if ts_rules_chains:
-                log_info(
-                    f"[S0]    Multi-rule chain discoveries : "
-                    f"{bold(cyan(str(len(ts_rules_chains))))}  "
-                    f"→ STAGE S sbd injection + STAGE 2 seed chains"
-                )
-
-            # ── Toggle-chain seeds ─────────────────────────────────────────────
+            _log_token_strip_stats(len(target_words), ts_all, inject_sbd=self.builtin_seeds)
             if self.max_depth >= 2:
                 toggle_seeds = _generate_toggle_chain_seeds(self.max_depth)
                 n_toggle_new = 0
@@ -4765,72 +3352,63 @@ class GPUExtractor:
                         ts_sbd.setdefault(depth, set()).add(ts_chain)
                         n_toggle_new += 1
                 if n_toggle_new:
-                    log_info(
-                        f"[S0]    Toggle-chain seeds       : "
-                        f"{bold(cyan(str(n_toggle_new)))}  "
-                        f"(T0..TN patterns + leet combos)  "
-                        f"→ STAGE S sbd + STAGE 2 seeds"
-                    )
-
-            # Merge STAGE 0 single‑rules into STAGE 1 atomic pool
+                    log_info(f"[S0]    Toggle-chain seeds: {bold(cyan(str(n_toggle_new)))}")
             ts_extra_singles = [r for r in ts_rules_singles if r not in builtin_set]
-
-            # STAGE 0 chains also forwarded to STAGE 2 as seed chains
             if ts_rules_chains:
                 all_seeds = list(all_seeds) + ts_rules_chains
 
-        # ─────────────────────────────────────────────────────────────────────
-        # NOW initialise GPU and continue with phases 1, S, 2, 3 ...
-        # ─────────────────────────────────────────────────────────────────────
         if not self.gpu_engine.initialize_gpu(self.device_spec):
             return all_counts
-
-        # Recompute params now that we have a real GPU device
         self.params = calculate_dynamic_parameters(
-            self.base_count, self.target_count,
-            self.gpu_engine.device,
-            self.params['TARGET_SECONDS'] / 3600,
-            bloom_mb_override=self.bloom_mb)
+            self.base_count, self.target_count, self.gpu_engine.device,
+            self.params['TARGET_SECONDS']/3600, bloom_mb_override=self.bloom_mb)
         self.params['MAX_CHAIN_DEPTH'] = self.max_depth
         self.gpu_engine.params = self.params
 
-        # Merge STAGE 0 single-rules into STAGE 1 atomic pool
         extra_seeds = [s for s in all_seeds if ' ' not in s.strip()]
         extra_seeds_valid = [s for s in extra_seeds if s not in builtin_set]
         rules_phase1 = rules + ts_extra_singles + extra_seeds_valid
-
         seed_chains = [s for s in all_seeds if ' ' in s.strip()]
-
         if extra_seeds_valid:
-            log_info(f"[SEED] {len(extra_seeds_valid)} seed single-rule(s) added to STAGE 1 "
-                     f"({len(extra_seeds) - len(extra_seeds_valid)} already in built-in set)")
+            log_info(f"[SEED] {len(extra_seeds_valid)} seed single-rule(s) added to STAGE 1")
         if seed_chains and self.max_depth < 2:
-            log_warn(f"[SEED] {len(seed_chains)} chain seed(s) ignored — "
-                     f"requires --max-depth >= 2 to run STAGE 2")
-        log_debug(f"Seed split: {len(extra_seeds_valid)} singles → STAGE 1, "
-                  f"{len(seed_chains)} chains → STAGE 2")
+            log_warn(f"[SEED] {len(seed_chains)} chain seed(s) ignored — requires --max-depth >= 2")
 
+        # Clear STAGE 0 index globals
+        global _p0_worker_base_set, _p0_worker_base_by_len, _p0_worker_base_lower_idx
+        global _p0_worker_purge_idx, _p0_worker_substr_idx, _p0_worker_omit_idx
+        global _p0_worker_prefix_idx, _p0_worker_ascii_idx, _p0_worker_overwrite_idx
+        _p0_worker_base_set       = set()
+        _p0_worker_base_by_len    = {}
+        _p0_worker_base_lower_idx = {}
+        _p0_worker_purge_idx      = {}
+        _p0_worker_substr_idx     = {}
+        _p0_worker_omit_idx       = {}
+        _p0_worker_prefix_idx     = {}
+        _p0_worker_ascii_idx      = {}
+        _p0_worker_overwrite_idx  = {}
+        log_debug("[MEM] STAGE 0 index globals cleared before STAGE 1")
+
+        # Bloom filter on CPU
+        log_info("[GPU]  Building bloom filter on CPU …")
+        if not self.gpu_engine.compile_kernel(): return all_counts
         bloom_filter = self.gpu_engine.generate_bloom_filter(target_words)
+        self.gpu_engine.upload_bloom_filter(bloom_filter)
 
-        # --- STAGE 1: single rules + seed singles ---
+        # STAGE 1
         log_section("STAGE 1 — Single Rule Search")
         seed_note = f"  ({len(extra_seeds_valid)} from seeds)" if extra_seeds_valid else ""
-        log_info(f"[S1]    {len(base_words):,} base words × "
-                 f"{len(rules_phase1):,} atomic rules{seed_note}")
+        log_info(f"[S1]    {len(base_words):,} base words × {len(rules_phase1):,} atomic rules{seed_note}")
         t0 = time.time()
-        single = self.gpu_engine.process_all_words_single_rule(
-            base_words, rules_phase1, bloom_filter)
+        single = self.gpu_engine.process_all_words_single_rule(base_words, rules_phase1, bloom_filter)
         t1 = time.time()
         all_counts.update(single)
-        log_debug(f"STAGE 1 elapsed: {t1-t0:.1f}s")
 
-        # --- STAGE S: Numeric Seed Extraction (controlled by --no-builtin-seeds) ---
+        # STAGE S
         seed_hits = Counter()
         if self.builtin_seeds:
-            log_section("STAGE S — Seed Extraction (numeric + special-char families A–M)")
+            log_section("STAGE S — Seed Extraction (families A-M)")
             sbd = self.gpu_engine.build_numeric_seed_families(max_depth=self.max_depth)
-
-            # ── STAGE 0 → STAGE S injection ───────────────────────────────────
             if ts_sbd:
                 n_injected = 0
                 for depth, chains in ts_sbd.items():
@@ -4838,26 +3416,19 @@ class GPUExtractor:
                     sbd[depth].update(chains)
                     n_injected += len(sbd[depth]) - before
                 if n_injected:
-                    log_info(
-                        f"[SEED]    STAGE 0 injected {bold(cyan(str(n_injected)))} "
-                        f"chain(s) into STAGE S sbd"
-                    )
-
+                    log_info(f"[SEED]    STAGE 0 injected {bold(cyan(str(n_injected)))} chain(s) into STAGE S sbd")
             seed_hits = self.gpu_engine.run_seed_extraction_pass(
                 base_words, sbd, bloom_filter, rules_phase1)
             all_counts.update(seed_hits)
             ts = time.time()
-            log_debug(f"Seed pass elapsed: {ts-t1:.1f}s")
         else:
-            log_info(f"[SEED]    {yellow('Skipped')} — built-in numeric seed families disabled "
-                     f"(--no-builtin-seeds)")
+            log_info(f"[SEED]    {yellow('Skipped')} (--no-builtin-seeds)")
             sbd = {}
             ts = t1
 
-        # --- STAGE 2: random rule chains ---
+        # STAGE 2
         if self.max_depth > 1:
             log_section("STAGE 2 — Rule Chain Search")
-            # Reserve time for GA if enabled
             if self.genetic and self.max_depth >= 2:
                 _min_ga_secs    = 120.0
                 _ga_frac        = 0.20
@@ -4865,60 +3436,38 @@ class GPUExtractor:
                                        self.params['TARGET_SECONDS'] * _ga_frac)
             else:
                 _reserved_for_ga = 0.0
-
             remaining = max(0, self.params['TARGET_SECONDS'] - (ts-t0) - _reserved_for_ga)
             budget    = remaining * self.params['EST_COMBOS_PER_SEC'] * TIME_SAFETY_FACTOR
             depths    = list(range(2, self.max_depth+1))
             depth_budgets = ({d: int(budget/len(depths)/(len(base_words)*d)) for d in depths}
                              if budget > 0 and base_words and depths
                              else {d: 0 for d in depths})
-
             for d in depths:
                 key = f'depth{d}_override'
                 if key in depth_overrides and depth_overrides[key] is not None:
                     depth_budgets[d] = depth_overrides[key]
-                    log_debug(f"Depth {d} chain budget overridden to {depth_overrides[key]:,}")
                 depth_budgets[d] = max(0, depth_budgets[d])
-
             if self.max_chains:
                 total = sum(depth_budgets.values())
                 if total > self.max_chains:
                     scale = self.max_chains / total
                     depth_budgets = {d: int(v*scale) for d,v in depth_budgets.items()}
-                    log_debug(f"Budgets scaled by {scale:.3f} to fit --max-chains={self.max_chains}")
-
             for d, bgt in depth_budgets.items():
                 self.params[f'CHAIN_GEN_LIMIT_{d}'] = bgt
-
-            log_info(f"[S2]    depth 2–{self.max_depth} | "
-                     + " | ".join(f"d{d}:{v:,}" for d,v in depth_budgets.items()))
-            log_debug(f"Remaining time budget: {remaining:.1f}s")
-
+            log_info(f"[S2]    depth 2-{self.max_depth} | " +
+                     " | ".join(f"d{d}:{v:,}" for d,v in depth_budgets.items()))
             chains = self.gpu_engine.process_all_words_chain_rules(
                 base_words, rules_phase1, self.max_depth, bloom_filter, single,
                 seed_chains=seed_chains, prebuilt_sbd=sbd)
             all_counts.update(chains)
-            log_debug(f"STAGE 2 elapsed: {time.time()-ts:.1f}s")
 
-        # --- STAGE 3: Genetic Algorithm Rule Evolution (optional) ---
+        # STAGE 3
         if self.genetic and self.max_depth >= 2:
             log_section("STAGE 3 — Genetic Algorithm Rule Evolution")
-
-            # Build the rule pool from Phase-1 validated rules.
             rule_pool = HashcatRuleValidator.validate_rules_for_gpu(rules_phase1)
-
-            # Seed the GA with the hottest Phase-1 hits (most bloom hits first).
-            hot_rules = [
-                r for r, _ in sorted(
-                    single.items(), key=lambda kv: -kv[1]
-                )
-            ]
-
-            # Time remaining: use the dedicated GA reservation first, then
-            # any unconsumed Phase-2 time.
-            t_now     = time.time()
-            elapsed_p12s = t_now - t0
-            remaining = max(0.0, self.params['TARGET_SECONDS'] - elapsed_p12s)
+            hot_rules = [r for r, _ in sorted(single.items(), key=lambda kv: -kv[1])]
+            t_now = time.time()
+            remaining = max(0.0, self.params['TARGET_SECONDS'] - (t_now - t0))
             if self.genetic and self.max_depth >= 2:
                 _min_ga_secs    = 120.0
                 _ga_frac        = 0.20
@@ -4927,55 +3476,29 @@ class GPUExtractor:
             else:
                 _reserved_for_ga = 0.0
             ga_budget = max(remaining, _reserved_for_ga)
-
             if ga_budget < 5.0:
-                log_warn(
-                    f"[S3]    Only {ga_budget:.1f}s available — "
-                    "consider raising --target-hours for STAGE 3."
-                )
+                log_warn(f"[S3]    Only {ga_budget:.1f}s available — consider raising --target-hours")
             else:
-                log_info(
-                    f"[S3]    Reserved budget for STAGE 3: "
-                    f"{bold(f'{ga_budget:.0f}s')}  "
-                    f"(target={self.params['TARGET_SECONDS']:.0f}s, "
-                    f"used={elapsed_p12s:.0f}s)"
-                )
-
-            # Pass all rules already discovered (STAGE 1 + STAGE S + STAGE 2)
+                log_info(f"[S3]    Budget: {bold(f'{ga_budget:.0f}s')}")
             known_rules_set = set(all_counts.keys())
-
             evolver = GeneticRuleEvolver(
-                gpu_engine        = self.gpu_engine,
-                base_words        = base_words,
-                rule_pool         = rule_pool,
-                max_depth         = self.max_depth,
-                pop_size          = self.genetic_pop,
-                elite_frac        = self.genetic_elite,
-                seed_hits         = seed_hits,
-                known_rules       = known_rules_set,
+                gpu_engine=self.gpu_engine, base_words=base_words,
+                rule_pool=rule_pool, max_depth=self.max_depth,
+                pop_size=self.genetic_pop, elite_frac=self.genetic_elite,
+                seed_hits=seed_hits, known_rules=known_rules_set,
             )
-
-            ga_hits = evolver.evolve(
-                hot_rules   = hot_rules,
-                generations = self.genetic_generations,
-                time_budget = ga_budget,
-            )
-
+            ga_hits = evolver.evolve(hot_rules, self.genetic_generations, ga_budget)
             before = len(all_counts)
             all_counts.update(ga_hits)
-            new_from_ga   = len(all_counts) - before
+            new_from_ga = len(all_counts) - before
             n_truly_novel = sum(1 for r in ga_hits if r not in known_rules_set)
-            log_info(
-                f"[S3]    {bold(cyan(str(new_from_ga)))} net new rules added "
-                f"by STAGE 3  ({bold(green(str(len(ga_hits))))} total GA hits, "
-                f"{bold(cyan(str(n_truly_novel)))} genuinely novel)"
-            )
+            log_info(f"[S3]    {bold(cyan(str(new_from_ga)))} net new rules from STAGE 3  "
+                     f"({bold(green(str(len(ga_hits))))} total GA hits, "
+                     f"{bold(cyan(str(n_truly_novel)))} genuinely novel)")
 
         validated = Counter({r: c for r,c in all_counts.items()
                              if HashcatRuleValidator.validate_rule_for_gpu(r)})
-        log_debug(f"Post-validation: {len(validated)} rules from {len(all_counts)} raw")
         return validated
-
 
 # --------------------------------------------------------------------
 # Wordlist loader
@@ -4984,19 +3507,14 @@ def load_wordlist(filename: str) -> list:
     words = set()
     try:
         with open(filename, 'r', encoding='latin-1', errors='ignore') as f:
-            for line in tqdm(f,
-                             desc=green(f"  Loading  "),
-                             unit="line",
-                             ncols=88,
-                             leave=False,
-                             bar_format="{l_bar}{bar}| {n_fmt} [{elapsed}] {postfix}"):
+            for line in tqdm(f, desc=green("  Loading  "), unit="line", ncols=88,
+                             leave=False, bar_format="{l_bar}{bar}| {n_fmt} [{elapsed}] {postfix}"):
                 w = line.strip()
                 if w and len(w) <= MAX_WORD_LEN: words.add(w)
     except FileNotFoundError:
         log_error(f"File not found: {filename}"); sys.exit(1)
     result = list(words)
-    log_info(f"[LOAD] {bold(os.path.basename(filename))}: "
-             f"{bold(cyan(f'{len(result):,}'))} unique words")
+    log_info(f"[LOAD] {bold(os.path.basename(filename))}: {bold(cyan(f'{len(result):,}'))} unique words")
     return result
 
 # ====================================================================
@@ -5004,231 +3522,80 @@ def load_wordlist(filename: str) -> list:
 # ====================================================================
 def main() -> None:
     global VERBOSE, ALLOW_REJECT_RULES
-
-    ap = argparse.ArgumentParser(
-        prog='rulest',
-        description='GPU-Compatible Hashcat Rules Engine',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-
-    # ---- Positional / core ----------------------------------------
-    ap.add_argument('base_wordlist',   nargs='?', default=None,
-                    help='Base wordlist (input words to transform)')
-    ap.add_argument('target_wordlist', nargs='?', default=None,
-                    help='Target wordlist (desired transformation outputs)')
-
-    # ---- Output ---------------------------------------------------
-    ap.add_argument('-o', '--output', default='rulest_output.txt',
-                    help='Output file for the minimized rule set (default: rulest_output.txt)')
-
-    # ---- GPU / extraction ----------------------------------------
-    ap.add_argument('--device',       default=None,
-                    help='OpenCL device index or name substring')
-    ap.add_argument('--list-devices', action='store_true',
-                    help='List available OpenCL devices and exit')
-    ap.add_argument('--max-depth',    type=int, default=2,
-                    help='Maximum rule chain depth (default: 2, max: 31)')
-    ap.add_argument('--target-hours', type=float, default=0.5,
-                    help='Target GPU runtime in hours (default: 0.5)')
-    ap.add_argument('--max-chains',   type=int, default=0,
-                    help='Hard cap on total chain candidates (0 = auto)')
-    ap.add_argument('--bloom-mb',     type=int, default=0,
-                    help=f'Bloom filter size in MB (default: {BLOOM_FILTER_MAX_MB})')
-    ap.add_argument('--seed-rules',   default=None,
-                    help='Path to a file of seed rules. Single-rule seeds are '
-                         'injected into STAGE 1 as standalone extraction candidates '
-                         'AND used as prioritised chain atoms in STAGE 2. '
-                         'Multi-rule chain seeds are tested directly against the '
-                         'bloom filter in STAGE 2 (not only as chain building blocks).')
-
-    # ---- Depth overrides -----------------------------------------
+    ap = argparse.ArgumentParser(prog='rulest', description='GPU-Compatible Hashcat Rules Engine',
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('base_wordlist', nargs='?', default=None)
+    ap.add_argument('target_wordlist', nargs='?', default=None)
+    ap.add_argument('-o', '--output', default='rulest_output.txt')
+    ap.add_argument('--device', default=None)
+    ap.add_argument('--list-devices', action='store_true')
+    ap.add_argument('--max-depth', type=int, default=2)
+    ap.add_argument('--target-hours', type=float, default=0.5)
+    ap.add_argument('--max-chains', type=int, default=0)
+    ap.add_argument('--bloom-mb', type=int, default=0)
+    ap.add_argument('--seed-rules', default=None)
     for i in range(2, 11):
-        ap.add_argument(f'--depth{i}-chains', type=int, default=None,
-                        dest=f'depth{i}_chains',
-                        help=f'Override chain count for depth {i} (default: auto)')
-
-    # ---- Signature-based minimization (built-in probe set only) ---
-    # (Note: --sig-words and --min-word-len have been removed; built-in probe set is always used)
-
-    # ---- Misc ----------------------------------------------------
-    ap.add_argument('--allow-reject-rules', action='store_true',
-                    help='Allow rules that hashcat would reject (reject-class opcodes)')
-    ap.add_argument('--no-builtin-seeds', action='store_true',
-                    help='Disable the built-in seed families (STAGE S: '
-                         'pure prepend/append, mixed, transform+digit, date patterns, '
-                         'special-char families F–I: append/prepend special chars, '
-                         'transform+special, number+special combos, and new families '
-                         'J–M: leet substitutions, double-transform, special-before-digit, '
-                         'leet+transform). '
-                         'By default STAGE S always runs; pass this flag to skip it '
-                         'and rely solely on STAGE 1 atomic rules and STAGE 2 random chains.')
-
-    # ---- STAGE 0: Token-Strip ----------------------------------------
-    pt = ap.add_argument_group(
-        'STAGE 0 — Token-Strip Rule Extraction',
-        'Optional CPU-only pre-pass that decomposes target passwords into\n'
-        'token categories (lowercase=stem, uppercase=case rules,\n'
-        'leet chars=substitution rules, boundary digits/specials=prepend/append)\n'
-        'and generates hashcat rule chains that reconstruct each password\n'
-        'from a base-wordlist stem.  Activated with --token-strip.'
-    )
-    pt.add_argument(
-        '--token-strip', action='store_true',
-        help='Enable STAGE 0: empirical CPU-only rule extraction by decomposing '
-             'target passwords into stem + transform rules.  Discovered rules are '
-             'injected into the STAGE 1 atomic pool (single-rule) and STAGE S sbd '
-             '(multi-rule chains) before any GPU work begins.',
-    )
-    pt.add_argument(
-        '--token-strip-min-stem', type=int, default=4, metavar='N',
-        help='Minimum stem length after token decoding (default: 4).  '
-             'Shorter stems produce noisy rules and are discarded.',
-    )
-    pt.add_argument(
-        '--token-strip-max-prefix', type=int, default=4, metavar='N',
-        help='Maximum number of boundary characters to strip from the start '
-             'of a target word (default: 4).  These become prepend (^) rules.',
-    )
-    pt.add_argument(
-        '--token-strip-max-suffix', type=int, default=4, metavar='N',
-        help='Maximum number of boundary characters to strip from the end '
-             'of a target word (default: 4).  These become append ($) rules.',
-    )
-    pt.add_argument(
-        '--token-strip-min-leet-amb', type=int, default=3, metavar='N',
-        help="Maximum number of ambiguous leet positions per word (default: 3). "
-             "A position is ambiguous when its leet char maps to more than one "
-             "base letter (e.g. '1' → 'i' or 'l').  Higher values allow more "
-             "combinations but increase CPU time.",
-    )
-    pt.add_argument(
-        '--token-strip-workers', type=int, default=0, metavar='N',
-        help='Worker processes for STAGE 0 (default: 0 = all CPU cores). '
-             'Set to 1 to disable multiprocessing.',
-    )
-    pt.add_argument(
-        '--token-strip-chunk-size', type=int, default=0, metavar='N',
-        help='Target words per worker chunk (default: 0 = auto).  '
-             'Smaller chunks improve progress resolution; larger chunks reduce overhead.',
-    )
-    pt.add_argument(
-        '--token-strip-no-new-modes', action='store_true',
-        help='Disable the v1.1 extraction modes (insert, swap, range, char-dup, '
-             'ascii, truncate, purge, repeat, sep-title) and run only the original '
-             'five modes (letter, digit, reverse, delete-edge, dup/fold).',
-    )
-
-    # ---- STAGE 3: Genetic Algorithm ----------------------------------
-    ga = ap.add_argument_group(
-        'STAGE 3 — Genetic Algorithm',
-        'Optional evolutionary search that runs after STAGE 2 and guides '
-        'chain generation toward high-coverage rules. '
-        'Activated with --genetic.'
-    )
-    ga.add_argument(
-        '--genetic', action='store_true',
-        help='Enable STAGE 3 genetic algorithm rule evolution '
-             '(runs after STAGE 2, uses remaining time budget).',
-    )
-    ga.add_argument(
-        '--genetic-generations', type=int, default=50,
-        metavar='N',
-        help='Maximum number of GA generations to run (default: 50). '
-             'Each generation performs a full GPU fitness evaluation of '
-             'the entire population, so larger values extend runtime.',
-    )
-    ga.add_argument(
-        '--genetic-pop', type=int, default=200,
-        metavar='N',
-        help='GA population size — number of rule chains per generation '
-             '(default: 200).  Larger populations improve coverage at the '
-             'cost of more GPU evaluations per generation.',
-    )
-    ga.add_argument(
-        '--genetic-elite', type=float, default=0.15,
-        metavar='F',
-        help='Fraction of the top-scoring individuals carried unchanged '
-             'into the next generation (default: 0.15 = 15 %%).  '
-             'Higher values stabilise convergence; lower values increase '
-             'diversity.',
-    )
-
-    ap.add_argument('--debug',        action='store_true',
-                    help='Enable verbose/debug output')
-
+        ap.add_argument(f'--depth{i}-chains', type=int, default=None, dest=f'depth{i}_chains')
+    ap.add_argument('--allow-reject-rules', action='store_true')
+    ap.add_argument('--no-builtin-seeds', action='store_true')
+    pt = ap.add_argument_group('STAGE 0 — Token-Strip Rule Extraction')
+    pt.add_argument('--token-strip', action='store_true')
+    pt.add_argument('--token-strip-min-stem', type=int, default=4, metavar='N')
+    pt.add_argument('--token-strip-max-prefix', type=int, default=4, metavar='N')
+    pt.add_argument('--token-strip-max-suffix', type=int, default=4, metavar='N')
+    pt.add_argument('--token-strip-min-leet-amb', type=int, default=3, metavar='N')
+    pt.add_argument('--token-strip-workers', type=int, default=0, metavar='N')
+    pt.add_argument('--token-strip-chunk-size', type=int, default=0, metavar='N')
+    pt.add_argument('--token-strip-no-new-modes', action='store_true')
+    ga = ap.add_argument_group('STAGE 3 — Genetic Algorithm')
+    ga.add_argument('--genetic', action='store_true')
+    ga.add_argument('--genetic-generations', type=int, default=50, metavar='N')
+    ga.add_argument('--genetic-pop', type=int, default=200, metavar='N')
+    ga.add_argument('--genetic-elite', type=float, default=0.15, metavar='F')
+    ap.add_argument('--debug', action='store_true')
     args = ap.parse_args()
 
-    # ---- Apply globals -------------------------------------------
     ALLOW_REJECT_RULES = args.allow_reject_rules
     VERBOSE            = args.debug
-
-    # ---- Banner --------------------------------------------------
     print_banner()
-
-    if args.list_devices:
-        list_devices(); sys.exit(0)
-
+    if args.list_devices: list_devices(); sys.exit(0)
     if not args.base_wordlist or not args.target_wordlist:
-        ap.print_help(); print()
-        log_error("Both BASE and TARGET wordlists are required.")
-        sys.exit(1)
-
-    # Cap depth to hashcat limit
+        ap.print_help(); print(); log_error("Both BASE and TARGET wordlists are required."); sys.exit(1)
     if args.max_depth > MAX_HASHCAT_CHAIN:
-        log_warn(f"Depth {args.max_depth} exceeds hashcat's maximum chain length "
-                 f"({MAX_HASHCAT_CHAIN}). Limiting to {MAX_HASHCAT_CHAIN}.")
-        args.max_depth = MAX_HASHCAT_CHAIN
+        log_warn(f"Depth capped to {MAX_HASHCAT_CHAIN}"); args.max_depth = MAX_HASHCAT_CHAIN
     elif args.max_depth < 1:
         log_error("--max-depth must be >= 1"); sys.exit(1)
 
-    # ---- Summary line --------------------------------------------
     log_info(f"  base      : {bold(args.base_wordlist)}")
     log_info(f"  target    : {bold(args.target_wordlist)}")
     log_info(f"  depth     : {bold(str(args.max_depth))}  |  "
              f"hours: {bold(str(args.target_hours))}  |  "
-             f"bloom: {bold(str(args.bloom_mb or BLOOM_FILTER_MAX_MB))}MB")
-    _bs_status = red('DISABLED (--no-builtin-seeds)') if args.no_builtin_seeds else green('enabled (families A–M)')
-    log_info(f"  builtin seeds (STAGE S) : {_bs_status}")
-    # STAGE 0 status
+             f"bloom: {bold(str(args.bloom_mb or BLOOM_FILTER_MAX_MB))}MB  "
+             f"{bold(cyan('(on CPU)'))}")
+    _bs = red('DISABLED (--no-builtin-seeds)') if args.no_builtin_seeds else green('enabled (families A-M)')
+    log_info(f"  builtin seeds (STAGE S) : {_bs}")
     if args.token_strip:
-        _ts_inj = green('→ STAGE S sbd') if not args.no_builtin_seeds else yellow('→ STAGE 1 only (STAGE S disabled)')
-        _ts_modes = yellow('5 modes (new disabled)') if args.token_strip_no_new_modes else green('14 modes')
-        _ts_workers = bold(str(args.token_strip_workers or mp.cpu_count()))
-        log_info(
-            f"  {bold(cyan('STAGE 0 token-strip'))} : "
-            f"{green('enabled')}  |  "
-            f"min-stem={bold(str(args.token_strip_min_stem))}  "
-            f"prefix={bold(str(args.token_strip_max_prefix))}  "
-            f"suffix={bold(str(args.token_strip_max_suffix))}  "
-            f"leet-amb={bold(str(args.token_strip_min_leet_amb))}  "
-            f"workers={_ts_workers}  "
-            f"modes={_ts_modes}  "
-            f"{_ts_inj}"
-        )
-    if args.seed_rules:
-        log_info(f"  seeds     : {bold(args.seed_rules)}  "
-                 f"{dim('(singles -> STAGE 1 + STAGE 2 atoms | chains -> STAGE 2 direct)')}")
+        _inj = green('→ STAGE S sbd') if not args.no_builtin_seeds else yellow('→ STAGE 1 only')
+        _ml = green('15 modes') if not args.token_strip_no_new_modes else yellow('5 modes')
+        log_info(f"  {bold(cyan('STAGE 0'))} : {green('CPU exact-match')}  "
+                 f"min-stem={args.token_strip_min_stem}  "
+                 f"prefix={args.token_strip_max_prefix}  "
+                 f"suffix={args.token_strip_max_suffix}  "
+                 f"leet-amb={args.token_strip_min_leet_amb}  "
+                 f"workers={args.token_strip_workers or mp.cpu_count()}  "
+                 f"modes={_ml}  {_inj}")
+    if args.seed_rules: log_info(f"  seeds     : {bold(args.seed_rules)}")
     if args.genetic:
-        # Validate --genetic-elite range
         if not 0.0 < args.genetic_elite < 1.0:
-            log_error("--genetic-elite must be between 0.0 and 1.0 (exclusive).")
-            sys.exit(1)
-        log_info(
-            f"  {bold(green('STAGE 3 GA'))} : "
-            f"enabled  |  "
-            f"pop={bold(str(args.genetic_pop))}  "
-            f"gen={bold(str(args.genetic_generations))}  "
-            f"elite={bold(f'{args.genetic_elite:.0%}')}"
-        )
-    log_debug(f"Full args: {vars(args)}")
+            log_error("--genetic-elite must be between 0.0 and 1.0"); sys.exit(1)
+        log_info(f"  {bold(green('STAGE 3 GA'))} : pop={args.genetic_pop}  gen={args.genetic_generations}  elite={args.genetic_elite:.0%}")
+    log_info(f"  {bold(cyan('hang fix'))} : bloom on CPU + STAGE 0 indexes freed after pool")
     print()
 
-    # ---- Load ----------------------------------------------------
     base_words   = load_wordlist(args.base_wordlist)
     target_words = load_wordlist(args.target_wordlist)
     print()
 
-    # ---- GPU extraction ------------------------------------------
     t_start   = time.time()
     extractor = GPUExtractor(
         len(base_words), len(target_words), args.max_depth,
@@ -5248,109 +3615,63 @@ def main() -> None:
         token_strip_chunk_size    = args.token_strip_chunk_size,
         token_strip_no_new_modes  = args.token_strip_no_new_modes,
     )
-
-    extractor._output_path = args.output   # used by STAGE 0 debug dump
-
-    depth_overrides = {f'depth{i}_override': getattr(args, f'depth{i}_chains')
-                       for i in range(2, 11)}
-
+    extractor._output_path = args.output
+    depth_overrides = {f'depth{i}_override': getattr(args, f'depth{i}_chains') for i in range(2, 11)}
     raw_counts = extractor.extract_rules(base_words, target_words, **depth_overrides)
-    log_info(f"\n[GPU]  Raw bloom-filter candidates: {bold(cyan(str(len(raw_counts))))}")
-    log_debug(f"Raw counts: {len(raw_counts)} rules total")
-    print()
+    del target_words; gc.collect()
+    log_info(f"\n[GPU]  Raw bloom-filter candidates: {bold(cyan(str(len(raw_counts))))}"); print()
 
-    # ---- Signature-based functional minimization using built-in probe set ---
-    final_counts = minimize_by_signature(
-        raw_counts,
-        BUILTIN_PROBES,
-    )
+    final_counts = minimize_by_signature(raw_counts, BUILTIN_PROBES)
+    if ':' not in final_counts: final_counts[':'] = 0
 
-    # Always include the identity rule
-    if ':' not in final_counts:
-        final_counts[':'] = 0
-
-    # ---- Depth distribution for header ---------------------------
-    depth_dist: Dict[int, int] = defaultdict(int)
-    for rule in final_counts:
-        if rule != ':':
-            depth_dist[len(rule.split())] += 1
-    depth_summary = '  '.join(f"d{d}:{depth_dist[d]:,}" for d in sorted(depth_dist))
-
+    dd: Dict[int, int] = defaultdict(int)
+    for r in final_counts:
+        if r != ':': dd[len(r.split())] += 1
+    ds = '  '.join(f"d{d}:{dd[d]:,}" for d in sorted(dd))
     final_rules = len(final_counts) - (1 if ':' in final_counts else 0)
-    removed     = len(raw_counts)   - len(final_counts)
+    removed     = len(raw_counts) - len(final_counts)
 
-    # ---- Write single output file — sorted by frequency (GPU hits desc) --
-    sorted_items = sorted(
-        final_counts.items(),
-        key=lambda kv: (-kv[1], len(kv[0].split()), kv[0])
-    )
-
+    si = sorted(final_counts.items(), key=lambda kv: (-kv[1], len(kv[0].split()), kv[0]))
     with open(args.output, 'w', encoding='utf-8') as f:
         f.write("# rulest — GPU-Compatible Hashcat Rules Engine\n")
         f.write(f"# Generated      : {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write(f"# Base           : {os.path.basename(args.base_wordlist)}\n")
         f.write(f"# Target         : {os.path.basename(args.target_wordlist)}\n")
-        f.write(f"# Depth          : 1–{args.max_depth}\n")
-        f.write(f"# Bloom          : {args.bloom_mb or BLOOM_FILTER_MAX_MB} MB\n")
+        f.write(f"# Depth          : 1-{args.max_depth}\n")
+        f.write(f"# Bloom          : {args.bloom_mb or BLOOM_FILTER_MAX_MB} MB  (on CPU)\n")
+        f.write(f"# STAGE 0        : overwrite mode ON  GPU-verified candidates\n")
         if args.genetic:
-            f.write(f"# STAGE 3 GA     : enabled  "
-                    f"pop={args.genetic_pop}  "
-                    f"gen={args.genetic_generations}  "
-                    f"elite={args.genetic_elite:.0%}\n")
+            f.write(f"# STAGE 3 GA     : pop={args.genetic_pop}  gen={args.genetic_generations}  elite={args.genetic_elite:.0%}\n")
         f.write("#\n")
-        f.write(f"# GPU raw candidates      : {len(raw_counts):,}  "
-                f"(bloom hits, includes false positives)\n")
-        f.write(f"# Post-processing         : signature-based minimization\n")
-        _min_path = 'disk-backed SQLite' if len(raw_counts) > MINIMIZE_DISK_THRESHOLD else 'in-memory'
-        f.write(f"#   Path                  : {_min_path}  "
-                f"(threshold {MINIMIZE_DISK_THRESHOLD:,})\n")
+        f.write(f"# GPU raw candidates      : {len(raw_counts):,}\n")
+        mp2 = 'disk-backed SQLite' if len(raw_counts) > MINIMIZE_DISK_THRESHOLD else 'in-memory'
+        f.write(f"# Minimization            : {mp2}  (threshold {MINIMIZE_DISK_THRESHOLD:,})\n")
         f.write(f"#   Probe words           : {len(BUILTIN_PROBES)}  (built-in)\n")
         f.write(f"#   Equiv. rules removed  : {removed:,}\n")
         f.write("#\n")
-        f.write(f"# Rules kept     : {final_rules:,}  ({depth_summary})\n")
+        f.write(f"# Rules kept     : {final_rules:,}  ({ds})\n")
         f.write(f"# Sorted by      : GPU frequency (descending, UTF-8)\n")
         f.write(":\n")
-        for rule, _ in sorted_items:
-            if rule != ':':
-                f.write(f"{rule}\n")
-
+        for r, _ in si:
+            if r != ':': f.write(f"{r}\n")
     log_info(f"[OUT]  Minimized rules written to: {bold(args.output)}")
 
-    # ---- Final report --------------------------------------------
-    elapsed = time.time() - t_start
-    sep     = '─' * 56
-
-    print()
+    elapsed = time.time() - t_start; sep = '─'*56; print()
     log_info(cyan(sep))
-    log_info(f"  {bold('DONE')}  rulest finished in {bold(f'{elapsed:.1f}s')} "
-             f"({elapsed/3600:.3f}h)")
+    log_info(f"  {bold('DONE')}  rulest finished in {bold(f'{elapsed:.1f}s')}")
     log_info(cyan(sep))
     log_info(f"  GPU raw candidates : {bold(str(len(raw_counts)))}")
-    if args.genetic:
-        log_info(f"  STAGE 3 GA         : {bold(green('enabled'))}  "
-                 f"pop={args.genetic_pop}  gen={args.genetic_generations}")
-    log_info(f"  Rules kept         : {bold(green(str(final_rules)))}  "
-             f"{dim('('+depth_summary+')')}")
+    log_info(f"  Rules kept         : {bold(green(str(final_rules)))}  {dim('('+ds+')')}")
     log_info(f"  Rules removed      : {bold(red(str(removed)))}")
     log_info(f"  Output file        : {bold(args.output)}")
     log_info(cyan(sep))
-
-    # Top-20 by GPU frequency
-    top_sorted = sorted(
-        [(r, s) for r, s in final_counts.items() if r != ':'],
-        key=lambda kv: (-kv[1], len(kv[0].split()), kv[0])
-    )[:20]
-    if top_sorted:
-        print()
-        log_info(f"  Top {len(top_sorted)} rules by GPU frequency:")
-        for i, (rule, score) in enumerate(top_sorted, 1):
-            depth = len(rule.split())
-            log_info(f"  {dim(str(i).rjust(3)+'.')} "
-                     f"{dim(f'd={depth}')}  "
-                     f"{rule:<42s}  "
-                     f"{cyan(str(score))}")
+    top = sorted([(r,s) for r,s in final_counts.items() if r!=':'],
+                 key=lambda kv: (-kv[1], len(kv[0].split()), kv[0]))[:20]
+    if top:
+        print(); log_info(f"  Top {len(top)} rules by GPU frequency:")
+        for i,(r,s) in enumerate(top, 1):
+            log_info(f"  {dim(str(i).rjust(3)+'.')} {dim(f'd={len(r.split())}')}  {r:<42s}  {cyan(str(s))}")
     print()
-
 
 if __name__ == '__main__':
     main()
