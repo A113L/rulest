@@ -536,35 +536,6 @@ Phase 0 runs **14 extraction modes** per target word. The original five modes ar
 | **delete-edge** | `[` or `]` + combinations | depth ≥ 2 | Strips one boundary char from start or end first |
 | **dup/fold** | `d`, `f` | word ≥ 2× min-stem | Detects passwords formed by duplicating or folding a base word |
 
-#### New v1.1 modes
-
-| Mode | Hashcat rules | Example |
-|---|---|---|
-| **insert** | `iNX` | `paassword` → `password` via `i1a` |
-| **swap** | `k`, `K`, `*MN` | `apssword` → `password` via `k` |
-| **range** | `xNM`, `ONM` | `sswor` → `password` via `x26`; `passd` via `O43` |
-| **char-dup** | `zN`, `ZN`, `q` | `ppassword` → `password` via `z1` |
-| **ascii-transform** | `+N`, `-N`, `LN`, `RN` | `qbttxpse` → `password` via `+0 +1 … +7` |
-| **truncate** | `'N` | `passwor` → `password` via `'6` |
-| **purge** | `@X` | `pssword` → `password` via `@a` |
-| **repeat** | `pN` | `passwordpassword` → `password` via `p1` |
-| **sep-title** | `eX` | `Pass-Word` → `pass-word` via `e-` |
-
-### Multiprocessing
-
-Phase 0 fans out work across all CPU cores using `multiprocessing.Pool`. Seven inverted indexes are built once in the main process before the pool is created:
-
-| Index | Used by | Lookup cost |
-|---|---|---|
-| `base_by_len` | insert, ascii-transform | O(1) |
-| `base_lower_idx` | sep-title | O(1) |
-| `purge_idx` | purge | O(1) |
-| `substr_idx` | range `xNM` | O(1) |
-| `omit_idx` | range `ONM` | O(1) |
-| `prefix_idx` | truncate | O(1) |
-| `ascii_idx` | ascii-transform | O(1) |
-
-On Linux/macOS (fork context) workers inherit all indexes via copy-on-write — zero serialization overhead. On Windows (spawn context) they are passed via `initargs`. Control parallelism with `--token-strip-workers` (default: all cores) and `--token-strip-chunk-size` (default: auto).
 
 ### Token Model
 
