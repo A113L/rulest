@@ -535,7 +535,7 @@ Phase 0 runs **6 extraction modes** per target word. The original 6 modes are al
 | **reverse** | `r` + combinations | depth ≥ 2 | Prepends `r`; remainder handled by letter/digit modes |
 | **delete-edge** | `[` or `]` + combinations | depth ≥ 2 | Strips one boundary char from start or end first |
 | **dup/fold** | `d`, `f` | word ≥ 2× min-stem | Detects passwords formed by duplicating or folding a base word |
-| **insert** | `iNX` | `paassword` → `password` via `i1a` |
+| **insert** | `iNX` | `paassword` → `password` via `i1a` | inserts a given character at a specified position (0‑based) in the word. |
 
 ### Token Model
 
