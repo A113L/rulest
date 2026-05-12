@@ -65,7 +65,7 @@ A complete redesign built around GPU efficiency, Hashcat compatibility, and inte
 **Key capabilities:**
 - ✅ Full **Hashcat GPU rule validation** (max 31 ops, correct argument types)
 - ✅ **Bloom filter** on-GPU for fast membership testing with configurable false-positive rate
-- ✅ **Phase 0 — Token-Strip Rule Extraction** (`--token-strip`): optional CPU pre-pass running **14 extraction modes** across every target word with full multiprocessing support (`--token-strip-workers`); decomposes passwords into base stem + rule chain using letter, digit, reverse, delete-edge, dup/fold modes (original five) plus insert (`iNX`), swap (`*MN k K`), range (`xNM ONM`), char-dup (`zN ZN q`), ascii-transform (`+N -N LN RN`), truncate (`'N`), purge (`@X`), repeat (`pN`), and sep-title (`eX`) modes (v1.1); builds 7 precomputed inverted indexes before spawning workers (zero serialization overhead via CoW fork); single-rule discoveries feed Phase 1; multi-rule chains are injected into Phase S and Phase 2
+- ✅ **Phase 0 — Token-Strip Rule Extraction** (`--token-strip`): optional CPU pre-pass running **6 extraction modes** across every target word with full multiprocessing support (`--token-strip-workers`); decomposes passwords into base stem + rule chain using letter, digit, reverse, delete-edge, dup/fold modes (original five) plus insert (`iNX`); single-rule discoveries feed Phase 1; multi-rule chains are injected into Phase S and Phase 2
 - ✅ **Four-phase extraction**: token-strip pre-pass (Phase 0) → single-rule sweep (Phase 1) → built-in seed pass (Phase S) → informed chain generation (Phase 2)
 - ✅ **Built-in seed families** (A–M): thirteen deterministically generated seed families covering numeric prefixes/suffixes, mixed prepend/append, transform+digit combos, date patterns, special-character append/prepend/transform/combo patterns, leet substitutions, double-transform chains, special-before-digit patterns, and leet+transform combos — run by default as a dedicated extraction pass, independent of `--max-depth` and the random-chain time budget; can be skipped with `--no-builtin-seeds`
 - ✅ **Signature-based functional minimization**: removes functionally equivalent rules post-GPU using a deterministic probe set, keeping only the highest-frequency representative per equivalence class
@@ -88,7 +88,6 @@ Three root-cause bugs that caused Phase 3 to produce identical results with and 
  
 | Change | Description |
 |---|---|
-| **Phase 0 — 14 extraction modes + multiprocessing** | Phase 0 now runs **14 extraction modes** (up from 5) with full multiprocessing. Nine new v1.1 modes added: insert (`iNX`), swap (`*MN k K`), range (`xNM ONM`), char-dup (`zN ZN q`), ascii-transform (`+N -N LN RN`), truncate (`'N`), purge (`@X`), repeat (`pN`), sep-title (`eX`). Seven precomputed inverted indexes are built once before spawning workers; CoW fork inheritance means zero serialization overhead. New flags: `--token-strip-workers`, `--token-strip-chunk-size`, `--token-strip-no-new-modes`. |
 | **Phase 0 — Token-Strip** | New optional CPU pre-pass (`--token-strip`) that runs before Phase 1. Reverse-engineers exact rule chains from target passwords by splitting each word into a base stem + boundary tokens. Single-rule discoveries are injected into Phase 1; multi-rule chains are injected into Phase S and Phase 2. Supersedes ad-hoc leet/case rules with ground-truth verified chains. |
 | **Novelty-weighted fitness** | Chains not yet discovered by Phase 1/S/2 receive a **2x fitness bonus** during GA selection. Previously fitness was raw bloom hits, so already-known high-scorers dominated every generation and the GA just rediscovered Phase 2 results. |
 | **Unexplored-seed initial population** | The 40 % Phase-S fill slot now prefers seeds **absent from `known_rules`**. Previously it used top-hit Phase-S chains — all already in `all_counts` — so the GA started with a population of mostly-known rules. Depth-3+ bias (70 %) is also applied to seeded and fill portions when `--max-depth >= 3`. |
@@ -107,7 +106,7 @@ Three root-cause bugs that caused Phase 3 to produce identical results with and 
 | **Rule set size** | ~2,700 static rules | 5,600+ GPU-validated Hashcat single rules across 9 categories |
 | **Search strategy** | Naive BFS — every rule applied blindly | Phase 1 single-rule sweep → Phase S built-in seed extraction → Phase 2 hot-biased chain generation → Phase 3 GA (optional) |
 | **Built-in seed families** | ❌ Not implemented | ✅ Thirteen families (A–M): numeric prepend/append, mixed, transform+digit, date patterns, special-char append/prepend/transform/combo (F–I), leet substitutions (J), double-transform chains (K), special-before-digit (L), leet+transform (M); run by default as a dedicated pass independent of `--max-depth`; disable with `--no-builtin-seeds` |
-| **Token-strip pre-pass** | ❌ Not implemented | ✅ Phase 0 (`--token-strip`): **14 extraction modes** with multiprocessing; 7 precomputed inverted indexes built once, CoW-inherited by workers; new v1.1 modes: insert, swap, range, char-dup, ascii-transform, truncate, purge, repeat, sep-title; new flags: `--token-strip-workers`, `--token-strip-chunk-size`, `--token-strip-no-new-modes` |
+| **Token-strip pre-pass** | ❌ Not implemented | ✅ Phase 0 (`--token-strip`): **6 extraction modes** with multiprocessing; new flags: `--token-strip-workers`, `--token-strip-chunk-size` |
 | **Genetic algorithm** | ❌ Not implemented | ✅ Optional Phase 3 (`--genetic`): novelty-weighted evolutionary search (2× fitness bonus for chains not yet in known_rules) with dedicated time reservation (20 % of `--target-hours`, min 120 s) and stagnation-triggered population refresh; discovers deep-chain patterns that random Phase 2 sampling misses |
 | **Target lookup** | Python `set` (host RAM, per-result) | 16–256 MB Bloom filter uploaded once to GPU VRAM (FNV-1a, 4 hash functions) |
 | **Chain state** | Temp `.tmp` files on disk per depth | In-memory, GPU buffer-based with proper release and `gc.collect()` |
@@ -216,7 +215,6 @@ usage: rulest_v2.py [options] base_wordlist target_wordlist
 | `--token-strip-min-leet-amb` | `3` | Maximum number of ambiguous leet positions per word. A position is ambiguous when its leet char maps to more than one base letter (e.g. `1` → `i` or `l`). Higher values allow more combinations but increase CPU time. |
 | `--token-strip-workers` | `0` | Number of worker processes for Phase 0. `0` = all CPU cores. Set to `1` to disable multiprocessing. |
 | `--token-strip-chunk-size` | `0` | Words per worker chunk. `0` = auto-sized to `max(500, n_words / (workers × 4))`. Smaller values improve progress resolution; larger values reduce dispatch overhead. |
-| `--token-strip-no-new-modes` | off | Run only the original 5 modes (letter, digit, reverse, delete-edge, dup/fold). Skips the 9 v1.1 modes (insert, swap, range, char-dup, ascii-transform, truncate, purge, repeat, sep-title). Faster but narrower extraction. |
  
 #### Legacy v1 Reference
  
@@ -242,7 +240,7 @@ usage: rulest.py -w WORDLIST [-b BASE_WORDLIST] [-d CHAIN_DEPTH]
 │  │                                               │  │
 │  │  Phase 0 ────────▶  TokenStripExtractor       │  │
 │  │  (--token-strip;     CPU-only  ·  optional;   │  │
-│  │   default off;       14 modes, MP workers;    │  │
+│  │   default off;       6 modes, MP workers;    │  │
 │  │   runs pre-GPU)      singles → Phase 1 atoms; │  │
 │  │                      chains  → Ph.S + Ph.2    │  │
 │  │                                               │  │
@@ -282,9 +280,7 @@ usage: rulest.py -w WORDLIST [-b BASE_WORDLIST] [-d CHAIN_DEPTH]
 
 A CPU-only pre-pass running **14 extraction modes** with multiprocessing. Seven inverted indexes are built once in the main process and inherited by all workers via CoW fork (zero serialization on Linux/macOS; passed via `initargs` on Windows/spawn).
 
-Original 5 modes: letter (case + leet + boundary ops), digit (digit-stem with dynamic boundary), reverse (`r` prefix), delete-edge (`[`/`]` prefix), dup/fold (`d`/`f`).
-
-New v1.1 modes (9): insert (`iNX`), swap (`*MN k K`), range (`xNM ONM`), char-dup (`zN ZN q`), ascii-transform (`+N -N LN RN`), truncate (`'N`), purge (`@X`), repeat (`pN`), sep-title (`eX`).
+Original 5 modes: letter (case + leet + boundary ops), digit (digit-stem with dynamic boundary), reverse (`r` prefix), delete-edge (`[`/`]` prefix), dup/fold (`d`/`f`), insert (`iNX`).
 
 Validated single-rule discoveries are merged into Phase 1's atomic rule pool; multi-rule chains are injected into Phase S's seed-by-depth table and forwarded to Phase 2. Use `--token-strip-no-new-modes` to restrict to the original 5 modes; `--token-strip-workers` controls parallelism.
 
@@ -1042,22 +1038,11 @@ python rulest_v2.py rockyou.txt target.txt \
   -o with_token_strip.txt
 ```
 
-**Token-strip — use all CPU cores, default 14-mode extraction:**
-```bash
-# --token-strip-workers 0 = all cores (default); chunk size auto-tuned
-python rulest_v2.py rockyou.txt target.txt \
-  --token-strip \
-  --token-strip-workers 0 \
-  --max-depth 4 --target-hours 1.0 \
-  -o full_mp.txt
-```
-
-**Token-strip — restrict to original 5 modes for speed:**
+**Token-strip — use all CPU cores, default 6-mode extraction:**
 ```bash
 # Skip v1.1 modes (insert, swap, range, char-dup, ascii, truncate, purge, repeat, sep-title)
 python rulest_v2.py rockyou.txt target.txt \
   --token-strip \
-  --token-strip-no-new-modes \
   --token-strip-workers 8 \
   --max-depth 4 --target-hours 1.0 \
   -o fast_ts.txt
