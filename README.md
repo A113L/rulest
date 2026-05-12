@@ -1038,13 +1038,9 @@ python rulest_v2.py rockyou.txt target.txt \
 # Without token-strip — baseline
 python rulest_v2.py base.txt target.txt --max-depth 3 --target-hours 1.0 -o no_ts.txt
 
-# With token-strip, 14 modes (default) — compare rule count and depth distribution
+# With token-strip, 6 modes
 python rulest_v2.py base.txt target.txt --max-depth 3 --target-hours 1.0 \
-  --token-strip -o with_ts_14modes.txt
-
-# With token-strip, 5 modes only — isolate v1.1 mode contribution
-python rulest_v2.py base.txt target.txt --max-depth 3 --target-hours 1.0 \
-  --token-strip --token-strip-no-new-modes -o with_ts_5modes.txt
+  --token-strip -o with_ts_6modes.txt
 ```
 
 **Skip built-in seed families (Phase S disabled):**
