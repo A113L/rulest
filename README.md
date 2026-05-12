@@ -524,9 +524,9 @@ Phase 0 is an optional **CPU-only pre-pass** activated by `--token-strip`. It ru
 
 ### Extraction Modes
 
-Phase 0 runs **14 extraction modes** per target word. The original five modes are always active; the nine v1.1 modes run by default and can be disabled with `--token-strip-no-new-modes`.
+Phase 0 runs **6 extraction modes** per target word. The original 6 modes are always active
 
-#### Original 5 modes
+#### Original 6 modes
 
 | Mode | Hashcat rules | Trigger | Description |
 |---|---|---|---|
@@ -535,7 +535,7 @@ Phase 0 runs **14 extraction modes** per target word. The original five modes ar
 | **reverse** | `r` + combinations | depth ≥ 2 | Prepends `r`; remainder handled by letter/digit modes |
 | **delete-edge** | `[` or `]` + combinations | depth ≥ 2 | Strips one boundary char from start or end first |
 | **dup/fold** | `d`, `f` | word ≥ 2× min-stem | Detects passwords formed by duplicating or folding a base word |
-
+| **insert** | `iNX` | `paassword` → `password` via `i1a` |
 
 ### Token Model
 
