@@ -1,213 +1,17 @@
 #!/usr/bin/env python3
 """
 rulest — GPU-Compatible Hashcat Rules Engine
-=============================================
-Extracts hashcat rules/chains by comparing a base wordlist against a target
-wordlist.  GPU bloom filter screening (STAGE 1: single rules, STAGE 2: chains)
-is followed by signature-based functional minimization.
+====================================================================
+Stripped version: only 5 basic token‑strip modes + insert mode.
+All extra modes (swap, range, char‑duplicate, ascii‑transform, truncate,
+purge, repeat, separator‑title, overwrite) have been removed.
 
-Key feature: built-in probe set for functional minimisation.
-  Rules are deduplicated by their functional signature — the tuple of outputs
-  produced when applied to a fixed hand-curated set of probe words.  Rules that
-  produce identical outputs on every probe word are considered functionally
-  equivalent; only the one with the highest GPU hit-count is retained.
-  The built-in probe set covers short words (including "password"), mixed case,
-  words with digits/specials, and repeated-char words – no external wordlist
-  is required for accurate minimisation.
-
-  Large-scale minimisation (v2 improvement)
-  ─────────────────────────────────────────
-  The original in-memory path stores every signature as a Python tuple of
-  len(probe_words) strings inside a dict.  At ~2.5 KB per key, 8 M+ rules
-  require ~20 GB of Python heap — typically causing an OOM kill or a C-
-  extension crash reported as "core dumped".
-
-  ``minimize_by_signature`` now dispatches automatically:
-
-    ≤ MINIMIZE_DISK_THRESHOLD rules (default 500 k)
-      → ``_minimize_mem``  — original in-memory algorithm (fast, zero I/O).
-
-    > MINIMIZE_DISK_THRESHOLD rules
-      → ``_minimize_disk`` — SQLite-backed algorithm:
-          • Computes one signature at a time and immediately SHA-1-hashes it
-            (160-bit digest replaces the ~2.5 KB tuple in Python heap).
-          • Writes (sig_hash, rule, count, depth) in batches of
-            MINIMIZE_DISK_BATCH_SIZE rows to a temporary on-disk SQLite DB.
-          • Uses a single-pass INSERT … ON CONFLICT DO UPDATE so the DB
-            table holds at most one row per equivalence class at any moment.
-          • Reads survivors with one SELECT scan; deletes the temp file.
-          Peak Python heap is O(MINIMIZE_DISK_BATCH_SIZE × avg_rule_len)
-          — a few hundred KB regardless of total rule count.
-  Both paths apply the same tie-breaking: highest GPU count → shortest
-  chain depth → lexicographic rule order.
-
-STAGE S — Built-in Seed Families (A–M)
-  Thirteen seed families are always tested via a dedicated GPU chain-kernel
-  pass, independent of the random-chain time budget (unless --no-builtin-seeds).
-
-  Numeric families
-    A  Pure Prepend digits           (depths 1–4)
-    B  Pure Append digits            (depths 1–4)
-    C  Mixed Prepend/Append digits   (depths 1–4)
-    D  Transform + digit/bracket     (depths 2–4)
-    E  Date patterns DDMM/YYYY/…     (depths 4–9)
-
-  Special-character families
-    F  Pure Append special chars     (depths 1–3, top-15 chars)
-    G  Pure Prepend special chars    (depths 1–3, top-15 chars)
-    H  Transform + special char      (depths 2–3, top-15 chars)
-    I  Digit(s) + special char       (depths 2–4, core-7 chars)
-       — covers the ubiquitous "word123!" / "!word123" patterns
-
-  New families
-    J  Leet substitutions            (depths 1–2, 10 core pairs)
-       — sa@ se3 so0 si1 sl1 ss5 ss$ st7 sa4 si!
-       — depth 2: leet + digit/special suffix/prefix
-       — depth 2: double-leet chains (e.g. "sa@ so0" → "p@ssw0rd")
-    K  Double-transform chains       (depth 2, all 15×15 pairs)
-       — covers "c r", "u d", "t f", "E l", "c {", "l ]", etc.
-    L  Special-before-digit patterns (depths 2–3, core-7 chars)
-       — reverse orientation of Family I: "!1word" / "word!12"
-       — append: $sp $d…  prepend: ^d… ^sp
-    M  Leet + transform chains       (depth 2)
-       — leet substitution followed by a transform op (all 15)
-       — and transform op followed by leet substitution
-       — covers "P@ssword", "@DMIN", "p@SSW0RD" patterns
-
-  Special chars — top-15 (F/G/H):  ! @ # $ % ^ & * ? . - _ + ( )
-  Special chars — core-7  (I/L):   ! @ # $ % * ?
-
-STAGE 0 — Token-Strip Rule Extraction  (--token-strip)
-  An optional CPU-only pre-pass that extracts rules empirically by
-  decomposing target passwords into their constituent token categories
-  and building hashcat rule chains that reconstruct each password from
-  a base-wordlist stem.
-
-  Five extraction modes
-  ─────────────────────
-  LETTER MODE  (primary when letters ≥ digits)
-    Boundary = digits + specials → prepend/append ops.
-    Middle   = letters + leet   → case-transform + leet-substitution ops.
-    Covers:  "Password123!", "P@ssw0rd", "ADMIN2024"
-
-  DIGIT MODE   (primary when digits > letters — dynamic boundary)
-    Boundary = letters + specials → prepend/append ops.
-    Middle   = pure digit string → looked up verbatim in base wordlist.
-    Covers:  "abc2024" (stem "2024"), "123456xyz" (stem "123456")
-    Selects which characters become ^/$ rules based on word composition
-    so common numeric-base passwords are found regardless of orientation.
-
-  REVERSE MODE (chain prefix 'r')
-    The middle segment is reversed before stem lookup and case/leet decode.
-    Covers:  "drowssap!" → stem "password", rule "r $!"
-
-  DELETE-EDGE MODE (chain prefix '[' or ']')
-    One non-boundary character is stripped from start ('[') or end (']')
-    before running the normal letter-mode extraction.
-
-  DUPLICATE / FOLD MODE (chain 'd' or 'f')
-    Detects passwords built by duplicating ('d': stem+stem) or folding
-    ('f': stem+reverse(stem)) a base-wordlist word.
-
-  Toggle-chain seeds (separate, direct injection into STAGE 2)
-  ─────────────────────────────────────────────────────────────
-  Deterministic T0..TN chains (sequential, even-position, odd-position)
-  combined with every core leet op are generated independently of stem
-  lookups and injected directly into STAGE S sbd + STAGE 2 seed pool.
-  Captures high-frequency patterns observed in practice:
-    "T0 T1 T2 T3 T4 T5 T6 T7 se3"  →  mixed-case + e→3 on 8-char words
-    "T0 T2 T4 T6 sa@"               →  alternating toggle + a→@
-
-  STAGE S injection
-  ─────────────────
-  All STAGE 0 chains (from all modes) are injected into the STAGE S
-  seed-by-depth (sbd) pool before the GPU sweep.  Depth slots not present
-  in sbd (e.g. depth 10 with --max-depth 10) are created automatically.
-
-  Single-rule discoveries are merged into the STAGE 1 atomic-rule pool;
-  multi-rule chains are forwarded to STAGE 2 as seed chains.
-
-  CLI flags
-  ─────────
-    --token-strip                 Enable STAGE 0 (default: disabled)
-    --token-strip-min-stem N      Minimum stem length (default: 4)
-    --token-strip-max-prefix N    Max boundary prefix/suffix length (default: 4)
-    --token-strip-min-leet-amb N  Max ambiguous leet positions per word
-                                  (default: 3; limits branching for '1')
-
-STAGE 3 — Genetic Algorithm Rule Evolution  (--genetic)
-  An optional evolutionary search that runs after STAGE 2 and complements
-  random chain sampling with guided, coverage-driven optimisation.
-
-  Why it fits this project
-  ────────────────────────
-  • The fitness function (bloom-filter hits) is already computed by the
-    existing GPU chain kernel — no new GPU code is required.
-  • STAGE 2 samples chains *uniformly at random* from the atomic-rule pool.
-    For depth ≥ 3 the search space is |pool|^depth (millions of candidates);
-    the GA focuses probability mass on high-hit-rate regions of that space.
-  • Hot atomic rules from STAGE 1 seed the initial population, giving the GA
-    a strong head start rather than searching from scratch.
-  • **Improvement (v2)**: the original 40 % purely random portion of the
-    initial population is now replaced by high-hit chains from STAGE S
-    (families A–M) when builtin seeds are enabled. This dramatically
-    improves starting coverage while gracefully falling back to random
-    when --no-builtin-seeds is used.
-  • **Improvement (v2)**: three key fixes make STAGE 3 produce genuinely
-    new rules rather than rediscovering STAGE 2 results:
-      1. Novelty-weighted fitness — chains NOT already found by STAGE 1/S/2
-         receive a 2× fitness bonus so the GA is driven toward new territory
-         rather than cycling through already-known high-scorers.
-      2. Unexplored-seed initial population — the 40 % Phase-S fill slot
-         now prefers seeds NOT yet in all_counts; known seeds are used only
-         as fallback.  Depth-3+ chains are also biased (70 % probability)
-         in the seeded and fill portions when max_depth ≥ 3.
-      3. Dedicated time budget — 20 % of --target-hours (min 120 s) is
-         reserved for STAGE 3 instead of relying on leftover scraps after
-         STAGE 1+S+2.  This guarantees the GA actually runs.
-  • Stagnation detection — if the best fitness score does not improve for
-    5 consecutive generations, the bottom 30 % of the population is replaced
-    with fresh random chains, preventing premature convergence.
-  • All Phase-3 discoveries are merged into the global hit counter before
-    signature-based minimisation, so they benefit from the same deduplication
-    and sorting as STAGE 1 and STAGE 2 results.
-
-  Algorithm summary
-  ─────────────────
-  1. Initial population — 30 % depth-2 hot-rule combos (STAGE 1),
-     30 % seeded deeper chains (STAGE 1 hot + random, depth-3+ biased),
-     40 % unexplored Phase-S chains (NOT in known_rules, novel-first)
-     — ensures both exploitation and exploration with far better
-     starting coverage when seeds are active.
-  2. GPU-batch fitness evaluation — returns raw bloom hits; novelty
-     weighting (× 2 for chains not in known_rules) is applied in the
-     evolve loop so raw counts are always stored honestly.
-  3. Incremental signature registry (_sig_to_best) — after every GPU
-     eval, every hit chain is indexed by its functional signature
-     (compute_rule_signature / BUILTIN_PROBES).  The representative of
-     each equivalence class is added to known_rules so that functionally
-     equivalent variants receive no bonus in subsequent generations.
-  4. Tournament selection (k = 4) — low-pressure, maintains diversity.
-  5. One-point crossover (p = 0.80) — exchanges rule-token sub-sequences.
-  6. Adaptive mutation (_mutate_adaptive) — apply standard mutation;
-     if result is functionally covered by _sig_to_best, apply up to
-     2 extra escape mutations to break out of the equivalence class.
-  7. Signature-based offspring filter — offspring still covered after
-     adaptive mutation are replaced by fresh random chains, keeping the
-     population structurally diverse generation-over-generation.
-  8. Elitism — top <elite_frac> individuals survive unchanged each gen.
-  9. Stagnation guard — if best effective score does not improve for
-     5 generations, the bottom 30 % of the population is replaced with
-     fresh random chains (depth 3+ biased).
-  10. Terminates when <--genetic-generations> is reached or wall-clock
-      time budget (--target-hours reservation) is exhausted.
-
-  CLI flags
-  ─────────
-    --genetic                   Enable STAGE 3 (default: disabled)
-    --genetic-generations N     Max generations (default: 50)
-    --genetic-pop N             Population size (default: 200)
-    --genetic-elite F           Elite fraction, e.g. 0.15 (default: 0.15)
+Main changes:
+- No --token-strip-no-new-modes flag.
+- No extra indexes (purge, substr, omit, prefix, ascii, overwrite) are built.
+- Worker processes only call letter, digit, reverse, delete‑edge, duplicate,
+  and insert extraction functions.
+- Insert mode is kept (--max-depth >= 2).
 """
 
 import os
@@ -259,24 +63,19 @@ def dim(t):     return f"{C.DIM}{t}{C.END}"
 # --- LOGGING SYSTEM ---
 # ====================================================================
 def log_info(msg: str) -> None:
-    """Always printed — key milestones and final stats."""
     print(msg)
 
 def log_debug(msg: str) -> None:
-    """Only printed in --debug mode."""
     if VERBOSE:
         print(f"{dim('[dbg]')} {msg}")
 
 def log_warn(msg: str) -> None:
-    """Always printed — non-fatal warnings."""
     print(yellow(f"[WARN] {msg}"))
 
 def log_error(msg: str) -> None:
-    """Always printed — errors."""
     print(red(f"[ERROR] {msg}"))
 
 def log_section(title: str) -> None:
-    """Section header — only in --debug mode."""
     if VERBOSE:
         bar = '─' * 56
         print(f"\n{cyan(bar)}")
@@ -293,7 +92,7 @@ BANNER = f"""{green(bold('''
  ██╔══██╗██║   ██║██║     ██═══╝  ╚════██║   ██║
  ██║  ██║╚██████╔╝███████╗███████╗███████║   ██║
  ╚═╝  ╚═╝ ╚═════╝ ╚══════╝╚══════╝╚══════╝   ╚═╝'''))}{C.END}
-  {dim('GPU-Compatible Hashcat Rules Engine')}
+  {dim('GPU-Compatible Hashcat Rules Engine (core token‑strip)')}
   {dim('github.com/A113L/rulest')}
 """
 
@@ -307,7 +106,7 @@ MAX_WORD_LEN         = 256
 MAX_RULE_LEN         = 16
 MAX_OUTPUT_LEN       = 512
 MAX_CHAIN_STRING_LEN = 128
-MAX_HASHCAT_CHAIN    = 31          # hashcat's maximum rule chain length
+MAX_HASHCAT_CHAIN    = 31
 
 VRAM_USAGE_FACTOR    = 0.55
 BLOOM_HASH_FUNCTIONS = 4
@@ -337,26 +136,22 @@ FNV1A_SEED2        = 0xCAFEBABE
 
 MAX_GPU_RULES = 255
 
-# Sentinel used in signatures when a rule contains unsupported opcodes
 _UNSUPPORTED_SENTINEL = object()
 
-# ── Minimization constants ───────────────────────────────────────────────────
 MINIMIZE_DISK_THRESHOLD  = 500_000
 MINIMIZE_DISK_BATCH_SIZE =  10_000
 
-# ── Special-character seed constants ────────────────────────────────────────
 SPECIAL_CHARS_TOP  = ['!', '@', '#', '$', '%', '^', '&', '*',
                       '?', '.', '-', '_', '+', '(', ')']
 SPECIAL_CHARS_CORE = ['!', '@', '#', '$', '%', '*', '?']
 
-# ── Leet-substitution seed constants (Family J / M) ─────────────────────────
 LEET_SUBS: List[Tuple[str, str]] = [
     ('a', '@'), ('e', '3'), ('o', '0'), ('i', '1'), ('l', '1'),
     ('s', '5'), ('s', '$'), ('t', '7'), ('a', '4'), ('i', '!'),
 ]
 LEET_OPS: List[str] = [f's{orig}{rep}' for orig, rep in LEET_SUBS]
 
-# ── Token-Strip constants (STAGE 0) ──────────────────────────────────────────
+# ── Token-Strip constants ──────────────────────────────────────────
 TOKEN_STRIP_LEET_TABLE: List[Tuple[str, str, str]] = [
     ('@', 'a', 'sa@'), ('3', 'e', 'se3'), ('0', 'o', 'so0'),
     ('1', 'i', 'si1'), ('1', 'l', 'sl1'), ('5', 's', 'ss5'),
@@ -372,30 +167,21 @@ TOKEN_STRIP_ALPHA_BOUNDARY: Set[str] = (
     set(string.ascii_letters) | set('!@#$%^&*?.-_+()')
 )
 
-# ── STAGE 0 multiprocessing worker globals ───────────────────────────────────
+# ── STAGE 0 multiprocessing worker globals ─────────────────────────
 _p0_worker_base_set:       Set[str]                       = set()
 _p0_worker_base_by_len:    Dict[int, Set[str]]            = {}
-_p0_worker_base_lower_idx: Dict[str, Set[str]]            = {}
-_p0_worker_purge_idx:      Dict[str, Set[str]]            = {}
-_p0_worker_substr_idx:     Dict[str, Set[str]]            = {}
-_p0_worker_omit_idx:       Dict[str, Set[str]]            = {}
-_p0_worker_prefix_idx:     Dict[str, Set[str]]            = {}
-_p0_worker_ascii_idx:      Dict[str, Set[Tuple[str,str]]] = {}
-_p0_worker_overwrite_idx:  Dict[str, Set[str]]            = {}
 
 # ====================================================================
 # --- BUILT-IN PROBE SET ---
 # ====================================================================
 BUILTIN_PROBES: List[str] = [
-    "ab", "abc", "abcd",
-    "pass", "root", "test", "admin", "login",
+    "ab", "abc", "abcd", "pass", "root", "test", "admin", "login",
     "letmein", "welcome", "password", "sunshine", "football",
-    "baseball", "princess", "dragon12",
-    "qwertyuiop", "iloveyou12", "monkey12345", "superman123", "mustang2024",
+    "baseball", "princess", "dragon12", "qwertyuiop", "iloveyou12",
+    "monkey12345", "superman123", "mustang2024",
     "Password", "AdminUser", "MySecret", "HelloWorld",
     "pass123", "admin2024", "test1234", "user9999",
-    "p@ssw0rd", "s3cur1ty",
-    "master", "leet", "elite", "access",
+    "p@ssw0rd", "s3cur1ty", "master", "leet", "elite", "access",
     "aaaa", "bbbb",
 ]
 _seen = set(); _d = []
@@ -618,7 +404,6 @@ def _py_apply_single_rule(rule: str, word: str) -> Optional[str]:
     except Exception:
         return None
 
-
 def py_apply_chain(chain: str, word: str) -> Optional[str]:
     cur = word
     for r in chain.split():
@@ -630,7 +415,6 @@ def py_apply_chain(chain: str, word: str) -> Optional[str]:
 # ====================================================================
 # --- SIGNATURE-BASED FUNCTIONAL MINIMIZATION ---
 # ====================================================================
-
 def compute_rule_signature(rule: str, probe_words: List[str]) -> tuple:
     outputs = []
     for word in probe_words:
@@ -640,43 +424,24 @@ def compute_rule_signature(rule: str, probe_words: List[str]) -> tuple:
         outputs.append(out)
     return tuple(outputs)
 
-
-def minimize_by_signature(
-    rule_counter: Counter,
-    probe_words:  List[str],
-) -> Counter:
+def minimize_by_signature(rule_counter: Counter, probe_words: List[str]) -> Counter:
     if not rule_counter:
         return Counter()
-
     log_section("POST-PROCESSING — Signature-Based Functional Minimization")
     n = len(rule_counter)
     log_info(f"[MINIMIZE] Candidates  : {bold(str(n))}")
     log_info(f"[MINIMIZE] Probe words : {bold(str(len(probe_words)))}")
-
     if n > MINIMIZE_DISK_THRESHOLD:
-        log_info(
-            f"[MINIMIZE] {cyan(f'{n:,} rules exceeds threshold {MINIMIZE_DISK_THRESHOLD:,}')} "
-            f"— using {bold('disk-backed')} SQLite path to avoid OOM"
-        )
+        log_info(f"[MINIMIZE] {cyan(f'{n:,} rules exceeds threshold {MINIMIZE_DISK_THRESHOLD:,}')} — using {bold('disk-backed')} SQLite path")
         return _minimize_disk(rule_counter, probe_words)
     else:
         return _minimize_mem(rule_counter, probe_words)
 
-
-def _minimize_mem(
-    rule_counter: Counter,
-    probe_words:  List[str],
-) -> Counter:
+def _minimize_mem(rule_counter: Counter, probe_words: List[str]) -> Counter:
     sig_map: Dict[tuple, List[Tuple[str, int]]] = defaultdict(list)
     rule_items = list(rule_counter.items())
-
-    with tqdm(
-        total=len(rule_items),
-        desc=green("  Minimizing"),
-        unit="rule",
-        ncols=88,
-        bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}",
-    ) as pbar:
+    with tqdm(total=len(rule_items), desc=green("  Minimizing"), unit="rule", ncols=88,
+              bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}") as pbar:
         n_groups = 0
         for rule, gpu_count in rule_items:
             sig = compute_rule_signature(rule, probe_words)
@@ -684,137 +449,82 @@ def _minimize_mem(
             n_groups = len(sig_map)
             pbar.update(1)
             pbar.set_postfix({"unique_sigs": cyan(str(n_groups))}, refresh=False)
-
     def _group_key(item: Tuple[str, int]) -> tuple:
         rule, gpu_count = item
         return (-gpu_count, len(rule.split()), rule)
-
-    survivors    = Counter()
+    survivors = Counter()
     n_unsupported = 0
     for sig, group in sig_map.items():
         if sig == ('__UNSUPPORTED__',):
             n_unsupported = len(group)
         best_rule, best_count = min(group, key=_group_key)
         survivors[best_rule] = best_count
-
     _log_minimize_stats(len(rule_counter), survivors, len(sig_map), n_unsupported)
     return survivors
 
-
-def _minimize_disk(
-    rule_counter: Counter,
-    probe_words:  List[str],
-) -> Counter:
-    tmp_fd, tmp_path = tempfile.mkstemp(
-        suffix='.db', prefix='rulest_minimize_'
-    )
+def _minimize_disk(rule_counter: Counter, probe_words: List[str]) -> Counter:
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix='.db', prefix='rulest_minimize_')
     os.close(tmp_fd)
-
     try:
         conn = sqlite3.connect(tmp_path)
         conn.execute('PRAGMA journal_mode = WAL')
         conn.execute('PRAGMA synchronous  = OFF')
         conn.execute('PRAGMA temp_store   = MEMORY')
         conn.execute('PRAGMA cache_size   = -131072')
-
-        conn.execute('''
-            CREATE TABLE sig_best (
-                sig_hash  TEXT    PRIMARY KEY,
-                rule      TEXT    NOT NULL,
-                count     INTEGER NOT NULL,
-                depth     INTEGER NOT NULL
-            )
-        ''')
+        conn.execute('CREATE TABLE sig_best (sig_hash TEXT PRIMARY KEY, rule TEXT NOT NULL, count INTEGER NOT NULL, depth INTEGER NOT NULL)')
         conn.commit()
-
         _UPSERT = '''
             INSERT INTO sig_best (sig_hash, rule, count, depth)
             VALUES (?, ?, ?, ?)
             ON CONFLICT(sig_hash) DO UPDATE SET
                 rule  = CASE
-                    WHEN excluded.count > sig_best.count
-                        THEN excluded.rule
-                    WHEN excluded.count  = sig_best.count
-                     AND excluded.depth  < sig_best.depth
-                        THEN excluded.rule
-                    WHEN excluded.count  = sig_best.count
-                     AND excluded.depth  = sig_best.depth
-                     AND excluded.rule   < sig_best.rule
-                        THEN excluded.rule
+                    WHEN excluded.count > sig_best.count THEN excluded.rule
+                    WHEN excluded.count  = sig_best.count AND excluded.depth  < sig_best.depth THEN excluded.rule
+                    WHEN excluded.count  = sig_best.count AND excluded.depth  = sig_best.depth AND excluded.rule   < sig_best.rule THEN excluded.rule
                     ELSE sig_best.rule
                 END,
                 count = CASE
-                    WHEN excluded.count > sig_best.count
-                        THEN excluded.count
+                    WHEN excluded.count > sig_best.count THEN excluded.count
                     ELSE sig_best.count
                 END,
                 depth = CASE
-                    WHEN excluded.count > sig_best.count
-                        THEN excluded.depth
-                    WHEN excluded.count  = sig_best.count
-                     AND excluded.depth  < sig_best.depth
-                        THEN excluded.depth
+                    WHEN excluded.count > sig_best.count THEN excluded.depth
+                    WHEN excluded.count  = sig_best.count AND excluded.depth  < sig_best.depth THEN excluded.depth
                     ELSE sig_best.depth
                 END
         '''
-
-        rule_items  = list(rule_counter.items())
-        n_total     = len(rule_items)
+        rule_items = list(rule_counter.items())
+        n_total = len(rule_items)
         batch: List[Tuple[str, str, int, int]] = []
-        n_committed = 0
-
         log_info(f"[MINIMIZE] Temp DB     : {dim(tmp_path)}")
-
-        with tqdm(
-            total=n_total,
-            desc=green("  Minimizing"),
-            unit="rule",
-            ncols=88,
-            bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} "
-                       "[{elapsed}<{remaining}] {postfix}",
-        ) as pbar:
+        with tqdm(total=n_total, desc=green("  Minimizing"), unit="rule", ncols=88,
+                  bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}") as pbar:
             for rule, count in rule_items:
-                sig        = compute_rule_signature(rule, probe_words)
-                sig_str    = '\x00'.join(sig)
-                sig_hash   = hashlib.sha1(
-                    sig_str.encode('latin-1', errors='replace')
-                ).hexdigest()
-                depth      = len(rule.split())
+                sig = compute_rule_signature(rule, probe_words)
+                sig_str = '\x00'.join(sig)
+                sig_hash = hashlib.sha1(sig_str.encode('latin-1', errors='replace')).hexdigest()
+                depth = len(rule.split())
                 batch.append((sig_hash, rule, count, depth))
-
                 if len(batch) >= MINIMIZE_DISK_BATCH_SIZE:
                     conn.executemany(_UPSERT, batch)
                     conn.commit()
-                    n_committed += len(batch)
+                    n_committed = len(batch)
                     batch.clear()
-
-                    (n_sigs,) = conn.execute(
-                        'SELECT COUNT(*) FROM sig_best'
-                    ).fetchone()
-                    pbar.set_postfix(
-                        {"unique_sigs": cyan(str(n_sigs))}, refresh=False
-                    )
+                    (n_sigs,) = conn.execute('SELECT COUNT(*) FROM sig_best').fetchone()
+                    pbar.set_postfix({"unique_sigs": cyan(str(n_sigs))}, refresh=False)
                     pbar.update(MINIMIZE_DISK_BATCH_SIZE)
-
             if batch:
                 conn.executemany(_UPSERT, batch)
                 conn.commit()
                 pbar.update(len(batch))
-
-        survivors   = Counter()
-        (n_sigs,)   = conn.execute('SELECT COUNT(*) FROM sig_best').fetchone()
-        cursor      = conn.execute('SELECT rule, count FROM sig_best')
+        survivors = Counter()
+        (n_sigs,) = conn.execute('SELECT COUNT(*) FROM sig_best').fetchone()
+        cursor = conn.execute('SELECT rule, count FROM sig_best')
         for rule_str, cnt in cursor:
             survivors[rule_str] = cnt
-
         conn.close()
-
-        _unsup_hash = hashlib.sha1(
-            '__UNSUPPORTED__'.encode('latin-1')
-        ).hexdigest()
         _log_minimize_stats(n_total, survivors, n_sigs, n_unsupported=0)
         return survivors
-
     finally:
         try:
             os.unlink(tmp_path)
@@ -822,44 +532,28 @@ def _minimize_disk(
         except OSError:
             log_warn(f"[MINIMIZE] Could not delete temp DB: {tmp_path}")
 
-
-def _log_minimize_stats(
-    n_input:       int,
-    survivors:     Counter,
-    n_groups:      int,
-    n_unsupported: int,
-) -> None:
+def _log_minimize_stats(n_input: int, survivors: Counter, n_groups: int, n_unsupported: int) -> None:
     removed = n_input - len(survivors)
     log_info(f"[MINIMIZE] {green('Done')}")
     log_info(f"           Unique signatures : {bold(cyan(str(n_groups))):>12s}")
     log_info(f"           Rules kept        : {bold(green(str(len(survivors)))):>12s}")
-    log_info(f"           Rules removed     : {bold(red(str(removed))):>12s}  "
-             f"({removed / max(1, n_input):.1%})")
+    log_info(f"           Rules removed     : {bold(red(str(removed))):>12s}  ({removed / max(1, n_input):.1%})")
     if n_unsupported:
-        log_info(
-            f"           Unsupported (kept 1 each group) : "
-            f"{bold(str(n_unsupported))}"
-        )
-    log_debug(
-        f"minimize_by_signature complete: "
-        f"kept={len(survivors)}, removed={removed}, sig_groups={n_groups}"
-    )
+        log_info(f"           Unsupported (kept 1 each group) : {bold(str(n_unsupported))}")
 
 # ====================================================================
-# --- STAGE 0 — TOKEN-STRIP RULE EXTRACTION ---
+# --- STAGE 0 — TOKEN-STRIP RULE EXTRACTION (core + insert) ---
 # ====================================================================
-
 def _hashcat_title_case(s: str) -> str:
-    result    = list(s)
-    cap_next  = True
+    result = list(s)
+    cap_next = True
     for i, c in enumerate(result):
         if cap_next and 'a' <= c <= 'z':
             result[i] = c.upper()
-            cap_next   = False
+            cap_next = False
         if c in (' ', '-', '_'):
             cap_next = True
     return ''.join(result)
-
 
 def _infer_case_rules(cased_stem: str) -> List[List[str]]:
     stem_lower = cased_stem.lower()
@@ -868,13 +562,9 @@ def _infer_case_rules(cased_stem: str) -> List[List[str]]:
     candidates: List[List[str]] = []
     if cased_stem == stem_lower.upper():
         candidates.append(['u'])
-    if (len(cased_stem) >= 1
-            and cased_stem[0] == cased_stem[0].upper()
-            and cased_stem[1:] == cased_stem[1:].lower()):
+    if (len(cased_stem) >= 1 and cased_stem[0] == cased_stem[0].upper() and cased_stem[1:] == cased_stem[1:].lower()):
         candidates.append(['c'])
-    if (len(cased_stem) >= 1
-            and cased_stem[0] == cased_stem[0].lower()
-            and cased_stem[1:] == cased_stem[1:].upper()):
+    if (len(cased_stem) >= 1 and cased_stem[0] == cased_stem[0].lower() and cased_stem[1:] == cased_stem[1:].upper()):
         candidates.append(['C'])
     toggled = ''.join(c.lower() if c.isupper() else c.upper() for c in stem_lower)
     if cased_stem == toggled:
@@ -882,17 +572,12 @@ def _infer_case_rules(cased_stem: str) -> List[List[str]]:
     if cased_stem == _hashcat_title_case(stem_lower):
         candidates.append(['E'])
     if not candidates:
-        uppercase_positions = [i for i, c in enumerate(cased_stem)
-                               if c != stem_lower[i]]
+        uppercase_positions = [i for i, c in enumerate(cased_stem) if c != stem_lower[i]]
         if uppercase_positions and all(p <= 9 for p in uppercase_positions):
             candidates.append([f'T{p}' for p in uppercase_positions])
     return candidates
 
-
-def _leet_decode_variants(
-    middle: str,
-    max_ambiguous: int = 3,
-) -> Iterator[Tuple[str, frozenset]]:
+def _leet_decode_variants(middle: str, max_ambiguous: int = 3) -> Iterator[Tuple[str, frozenset]]:
     for ch in middle:
         if not ch.isalpha() and ch not in TOKEN_STRIP_LEET_CHARS:
             return
@@ -909,8 +594,8 @@ def _leet_decode_variants(
         return
     choices_per_pos = [opts for _, _, opts in leet_positions]
     for combo in itertools.product(*choices_per_pos):
-        decoded  = list(middle)
-        rules    = set()
+        decoded = list(middle)
+        rules = set()
         for (pos, _orig, _opts), (base_ch, rule_str) in zip(leet_positions, combo):
             decoded[pos] = base_ch
             rules.add(rule_str)
@@ -918,33 +603,23 @@ def _leet_decode_variants(
         if all(ch.isalpha() for ch in decoded_str):
             yield (decoded_str, frozenset(rules))
 
-
-def _decode_middle(
-    middle: str,
-    max_ambiguous: int = 3,
-) -> Iterator[Tuple[str, frozenset, List[List[str]]]]:
+def _decode_middle(middle: str, max_ambiguous: int = 3) -> Iterator[Tuple[str, frozenset, List[List[str]]]]:
     for leet_decoded, leet_rules in _leet_decode_variants(middle, max_ambiguous):
-        cased_stem      = leet_decoded
-        stem            = cased_stem.lower()
+        cased_stem = leet_decoded
+        stem = cased_stem.lower()
         case_candidates = _infer_case_rules(cased_stem)
         if not case_candidates:
             case_candidates = [[]]
         yield (stem, leet_rules, case_candidates)
 
-
-def _rule_chain_orderings(
-    case_ops:    List[str],
-    leet_ops:    List[str],
-    prepend_ops: List[str],
-    append_ops:  List[str],
-    leading_ops: Optional[List[str]] = None,
-) -> List[List[str]]:
+def _rule_chain_orderings(case_ops: List[str], leet_ops: List[str], prepend_ops: List[str],
+                          append_ops: List[str], leading_ops: Optional[List[str]] = None) -> List[List[str]]:
     lead = leading_ops or []
     seen: Set[tuple] = set()
     result: List[List[str]] = []
     def _add(ops: List[str]) -> None:
         full = lead + ops
-        key  = tuple(full)
+        key = tuple(full)
         if key not in seen:
             seen.add(key)
             result.append(full)
@@ -955,15 +630,9 @@ def _rule_chain_orderings(
         _add(prepend_ops + case_ops + leet_ops + append_ops)
     return result
 
-
-def _boundary_scan(
-    word:           str,
-    boundary_chars: Set[str],
-    max_prefix_len: int,
-    max_suffix_len: int,
-    min_stem_len:   int,
-) -> List[Tuple[str, str, str]]:
-    wlen    = len(word)
+def _boundary_scan(word: str, boundary_chars: Set[str], max_prefix_len: int,
+                   max_suffix_len: int, min_stem_len: int) -> List[Tuple[str, str, str]]:
+    wlen = len(word)
     triples: List[Tuple[str, str, str]] = []
     for p in range(0, min(max_prefix_len + 1, wlen + 1)):
         if p > 0 and word[p - 1] not in boundary_chars:
@@ -981,22 +650,14 @@ def _boundary_scan(
                 triples.append((word[:p], mid, suf))
     return triples
 
-
-def _chains_from_middle(
-    middle:          str,
-    prefix:          str,
-    suffix:          str,
-    base_set:        Set[str],
-    max_depth:       int,
-    min_stem_len:    int,
-    max_leet_amb:    int,
-    leading_ops:     Optional[List[str]] = None,
-) -> Set[str]:
+def _chains_from_middle(middle: str, prefix: str, suffix: str, base_set: Set[str],
+                        max_depth: int, min_stem_len: int, max_leet_amb: int,
+                        leading_ops: Optional[List[str]] = None) -> Set[str]:
     target_word = prefix + middle + suffix
-    lead      = leading_ops or []
+    lead = leading_ops or []
     lead_depth = len(lead)
     prepend_ops: List[str] = [f'^{c}' for c in reversed(prefix)]
-    append_ops:  List[str] = [f'${c}' for c in suffix]
+    append_ops: List[str] = [f'${c}' for c in suffix]
     boundary_depth = len(prepend_ops) + len(append_ops)
     found: Set[str] = set()
     for stem, leet_rules, case_candidates in _decode_middle(middle, max_leet_amb):
@@ -1008,10 +669,7 @@ def _chains_from_middle(
             total = lead_depth + transform_depth + boundary_depth
             if total > max_depth:
                 continue
-            for ops in _rule_chain_orderings(
-                case_ops, leet_ops, prepend_ops, append_ops,
-                leading_ops=lead,
-            ):
+            for ops in _rule_chain_orderings(case_ops, leet_ops, prepend_ops, append_ops, leading_ops=lead):
                 if not ops or len(ops) > max_depth:
                     continue
                 chain = ' '.join(ops)
@@ -1021,45 +679,26 @@ def _chains_from_middle(
                     found.add(chain)
     return found
 
-
-def _extract_letter_mode(
-    word:           str,
-    base_set:       Set[str],
-    max_depth:      int,
-    min_stem_len:   int,
-    max_prefix_len: int,
-    max_suffix_len: int,
-    max_leet_amb:   int,
-) -> Set[str]:
+def _extract_letter_mode(word: str, base_set: Set[str], max_depth: int, min_stem_len: int,
+                         max_prefix_len: int, max_suffix_len: int, max_leet_amb: int) -> Set[str]:
     found: Set[str] = set()
-    for prefix, middle, suffix in _boundary_scan(
-        word, TOKEN_STRIP_BOUNDARY, max_prefix_len, max_suffix_len, min_stem_len
-    ):
-        found |= _chains_from_middle(
-            middle, prefix, suffix, base_set,
-            max_depth, min_stem_len, max_leet_amb,
-        )
+    for prefix, middle, suffix in _boundary_scan(word, TOKEN_STRIP_BOUNDARY, max_prefix_len,
+                                                  max_suffix_len, min_stem_len):
+        found |= _chains_from_middle(middle, prefix, suffix, base_set, max_depth,
+                                     min_stem_len, max_leet_amb)
     return found
 
-
-def _extract_digit_mode(
-    word:           str,
-    base_set:       Set[str],
-    max_depth:      int,
-    min_stem_len:   int,
-    max_prefix_len: int,
-    max_suffix_len: int,
-) -> Set[str]:
+def _extract_digit_mode(word: str, base_set: Set[str], max_depth: int, min_stem_len: int,
+                        max_prefix_len: int, max_suffix_len: int) -> Set[str]:
     found: Set[str] = set()
-    for prefix, middle, suffix in _boundary_scan(
-        word, TOKEN_STRIP_ALPHA_BOUNDARY, max_prefix_len, max_suffix_len, min_stem_len
-    ):
+    for prefix, middle, suffix in _boundary_scan(word, TOKEN_STRIP_ALPHA_BOUNDARY,
+                                                  max_prefix_len, max_suffix_len, min_stem_len):
         if not middle.isdigit():
             continue
         if middle not in base_set:
             continue
-        prepend_ops: List[str] = [f'^{c}' for c in reversed(prefix)]
-        append_ops:  List[str] = [f'${c}' for c in suffix]
+        prepend_ops = [f'^{c}' for c in reversed(prefix)]
+        append_ops = [f'${c}' for c in suffix]
         total = len(prepend_ops) + len(append_ops)
         if total == 0 or total > max_depth:
             continue
@@ -1069,46 +708,26 @@ def _extract_digit_mode(
                 found.add(chain)
     return found
 
-
-def _extract_reverse_mode(
-    word:           str,
-    base_set:       Set[str],
-    max_depth:      int,
-    min_stem_len:   int,
-    max_prefix_len: int,
-    max_suffix_len: int,
-    max_leet_amb:   int,
-) -> Set[str]:
+def _extract_reverse_mode(word: str, base_set: Set[str], max_depth: int, min_stem_len: int,
+                          max_prefix_len: int, max_suffix_len: int, max_leet_amb: int) -> Set[str]:
     found: Set[str] = set()
     if max_depth < 1:
         return found
-    for prefix, middle, suffix in _boundary_scan(
-        word, TOKEN_STRIP_BOUNDARY, max_prefix_len, max_suffix_len, min_stem_len
-    ):
+    for prefix, middle, suffix in _boundary_scan(word, TOKEN_STRIP_BOUNDARY, max_prefix_len,
+                                                  max_suffix_len, min_stem_len):
         rev_middle = middle[::-1]
-        found |= _chains_from_middle(
-            rev_middle, prefix, suffix, base_set,
-            max_depth, min_stem_len, max_leet_amb,
-            leading_ops=['r'],
-        )
+        found |= _chains_from_middle(rev_middle, prefix, suffix, base_set, max_depth,
+                                     min_stem_len, max_leet_amb, leading_ops=['r'])
     return found
 
-
-def _extract_duplicate_mode(
-    word:         str,
-    base_set:     Set[str],
-    max_depth:    int,
-    min_stem_len: int,
-) -> Set[str]:
-    found:  Set[str] = set()
-    wlen   = len(word)
-    for op, builder in (
-        ('d', lambda s: s + s),
-        ('f', lambda s: s + s[::-1]),
-    ):
+def _extract_duplicate_mode(word: str, base_set: Set[str], max_depth: int,
+                            min_stem_len: int) -> Set[str]:
+    found: Set[str] = set()
+    wlen = len(word)
+    for op, builder in (('d', lambda s: s + s), ('f', lambda s: s + s[::-1])):
         for half in range(min_stem_len, wlen // 2 + 1):
             stem_cand = word[:half]
-            expected  = builder(stem_cand)
+            expected = builder(stem_cand)
             if expected == word and stem_cand in base_set:
                 chain = op
                 if HashcatRuleValidator.validate_rule_for_gpu(chain):
@@ -1116,44 +735,20 @@ def _extract_duplicate_mode(
                         found.add(chain)
     return found
 
-
-def _extract_delete_edge_mode(
-    word:           str,
-    base_set:       Set[str],
-    max_depth:      int,
-    min_stem_len:   int,
-    max_prefix_len: int,
-    max_suffix_len: int,
-    max_leet_amb:   int,
-) -> Set[str]:
+def _extract_delete_edge_mode(word: str, base_set: Set[str], max_depth: int, min_stem_len: int,
+                              max_prefix_len: int, max_suffix_len: int, max_leet_amb: int) -> Set[str]:
     found: Set[str] = set()
     if max_depth < 1 or len(word) < min_stem_len + 1:
         return found
     for op, trimmed in (('[', word[1:]), (']', word[:-1])):
-        for prefix, middle, suffix in _boundary_scan(
-            trimmed, TOKEN_STRIP_BOUNDARY,
-            max_prefix_len, max_suffix_len, min_stem_len
-        ):
-            found |= _chains_from_middle(
-                middle, prefix, suffix, base_set,
-                max_depth, min_stem_len, max_leet_amb,
-                leading_ops=[op],
-            )
+        for prefix, middle, suffix in _boundary_scan(trimmed, TOKEN_STRIP_BOUNDARY,
+                                                      max_prefix_len, max_suffix_len, min_stem_len):
+            found |= _chains_from_middle(middle, prefix, suffix, base_set, max_depth,
+                                         min_stem_len, max_leet_amb, leading_ops=[op])
     return found
 
-
-# ====================================================================
-# --- STAGE 0 NEW EXTRACTION MODES (v1.1 — ported from stripper.py) ---
-# ====================================================================
-
-def _extract_insert_mode(
-    word:        str,
-    base_set:    Set[str],
-    max_depth:   int,
-    min_stem_len: int,
-    max_leet_amb: int,
-    base_by_len: Dict[int, Set[str]],
-) -> Set[str]:
+def _extract_insert_mode(word: str, base_set: Set[str], max_depth: int, min_stem_len: int,
+                         max_leet_amb: int, base_by_len: Dict[int, Set[str]]) -> Set[str]:
     found: Set[str] = set()
     if max_depth < 2:
         return found
@@ -1179,417 +774,49 @@ def _extract_insert_mode(
                             found.add(chain)
     return found
 
-
-def _extract_swap_mode(
-    word:        str,
-    base_set:    Set[str],
-    max_depth:   int,
-    min_stem_len: int,
-    max_leet_amb: int,
-) -> Set[str]:
-    found: Set[str] = set()
-    if max_depth < 1:
-        return found
-    wlen = len(word)
-    if wlen < 2:
-        return found
-    k_sw = word[1] + word[0] + word[2:]
-    if len(k_sw) >= min_stem_len and k_sw in base_set:
-        rule = 'k'
-        if HashcatRuleValidator.validate_rule_for_gpu(rule):
-            if py_apply_chain(rule, k_sw) == word:
-                found.add(rule)
-    K_sw = word[:-2] + word[-1] + word[-2]
-    if len(K_sw) >= min_stem_len and K_sw in base_set:
-        rule = 'K'
-        if HashcatRuleValidator.validate_rule_for_gpu(rule):
-            if py_apply_chain(rule, K_sw) == word:
-                found.add(rule)
-    max_pos = min(wlen - 1, 9)
-    for m in range(max_pos + 1):
-        for n in range(m + 1, max_pos + 1):
-            swapped = list(word); swapped[m], swapped[n] = swapped[n], swapped[m]
-            sw_str = ''.join(swapped)
-            if len(sw_str) >= min_stem_len and sw_str in base_set:
-                rule = f"*{m}{n}"
-                if HashcatRuleValidator.validate_rule_for_gpu(rule):
-                    if py_apply_chain(rule, sw_str) == word:
-                        found.add(rule)
-    return found
-
-
-def _extract_range_mode(
-    word:       str,
-    base_set:   Set[str],
-    max_depth:  int,
-    min_stem_len: int,
-    max_leet_amb: int,
-    substr_idx: Dict[str, Set[str]],
-    omit_idx:   Dict[str, Set[str]],
-) -> Set[str]:
-    found: Set[str] = set()
-    if max_depth < 1:
-        return found
-    wlen = len(word)
-    for stem in substr_idx.get(word, set()):
-        if len(stem) < min_stem_len:
-            continue
-        slen = len(stem)
-        for start in range(min(slen - wlen + 1, 10)):
-            end = start + wlen - 1
-            if end > 9:
-                break
-            if stem[start:end + 1] == word:
-                rule = f"x{start}{end}"
-                if HashcatRuleValidator.validate_rule_for_gpu(rule):
-                    if py_apply_chain(rule, stem) == word:
-                        found.add(rule)
-    for stem in omit_idx.get(word, set()):
-        if len(stem) < min_stem_len or len(stem) <= wlen:
-            continue
-        slen   = len(stem)
-        omit_n = slen - wlen
-        for start in range(min(slen - omit_n + 1, 10)):
-            if omit_n > 9 or start + omit_n > 10:
-                continue
-            if stem[:start] + stem[start + omit_n:] == word:
-                rule = f"O{start}{omit_n}"
-                if HashcatRuleValidator.validate_rule_for_gpu(rule):
-                    if py_apply_chain(rule, stem) == word:
-                        found.add(rule)
-    return found
-
-
-def _extract_char_duplicate_mode(
-    word:        str,
-    base_set:    Set[str],
-    max_depth:   int,
-    min_stem_len: int,
-) -> Set[str]:
-    found: Set[str] = set()
-    if max_depth < 1:
-        return found
-    wlen = len(word)
-    if wlen < 2:
-        return found
-    if wlen % 2 == 0:
-        q_cand = word[::2]
-        if len(q_cand) >= min_stem_len and q_cand in base_set:
-            if all(word[i] == word[i + 1] for i in range(0, wlen, 2)):
-                rule = 'q'
-                if HashcatRuleValidator.validate_rule_for_gpu(rule):
-                    if py_apply_chain(rule, q_cand) == word:
-                        found.add(rule)
-    for n in range(1, min(10, wlen)):
-        if wlen <= n:
-            continue
-        candidate = word[n:]
-        if len(candidate) >= min_stem_len and candidate in base_set:
-            if word[:n] == word[0] * n and candidate[0] == word[0]:
-                rule = f"z{n}"
-                if HashcatRuleValidator.validate_rule_for_gpu(rule):
-                    if py_apply_chain(rule, candidate) == word:
-                        found.add(rule)
-    for n in range(1, min(10, wlen)):
-        if wlen <= n:
-            continue
-        candidate = word[:-n]
-        if len(candidate) >= min_stem_len and candidate in base_set:
-            if word[-n:] == word[-1] * n and candidate[-1] == word[-1]:
-                rule = f"Z{n}"
-                if HashcatRuleValidator.validate_rule_for_gpu(rule):
-                    if py_apply_chain(rule, candidate) == word:
-                        found.add(rule)
-    return found
-
-
-def _extract_ascii_transform_mode(
-    word:        str,
-    base_set:    Set[str],
-    max_depth:   int,
-    min_stem_len: int,
-    max_leet_amb: int,
-    base_by_len: Dict[int, Set[str]],
-    ascii_idx:   Dict[str, Set[Tuple[str, str]]],
-) -> Set[str]:
-    found: Set[str] = set()
-    if max_depth < 1:
-        return found
-    for stem, rule in ascii_idx.get(word, set()):
-        if len(stem) < min_stem_len:
-            continue
-        if len(rule.split()) > max_depth:
-            continue
-        if HashcatRuleValidator.validate_rule_for_gpu(rule):
-            if py_apply_chain(rule, stem) == word:
-                found.add(rule)
-    return found
-
-
-def _extract_truncate_mode(
-    word:        str,
-    base_set:    Set[str],
-    max_depth:   int,
-    min_stem_len: int,
-    max_leet_amb: int,
-    prefix_idx:  Dict[str, Set[str]],
-) -> Set[str]:
-    found: Set[str] = set()
-    if max_depth < 1:
-        return found
-    wlen = len(word)
-    if wlen < min_stem_len or wlen - 1 > 9:
-        return found
-    rule = f"'{wlen - 1}"
-    if not HashcatRuleValidator.validate_rule_for_gpu(rule):
-        return found
-    for stem in prefix_idx.get(word, set()):
-        if len(stem) < min_stem_len or len(stem) <= wlen:
-            continue
-        if py_apply_chain(rule, stem) == word:
-            found.add(rule)
-    return found
-
-
-def _extract_purge_mode(
-    word:        str,
-    base_set:    Set[str],
-    max_depth:   int,
-    min_stem_len: int,
-    max_leet_amb: int,
-    purge_idx:   Dict[str, Set[str]],
-) -> Set[str]:
-    found: Set[str] = set()
-    if max_depth < 1:
-        return found
-    wlen      = len(word)
-    word_chars = set(word)
-    for stem in purge_idx.get(word, set()):
-        if len(stem) < min_stem_len or len(stem) <= wlen:
-            continue
-        for char in set(stem) - word_chars:
-            if stem.replace(char, '') == word:
-                rule = f"@{char}"
-                if HashcatRuleValidator.validate_rule_for_gpu(rule):
-                    if py_apply_chain(rule, stem) == word:
-                        found.add(rule)
-    return found
-
-
-def _extract_repeat_mode(
-    word:        str,
-    base_set:    Set[str],
-    max_depth:   int,
-    min_stem_len: int,
-) -> Set[str]:
-    found: Set[str] = set()
-    if max_depth < 1:
-        return found
-    wlen = len(word)
-    if wlen < 2 * min_stem_len:
-        return found
-    for n in range(2, min(10, wlen // min_stem_len + 1)):
-        if wlen % n != 0:
-            continue
-        part_len = wlen // n
-        if part_len < min_stem_len:
-            continue
-        parts = [word[i * part_len:(i + 1) * part_len] for i in range(n)]
-        if len(set(parts)) == 1 and parts[0] in base_set:
-            rule = f"p{n - 1}"
-            if HashcatRuleValidator.validate_rule_for_gpu(rule):
-                if py_apply_chain(rule, parts[0]) == word:
-                    found.add(rule)
-    return found
-
-
-def _extract_separator_title_mode(
-    word:           str,
-    base_set:       Set[str],
-    max_depth:      int,
-    min_stem_len:   int,
-    max_leet_amb:   int,
-    base_lower_idx: Dict[str, Set[str]],
-) -> Set[str]:
-    found: Set[str] = set()
-    if max_depth < 1:
-        return found
-    separators = ['-', '_', ' ', '.']
-    lower_word  = word.lower()
-    for sep in separators:
-        if sep not in word:
-            continue
-        stem_candidates = base_lower_idx.get(lower_word, set())
-        for stem in stem_candidates:
-            if len(stem) < min_stem_len:
-                continue
-            expected = []; cap_next = True
-            for c in stem:
-                if cap_next and 'a' <= c <= 'z':
-                    expected.append(c.upper()); cap_next = False
-                else:
-                    expected.append(c)
-                if c == sep:
-                    cap_next = True
-            if ''.join(expected) == word:
-                rule = f"e{sep}"
-                if HashcatRuleValidator.validate_rule_for_gpu(rule):
-                    if py_apply_chain(rule, stem) == word:
-                        found.add(rule)
-    return found
-
-
-def _extract_overwrite_mode(
-    word:        str,
-    base_set:    Set[str],
-    max_depth:   int,
-    min_stem_len: int,
-    overwrite_idx: Dict[str, Set[str]],
-) -> Set[str]:
-    """OVERWRITE MODE — detect oNX (overwrite char at position N with X) rules."""
-    found: Set[str] = set()
-    if max_depth < 1:
-        return found
-    wlen = len(word)
-    if wlen < min_stem_len:
-        return found
-    for pos in range(min(wlen, 10)):
-        key = word[:pos] + '\x00' + word[pos+1:]
-        stems = overwrite_idx.get(key)
-        if not stems:
-            continue
-        char = word[pos]
-        for stem in stems:
-            if len(stem) < min_stem_len or stem[pos] == char:
-                continue
-            rule = f"o{pos}{char}"
-            if HashcatRuleValidator.validate_rule_for_gpu(rule):
-                if py_apply_chain(rule, stem) == word:
-                    found.add(rule)
-    return found
-
-
 # ──────────────────────────────────────────────────────────────────────────────
-# STAGE 0 multiprocessing infrastructure
+# STAGE 0 multiprocessing infrastructure (core only)
 # ──────────────────────────────────────────────────────────────────────────────
-
-def _worker_init_p0(
-    base_set=None, base_by_len=None, base_lower_idx=None,
-    purge_idx=None, substr_idx=None, omit_idx=None,
-    prefix_idx=None, ascii_idx=None, overwrite_idx=None,
-) -> None:
-    global _p0_worker_base_set, _p0_worker_base_by_len, _p0_worker_base_lower_idx
-    global _p0_worker_purge_idx, _p0_worker_substr_idx, _p0_worker_omit_idx
-    global _p0_worker_prefix_idx, _p0_worker_ascii_idx, _p0_worker_overwrite_idx
-    if base_set       is not None: _p0_worker_base_set       = base_set
-    if base_by_len    is not None: _p0_worker_base_by_len    = base_by_len
-    if base_lower_idx is not None: _p0_worker_base_lower_idx = base_lower_idx
-    if purge_idx      is not None: _p0_worker_purge_idx      = purge_idx
-    if substr_idx     is not None: _p0_worker_substr_idx     = substr_idx
-    if omit_idx       is not None: _p0_worker_omit_idx       = omit_idx
-    if prefix_idx     is not None: _p0_worker_prefix_idx     = prefix_idx
-    if ascii_idx      is not None: _p0_worker_ascii_idx      = ascii_idx
-    if overwrite_idx  is not None: _p0_worker_overwrite_idx  = overwrite_idx
-
+def _worker_init_p0(base_set=None, base_by_len=None) -> None:
+    global _p0_worker_base_set, _p0_worker_base_by_len
+    if base_set is not None: _p0_worker_base_set = base_set
+    if base_by_len is not None: _p0_worker_base_by_len = base_by_len
 
 def _process_chunk_p0(args: Tuple) -> Set[str]:
     (words_chunk, max_depth, min_stem_len, max_leet_amb,
-     max_prefix_len, max_suffix_len, enable_new_modes) = args
-
-    base_set       = _p0_worker_base_set
-    base_by_len    = _p0_worker_base_by_len
-    base_lower_idx = _p0_worker_base_lower_idx
-    purge_idx      = _p0_worker_purge_idx
-    substr_idx     = _p0_worker_substr_idx
-    omit_idx       = _p0_worker_omit_idx
-    prefix_idx     = _p0_worker_prefix_idx
-    ascii_idx      = _p0_worker_ascii_idx
-    overwrite_idx  = _p0_worker_overwrite_idx
+     max_prefix_len, max_suffix_len) = args
+    base_set = _p0_worker_base_set
+    base_by_len = _p0_worker_base_by_len
     found: Set[str] = set()
-
     for word in words_chunk:
         if not word or len(word) > MAX_WORD_LEN:
             continue
-        n_digits  = sum(1 for c in word if c.isdigit())
-        n_alpha   = sum(1 for c in word if c.isalpha())
+        n_digits = sum(1 for c in word if c.isdigit())
+        n_alpha = sum(1 for c in word if c.isalpha())
         digit_primary = n_digits > n_alpha
-
         if digit_primary:
-            found |= _extract_digit_mode(
-                word, base_set, max_depth, min_stem_len,
-                max_prefix_len, max_suffix_len,
-            )
+            found |= _extract_digit_mode(word, base_set, max_depth, min_stem_len,
+                                         max_prefix_len, max_suffix_len)
             if n_alpha >= min_stem_len:
-                found |= _extract_letter_mode(
-                    word, base_set, max_depth, min_stem_len,
-                    max_prefix_len, max_suffix_len, max_leet_amb,
-                )
+                found |= _extract_letter_mode(word, base_set, max_depth, min_stem_len,
+                                              max_prefix_len, max_suffix_len, max_leet_amb)
         else:
-            found |= _extract_letter_mode(
-                word, base_set, max_depth, min_stem_len,
-                max_prefix_len, max_suffix_len, max_leet_amb,
-            )
+            found |= _extract_letter_mode(word, base_set, max_depth, min_stem_len,
+                                          max_prefix_len, max_suffix_len, max_leet_amb)
             if n_digits > 0:
-                found |= _extract_digit_mode(
-                    word, base_set, max_depth, min_stem_len,
-                    max_prefix_len, max_suffix_len,
-                )
+                found |= _extract_digit_mode(word, base_set, max_depth, min_stem_len,
+                                             max_prefix_len, max_suffix_len)
         if max_depth >= 2:
-            found |= _extract_reverse_mode(
-                word, base_set, max_depth, min_stem_len,
-                max_prefix_len, max_suffix_len, max_leet_amb,
-            )
-            found |= _extract_delete_edge_mode(
-                word, base_set, max_depth, min_stem_len,
-                max_prefix_len, max_suffix_len, max_leet_amb,
-            )
+            found |= _extract_reverse_mode(word, base_set, max_depth, min_stem_len,
+                                           max_prefix_len, max_suffix_len, max_leet_amb)
+            found |= _extract_delete_edge_mode(word, base_set, max_depth, min_stem_len,
+                                               max_prefix_len, max_suffix_len, max_leet_amb)
         if len(word) >= 2 * min_stem_len:
-            found |= _extract_duplicate_mode(
-                word, base_set, max_depth, min_stem_len,
-            )
-
-        if enable_new_modes:
-            if max_depth >= 2:
-                found |= _extract_insert_mode(
-                    word, base_set, max_depth, min_stem_len, max_leet_amb,
-                    base_by_len,
-                )
-            if max_depth >= 1:
-                found |= _extract_swap_mode(
-                    word, base_set, max_depth, min_stem_len, max_leet_amb,
-                )
-                found |= _extract_range_mode(
-                    word, base_set, max_depth, min_stem_len, max_leet_amb,
-                    substr_idx, omit_idx,
-                )
-                found |= _extract_char_duplicate_mode(
-                    word, base_set, max_depth, min_stem_len,
-                )
-                found |= _extract_ascii_transform_mode(
-                    word, base_set, max_depth, min_stem_len, max_leet_amb,
-                    base_by_len, ascii_idx,
-                )
-                found |= _extract_truncate_mode(
-                    word, base_set, max_depth, min_stem_len, max_leet_amb,
-                    prefix_idx,
-                )
-                found |= _extract_purge_mode(
-                    word, base_set, max_depth, min_stem_len, max_leet_amb,
-                    purge_idx,
-                )
-                if len(word) >= 2 * min_stem_len:
-                    found |= _extract_repeat_mode(
-                        word, base_set, max_depth, min_stem_len,
-                    )
-                found |= _extract_separator_title_mode(
-                    word, base_set, max_depth, min_stem_len, max_leet_amb,
-                    base_lower_idx,
-                )
-                found |= _extract_overwrite_mode(
-                    word, base_set, max_depth, min_stem_len, overwrite_idx,
-                )
+            found |= _extract_duplicate_mode(word, base_set, max_depth, min_stem_len)
+        if max_depth >= 2:
+            found |= _extract_insert_mode(word, base_set, max_depth, min_stem_len,
+                                          max_leet_amb, base_by_len)
     return found
-
 
 def _generate_toggle_chain_seeds(max_depth: int) -> List[str]:
     LEET_OPS = ['sa@', 'se3', 'so0', 'si1', 'sl1', 'ss5', 'ss$', 'st7', 'sa4', 'si!']
@@ -1633,168 +860,55 @@ def _generate_toggle_chain_seeds(max_depth: int) -> List[str]:
         _add([leet, 'T0'])
     return sorted(seeds)
 
-
-def extract_token_strip_rules(
-    target_words:       List[str],
-    base_set:           Set[str],
-    max_depth:          int  = 0,
-    min_stem_len:       int  = 4,
-    max_prefix_len:     int  = 4,
-    max_suffix_len:     int  = 4,
-    max_leet_ambiguity: int  = 3,
-    workers:            int  = 0,
-    chunk_size:         int  = 0,
-    enable_new_modes:   bool = True,
-) -> List[str]:
+def extract_token_strip_rules(target_words: List[str], base_set: Set[str],
+                              max_depth: int = 0, min_stem_len: int = 4,
+                              max_prefix_len: int = 4, max_suffix_len: int = 4,
+                              max_leet_ambiguity: int = 3, workers: int = 0,
+                              chunk_size: int = 0) -> List[str]:
     if max_depth <= 0:
         max_depth = MAX_HASHCAT_CHAIN
-
     n_workers = workers or mp.cpu_count()
-    n_words   = len(target_words)
+    n_words = len(target_words)
     if chunk_size <= 0:
         chunk_size = max(500, n_words // (n_workers * 4) + 1)
-
-    log_debug("[S0]    Building lookup indexes …")
-    base_by_len:    Dict[int, Set[str]]            = defaultdict(set)
-    base_lower_idx: Dict[str, Set[str]]            = defaultdict(set)
-    purge_idx:      Dict[str, Set[str]]            = defaultdict(set)
-    substr_idx:     Dict[str, Set[str]]            = defaultdict(set)
-    omit_idx:       Dict[str, Set[str]]            = defaultdict(set)
-    prefix_idx:     Dict[str, Set[str]]            = defaultdict(set)
-    ascii_idx:      Dict[str, Set[Tuple[str, str]]] = defaultdict(set)
-    overwrite_idx:  Dict[str, Set[str]]            = defaultdict(set)
-
+    base_by_len: Dict[int, Set[str]] = defaultdict(set)
     for w in base_set:
-        wlen = len(w)
-        base_by_len[wlen].add(w)
-        base_lower_idx[w.lower()].add(w)
-        for c in set(w):
-            purge_idx[w.replace(c, '')].add(w)
-        for start in range(min(wlen, 10)):
-            for end in range(start + 1, min(wlen + 1, 11)):
-                substr_idx[w[start:end]].add(w)
-            for omit_n in range(1, min(10, wlen - start) + 1):
-                if start + omit_n > 10:
-                    break
-                result = w[:start] + w[start + omit_n:]
-                if result:
-                    omit_idx[result].add(w)
-            if start < wlen - 1:
-                prefix_idx[w[:start + 1]].add(w)
-        for pos in range(min(wlen, 10)):
-            sc = ord(w[pos])
-            for delta, rchar in ((1, '+'), (-1, '-')):
-                t = w[:pos] + chr((sc + delta) & 0xFF) + w[pos + 1:]
-                ascii_idx[t].add((w, f"{rchar}{pos}"))
-            for shifted, rchar in (
-                (chr((sc << 1) & 0xFF), 'L'),
-                (chr((sc >> 1) & 0xFF), 'R'),
-            ):
-                ascii_idx[w[:pos] + shifted + w[pos + 1:]].add((w, f"{rchar}{pos}"))
-        for delta, rchar in ((1, '+'), (-1, '-')):
-            full_t = ''.join(chr((ord(c) + delta) & 0xFF) for c in w)
-            if full_t != w:
-                chain_str = ' '.join(f"{rchar}{p}" for p in range(min(wlen, 10)))
-                ascii_idx[full_t].add((w, chain_str))
-        if enable_new_modes:
-            for pos in range(min(wlen, 10)):
-                overwrite_idx[w[:pos] + '\x00' + w[pos+1:]].add(w)
+        base_by_len[len(w)].add(w)
+    base_by_len = dict(base_by_len)
 
-    base_by_len    = dict(base_by_len)
-    base_lower_idx = dict(base_lower_idx)
-    purge_idx      = dict(purge_idx)
-    substr_idx     = dict(substr_idx)
-    omit_idx       = dict(omit_idx)
-    prefix_idx     = dict(prefix_idx)
-    ascii_idx      = dict(ascii_idx)
-    overwrite_idx  = dict(overwrite_idx)
-    log_debug(f"[S0]    Indexes built  purge:{len(purge_idx)}  "
-              f"substr:{len(substr_idx)}  omit:{len(omit_idx)}  "
-              f"prefix:{len(prefix_idx)}  ascii:{len(ascii_idx)}  "
-              f"overwrite:{len(overwrite_idx)}")
+    global _p0_worker_base_set, _p0_worker_base_by_len
+    _p0_worker_base_set = base_set
+    _p0_worker_base_by_len = base_by_len
 
-    global _p0_worker_base_set, _p0_worker_base_by_len, _p0_worker_base_lower_idx
-    global _p0_worker_purge_idx, _p0_worker_substr_idx, _p0_worker_omit_idx
-    global _p0_worker_prefix_idx, _p0_worker_ascii_idx, _p0_worker_overwrite_idx
-    _p0_worker_base_set       = base_set
-    _p0_worker_base_by_len    = base_by_len
-    _p0_worker_base_lower_idx = base_lower_idx
-    _p0_worker_purge_idx      = purge_idx
-    _p0_worker_substr_idx     = substr_idx
-    _p0_worker_omit_idx       = omit_idx
-    _p0_worker_prefix_idx     = prefix_idx
-    _p0_worker_ascii_idx      = ascii_idx
-    _p0_worker_overwrite_idx  = overwrite_idx
+    chunks = [target_words[i:i + chunk_size] for i in range(0, n_words, chunk_size)]
+    n_chunks = len(chunks)
+    task_args = [(chunk, max_depth, min_stem_len, max_leet_ambiguity,
+                  max_prefix_len, max_suffix_len) for chunk in chunks]
 
-    chunks    = [target_words[i:i + chunk_size] for i in range(0, n_words, chunk_size)]
-    n_chunks  = len(chunks)
-    task_args = [
-        (chunk, max_depth, min_stem_len, max_leet_ambiguity,
-         max_prefix_len, max_suffix_len, enable_new_modes)
-        for chunk in chunks
-    ]
-
-    mode_label = green('15 modes') if enable_new_modes else yellow('5 modes')
-    log_info(
-        f"[S0]    Workers: {bold(str(n_workers))}  |  "
-        f"chunks: {bold(str(n_chunks))} × ~{chunk_size}  |  "
-        f"{mode_label}"
-    )
-
+    log_info(f"[S0]    Workers: {bold(str(n_workers))}  |  chunks: {bold(str(n_chunks))} × ~{chunk_size}")
     found: Set[str] = set()
     use_fork = hasattr(os, 'fork')
-    ctx      = mp.get_context('fork' if use_fork else 'spawn')
-
+    ctx = mp.get_context('fork' if use_fork else 'spawn')
     if use_fork:
-        pool_kw: dict = dict(processes=n_workers, initializer=_worker_init_p0)
+        pool_kw = dict(processes=n_workers, initializer=_worker_init_p0)
     else:
-        pool_kw = dict(
-            processes   = n_workers,
-            initializer = _worker_init_p0,
-            initargs    = (base_set, base_by_len, base_lower_idx,
-                           purge_idx, substr_idx, omit_idx,
-                           prefix_idx, ascii_idx, overwrite_idx),
-        )
-
+        pool_kw = dict(processes=n_workers, initializer=_worker_init_p0,
+                       initargs=(base_set, base_by_len))
     with ctx.Pool(**pool_kw) as pool:
-        with tqdm(
-            total      = n_words,
-            desc       = green("  STAGE 0 "),
-            unit       = "word",
-            ncols      = 88,
-            bar_format = "{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}",
-        ) as pbar:
-            for task_arg, chunk_result in zip(
-                task_args,
-                pool.imap_unordered(_process_chunk_p0, task_args),
-            ):
+        with tqdm(total=n_words, desc=green("  STAGE 0 "), unit="word", ncols=88,
+                  bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}") as pbar:
+            for task_arg, chunk_result in zip(task_args, pool.imap_unordered(_process_chunk_p0, task_args)):
                 found |= chunk_result
                 pbar.set_postfix({"rules": cyan(str(len(found)))}, refresh=False)
                 pbar.update(len(task_arg[0]))
-
-    # Clear worker globals immediately to free memory
-    _p0_worker_base_set       = set()
-    _p0_worker_base_by_len    = {}
-    _p0_worker_base_lower_idx = {}
-    _p0_worker_purge_idx      = {}
-    _p0_worker_substr_idx     = {}
-    _p0_worker_omit_idx       = {}
-    _p0_worker_prefix_idx     = {}
-    _p0_worker_ascii_idx      = {}
-    _p0_worker_overwrite_idx  = {}
-    log_debug("[S0]    Worker globals cleared — RAM released")
-
+    _p0_worker_base_set = set()
+    _p0_worker_base_by_len = {}
+    log_debug("[S0]    Worker globals cleared")
     return sorted(found)
 
-
-def _log_token_strip_stats(
-    n_words:     int,
-    rules:       List[str],
-    inject_sbd:  bool,
-) -> None:
+def _log_token_strip_stats(n_words: int, rules: List[str], inject_sbd: bool) -> None:
     if not rules:
-        log_info(f"[S0]    {yellow('0')} rules extracted by token-strip "
-                 f"({n_words:,} target words scanned)")
+        log_info(f"[S0]    {yellow('0')} rules extracted by token-strip ({n_words:,} target words scanned)")
         return
     depth_dist: Dict[int, int] = defaultdict(int)
     mode_counts: Dict[str, int] = defaultdict(int)
@@ -1803,61 +917,30 @@ def _log_token_strip_stats(
         toks = r.split()
         first = toks[0] if toks else ''
         if first == 'r':
-            mode_counts['reverse']    += 1
+            mode_counts['reverse'] += 1
         elif first == 'd':
-            mode_counts['dup']         += 1
+            mode_counts['dup'] += 1
         elif first == 'f':
-            mode_counts['fold']        += 1
+            mode_counts['fold'] += 1
         elif first in ('[', ']'):
-            mode_counts['del-edge']    += 1
+            mode_counts['del-edge'] += 1
         elif first.startswith('T') and len(first) == 2:
-            mode_counts['toggle']      += 1
+            mode_counts['toggle'] += 1
         elif first.startswith('i') and len(first) == 3:
-            mode_counts['insert']      += 1
-        elif first in ('k', 'K') or (first.startswith('*') and len(first) == 3):
-            mode_counts['swap']        += 1
-        elif first.startswith('x') and len(first) == 3:
-            mode_counts['range-ext']   += 1
-        elif first.startswith('O') and len(first) == 3:
-            mode_counts['range-omit']  += 1
-        elif first.startswith('z') and len(first) == 2:
-            mode_counts['char-dup-f']  += 1
-        elif first.startswith('Z') and len(first) == 2:
-            mode_counts['char-dup-l']  += 1
-        elif first == 'q':
-            mode_counts['char-dup-q']  += 1
-        elif first.startswith('+') and len(first) == 2:
-            mode_counts['ascii-inc']   += 1
-        elif first.startswith('-') and len(first) == 2:
-            mode_counts['ascii-dec']   += 1
-        elif first.startswith("'") and len(first) == 2:
-            mode_counts['truncate']    += 1
-        elif first.startswith('@') and len(first) == 2:
-            mode_counts['purge']       += 1
-        elif first.startswith('p') and len(first) == 2:
-            mode_counts['repeat']      += 1
-        elif first.startswith('e') and len(first) == 2:
-            mode_counts['sep-title']   += 1
-        elif first.startswith('o') and len(first) == 3:
-            mode_counts['overwrite']   += 1
-        elif all(c.isdigit() or c in ('^', '$', ' ')
-                 for c in r) and any(c.isdigit() for c in r):
-            mode_counts['digit-bnd']   += 1
+            mode_counts['insert'] += 1
+        elif all(c.isdigit() or c in ('^', '$', ' ') for c in r) and any(c.isdigit() for c in r):
+            mode_counts['digit-bnd'] += 1
         else:
-            mode_counts['letter']      += 1
+            mode_counts['letter'] += 1
     depth_summary = '  '.join(f"d{d}:{depth_dist[d]:,}" for d in sorted(depth_dist))
     inj = green('injected into STAGE S sbd') if inject_sbd else dim('STAGE S inactive')
     mode_str = '  '.join(f"{k}:{v}" for k, v in sorted(mode_counts.items()) if v)
-    log_info(
-        f"[S0]    {bold(green(str(len(rules))))} rules extracted by token-strip"
-        f"  ({depth_summary})  → {inj}"
-    )
+    log_info(f"[S0]    {bold(green(str(len(rules))))} rules extracted by token-strip  ({depth_summary})  → {inj}")
     if mode_str:
         log_info(f"[S0]    Mode breakdown  : {dim(mode_str)}")
 
-
 # --------------------------------------------------------------------
-# GPU device helpers
+# GPU device helpers (unchanged)
 # --------------------------------------------------------------------
 def get_all_devices():
     devices = []
@@ -1920,7 +1003,7 @@ def get_max_allocation(device):
     except: return 1024**3
 
 # --------------------------------------------------------------------
-# Dynamic parameters
+# Dynamic parameters (unchanged)
 # --------------------------------------------------------------------
 def calculate_dynamic_parameters(base_count, target_count, device=None,
                                   target_hours=0.5, bloom_mb_override=None):
@@ -1935,8 +1018,7 @@ def calculate_dynamic_parameters(base_count, target_count, device=None,
             if isn and mcu >= 38: lws = min(512, lws)
             est  = (LOW_END_COMBOS_PER_SEC if mcu < LOW_END_COMPUTE_UNITS_THRESHOLD
                     else BASELINE_COMBOS_PER_SEC)
-            log_debug(f"GPU: CU={mcu}, VRAM~{vgb:.1f}GB, WGS={lws}, "
-                      f"est={est//1_000_000}M combos/s")
+            log_debug(f"GPU: CU={mcu}, VRAM~{vgb:.1f}GB, WGS={lws}, est={est//1_000_000}M combos/s")
         except Exception:
             lws = 256; est = BASELINE_COMBOS_PER_SEC; mcu = 38; fv = 2*1024**3; vgb = 2.0
     else:
@@ -1974,7 +1056,7 @@ def calculate_dynamic_parameters(base_count, target_count, device=None,
     }
 
 # --------------------------------------------------------------------
-# GPU-compatible rules generator
+# GPU-compatible rules generator (unchanged)
 # --------------------------------------------------------------------
 class GPUCompatibleRulesGenerator:
     def __init__(self):
@@ -1983,8 +1065,7 @@ class GPUCompatibleRulesGenerator:
     def generate_gpu_compatible_rules(self):
         rules  = set()
         digits = '0123456789'
-        rules.update(['l','u','c','C','t','r','d','f',
-                      'q','E','{','}','[',']','k','K',':'])
+        rules.update(['l','u','c','C','t','r','d','f','q','E','{','}','[',']','k','K',':'])
         for cmd in ('T','D','L','R','+','-','.',',', "'", 'z','Z','y','Y'):
             for pos in digits: rules.add(f'{cmd}{pos}')
         for pos in digits:
@@ -2015,7 +1096,7 @@ class GPUCompatibleRulesGenerator:
         return valid
 
 # --------------------------------------------------------------------
-# OpenCL kernel
+# OpenCL kernel (unchanged)
 # --------------------------------------------------------------------
 GPU_KERNEL_TEMPLATE = r"""
 #define MAX_WORD_LEN         {MAX_WORD_LEN}
@@ -2167,7 +1248,7 @@ __kernel void find_rule_chains_gpu(
 """
 
 # --------------------------------------------------------------------
-# GPU Engine
+# GPU Engine (unchanged except minor logging)
 # --------------------------------------------------------------------
 class GPUEngine:
     def __init__(self, params):
@@ -2225,9 +1306,6 @@ class GPUEngine:
             log_error(f"GPU init failed: {e}"); return False
 
     def compile_kernel(self):
-        """
-        Idempotency guard — kernel is compiled once per GPU context.
-        """
         if self.program is not None:
             log_debug("compile_kernel: already compiled — skipping")
             return self.program
@@ -2244,7 +1322,6 @@ class GPUEngine:
             )
             context = self.context
             result: list = [None]
-
             def _build():
                 try:
                     prog = cl.Program(context, src)
@@ -2252,7 +1329,6 @@ class GPUEngine:
                     result[0] = prog
                 except Exception as exc:
                     result[0] = exc
-
             t = threading.Thread(target=_build, daemon=True)
             t.start()
             print("[GPU]  Compiling OpenCL kernel ", end='', flush=True)
@@ -2261,10 +1337,8 @@ class GPUEngine:
                 if t.is_alive():
                     print('.', end='', flush=True)
             print(" done", flush=True)
-
             if isinstance(result[0], Exception):
                 raise result[0]
-
             prog = result[0]
             self.program       = prog
             self.kernel_single = prog.find_single_rules_gpu
@@ -2302,10 +1376,7 @@ class GPUEngine:
         try:
             self.context         = cl.Context([self.device])
             self.queue           = cl.CommandQueue(self.context)
-            self.local_work_size = min(
-                self.params.get('LOCAL_WORK_SIZE', 512),
-                self.max_work_group_size,
-            )
+            self.local_work_size = min(self.params.get('LOCAL_WORK_SIZE', 512), self.max_work_group_size)
             if not self.compile_kernel():
                 log_error("[GPU] Context reset: kernel recompile failed")
                 return False
@@ -2334,11 +1405,8 @@ class GPUEngine:
         t.start()
         t.join(timeout=self._QUEUE_FINISH_TIMEOUT)
         if t.is_alive():
-            log_warn(
-                f"[GPU] queue.finish() hung for {self._QUEUE_FINISH_TIMEOUT}s "
-                f"— GPU stall / TDR detected; forcing context reset"
-            )
-            self._reset_gpu(RuntimeError("queue.finish timeout — GPU stall"))
+            log_warn(f"[GPU] queue.finish() hung for {self._QUEUE_FINISH_TIMEOUT}s — forcing reset")
+            self._reset_gpu(RuntimeError("queue.finish timeout"))
             return False
         if isinstance(result[0], Exception):
             log_warn(f"[GPU] queue.finish() raised: {result[0]}")
@@ -2350,12 +1418,8 @@ class GPUEngine:
         bsz = self.params['BLOOM_FILTER_SIZE'] // 8
         bf  = np.zeros(bsz, dtype=np.uint8)
         log_debug(f"Building bloom filter: {bsz//1024//1024}MB for {len(target_words):,} words")
-        for w in tqdm(target_words,
-                      desc=green("  Bloom filter"),
-                      unit="word",
-                      ncols=88,
-                      leave=False,
-                      bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}]"):
+        for w in tqdm(target_words, desc=green("  Bloom filter"), unit="word", ncols=88,
+                      leave=False, bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}]"):
             wb = w.encode('latin-1')
             h1 = fnv1a_32(wb, FNV1A_SEED1); h2 = fnv1a_32(wb, FNV1A_SEED2)
             for i in range(BLOOM_HASH_FUNCTIONS):
@@ -2408,24 +1472,16 @@ class GPUEngine:
             self._rules_buf_key     = key
         return self._rules_buf, self._rules_offsets_buf, self._rules_lengths_buf
 
-    # ---------------------------------------------------------------- STAGE 1
     def process_all_words_single_rule(self, base_words, rules, bloom_filter):
         self.upload_bloom_filter(bloom_filter)
         if not self.compile_kernel(): return Counter()
         self.gpu_rules  = HashcatRuleValidator.validate_rules_for_gpu(rules)
         self.rule_index = {r: i for i, r in enumerate(self.gpu_rules)}
         log_debug(f"STAGE 1: {len(base_words):,} words × {len(self.gpu_rules):,} rules")
-
         counter = Counter()
         bs      = self.params['WORDS_PER_BATCH']
-
-        with tqdm(total=len(base_words),
-                  desc=green("  STAGE 1 "),
-                  unit="word",
-                  ncols=88,
-                  bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}",
-                  ) as pbar:
-
+        with tqdm(total=len(base_words), desc=green("  STAGE 1 "), unit="word", ncols=88,
+                  bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}") as pbar:
             for i in range(0, len(base_words), bs):
                 batch = base_words[i:i+bs]
                 if batch:
@@ -2437,14 +1493,11 @@ class GPUEngine:
                     elif self.queue is None:
                         self._consecutive_errors += 1
                         if self._consecutive_errors >= self._MAX_CONSECUTIVE_ERRORS:
-                            log_warn(f"[GPU] {self._consecutive_errors} consecutive failures — "
-                                     f"aborting STAGE 1 gracefully")
+                            log_warn(f"[GPU] {self._consecutive_errors} consecutive failures — aborting STAGE 1")
                             break
                 pbar.update(len(batch))
-
         gc.collect()
         log_info(f"[S1]    {bold(green(str(len(counter))))} unique rules passed bloom filter")
-        log_debug(f"STAGE 1 complete: {len(counter)} rules in counter")
         return counter
 
     def _run_single_kernel(self, bd):
@@ -2453,25 +1506,20 @@ class GPUEngine:
             def B(arr, f=mf.READ_ONLY):
                 b = cl.Buffer(self.context, f | mf.COPY_HOST_PTR, hostbuf=arr)
                 bufs.append(b); return b
-
             bb=B(bd['words_flat']); bbo=B(bd['word_offsets']); bbl=B(bd['word_lengths'])
             rb, rbo, rbl = self._get_rules_buffers(mf)
             outs = self.safe_output_buffer_size(bd['num_words'], bd['num_rules'])
             fo = cl.Buffer(self.context, mf.WRITE_ONLY, outs*MAX_CHAIN_STRING_LEN); bufs.append(fo)
             fc = cl.Buffer(self.context, mf.READ_WRITE, 4);                         bufs.append(fc)
             cl.enqueue_copy(self.queue, fc, np.array([0], dtype=np.int32))
-
             tot = bd['num_words'] * bd['num_rules']
             gs  = ((tot+self.local_work_size-1)//self.local_work_size)*self.local_work_size
-            # Używamy np.int32, nie int – unikamy INVALID_VALUE
             self.kernel_single.set_args(bb, bbo, bbl, rb, rbo, rbl, self.bloom_buf,
-                                        np.int32(bd['num_words']),
-                                        np.int32(bd['num_rules']),
+                                        np.int32(bd['num_words']), np.int32(bd['num_rules']),
                                         fo, fc)
             cl.enqueue_nd_range_kernel(self.queue, self.kernel_single, (gs,), (self.local_work_size,))
             if not self._safe_queue_finish():
                 return []
-
             cnt = np.zeros(1, dtype=np.int32)
             cl.enqueue_copy(self.queue, cnt, fc)
             n = min(cnt[0], outs); out = []
@@ -2492,7 +1540,6 @@ class GPUEngine:
                 try: b.release()
                 except: pass
 
-    # ---------------------------------------------------------------- STAGE 2
     def _gen_random_chains(self, depth, count, valid, hot, existing, new_set):
         gen = set(); max_att = count * MAX_ATTEMPTS_MULTIPLIER
         hot_budget = int(count * HOT_RULE_RATIO) if hot else 0
@@ -2514,19 +1561,14 @@ class GPUEngine:
     def build_numeric_seed_families(self, max_depth: int = 4) -> dict:
         digits = '0123456789'
         sbd: Dict[int, set] = defaultdict(set)
-
         # A
-        a_cnt: Dict[int, int] = defaultdict(int)
         for depth in range(1, min(4, max_depth) + 1):
             for combo in itertools.product(digits, repeat=depth):
                 sbd[depth].add(' '.join(f'^{ch}' for ch in reversed(combo)))
-                a_cnt[depth] += 1
         # B
-        b_cnt: Dict[int, int] = defaultdict(int)
         for depth in range(1, min(4, max_depth) + 1):
             for combo in itertools.product(digits, repeat=depth):
                 sbd[depth].add(' '.join(f'${ch}' for ch in combo))
-                b_cnt[depth] += 1
         # C
         for depth in range(1, min(4, max_depth) + 1):
             for ops in itertools.product(['^', '$'], repeat=depth):
@@ -2535,23 +1577,18 @@ class GPUEngine:
         # D
         transform_ops = ['l','u','c','C','t','r','d','f','E','k','K','{','}','[',']']
         t_digit_ops = [f'^{d}' for d in digits] + [f'${d}' for d in digits] + ['[', ']']
-        d_cnt: Dict[int, int] = defaultdict(int)
         for depth in range(2, min(4, max_depth) + 1):
             for t_op in transform_ops:
                 for ops in itertools.product(t_digit_ops, repeat=depth - 1):
                     seed = f"{t_op} {' '.join(ops)}"
                     if HashcatRuleValidator.validate_rule_for_gpu(seed):
                         sbd[depth].add(seed)
-                        d_cnt[depth] += 1
         # E
         _days   = [f"{d:02d}" for d in range(1, 32)]
         _months = [f"{m:02d}" for m in range(1, 13)]
-        _years2 = ([f"{y:02d}" for y in range(60, 100)] +
-                   [f"{y:02d}" for y in range(0,  31)])
+        _years2 = ([f"{y:02d}" for y in range(60, 100)] + [f"{y:02d}" for y in range(0, 31)])
         _years4 = [str(y) for y in range(1960, 2031)]
-        _date4: set = set()
-        _date6: set = set()
-        _date8: set = set()
+        _date4 = set(); _date6 = set(); _date8 = set()
         for _d in _days:
             for _m in _months:
                 _date4.add(_d + _m)
@@ -2568,15 +1605,11 @@ class GPUEngine:
                 for _y in _years4:
                     _date8.add(_d + _m + _y)
                     _date8.add(_m + _d + _y)
-        e_cnt: Dict[int, int] = defaultdict(int)
         for _ds_set, _base_depth in ((_date4, 4), (_date6, 6), (_date8, 8)):
-            if _base_depth > max_depth:
-                continue
+            if _base_depth > max_depth: continue
             for _ds in _ds_set:
-                _app = ' '.join(f'${c}' for c in _ds)
-                _pre = ' '.join(f'^{c}' for c in reversed(_ds))
-                sbd[_base_depth].add(_app); e_cnt[_base_depth] += 1
-                sbd[_base_depth].add(_pre); e_cnt[_base_depth] += 1
+                sbd[_base_depth].add(' '.join(f'${c}' for c in _ds))
+                sbd[_base_depth].add(' '.join(f'^{c}' for c in reversed(_ds)))
         if max_depth >= 5:
             for _ds in _date4:
                 _app = ' '.join(f'${c}' for c in _ds)
@@ -2584,18 +1617,12 @@ class GPUEngine:
                 for t_op in transform_ops:
                     for _chain in (f"{t_op} {_app}", f"{t_op} {_pre}"):
                         if HashcatRuleValidator.validate_rule_for_gpu(_chain):
-                            sbd[5].add(_chain); e_cnt[5] += 1
+                            sbd[5].add(_chain)
         _bracket_ops = ['[', ']']
-        _bracket_date_schedule = [
-            (_date4, 4, range(2, 5)),
-            (_date6, 6, range(1, 3)),
-            (_date8, 8, range(1, 2)),
-        ]
-        for _bds, _bdepth, _brange in _bracket_date_schedule:
+        for _bds, _bdepth, _brange in ((_date4, 4, range(2,5)), (_date6, 6, range(1,3)), (_date8, 8, range(1,2))):
             for _num_b in _brange:
                 _new_depth = _bdepth + _num_b
-                if _new_depth > max_depth:
-                    continue
+                if _new_depth > max_depth: continue
                 for _brackets in itertools.product(_bracket_ops, repeat=_num_b):
                     _bpfx = ' '.join(_brackets)
                     for _ds in _bds:
@@ -2604,38 +1631,27 @@ class GPUEngine:
                         for _chain in (f"{_bpfx} {_app}", f"{_bpfx} {_pre}"):
                             if HashcatRuleValidator.validate_rule_for_gpu(_chain):
                                 sbd[_new_depth].add(_chain)
-                                e_cnt[_new_depth] += 1
         # F
-        f_cnt: Dict[int, int] = defaultdict(int)
         for depth in range(1, min(3, max_depth) + 1):
             for combo in itertools.product(SPECIAL_CHARS_TOP, repeat=depth):
                 chain = ' '.join(f'${ch}' for ch in combo)
                 if HashcatRuleValidator.validate_rule_for_gpu(chain):
                     sbd[depth].add(chain)
-                    f_cnt[depth] += 1
         # G
-        g_cnt: Dict[int, int] = defaultdict(int)
         for depth in range(1, min(3, max_depth) + 1):
             for combo in itertools.product(SPECIAL_CHARS_TOP, repeat=depth):
                 chain = ' '.join(f'^{ch}' for ch in reversed(combo))
                 if HashcatRuleValidator.validate_rule_for_gpu(chain):
                     sbd[depth].add(chain)
-                    g_cnt[depth] += 1
         # H
-        sp_ops_top = (
-            [f'${ch}' for ch in SPECIAL_CHARS_TOP] +
-            [f'^{ch}' for ch in SPECIAL_CHARS_TOP]
-        )
-        h_cnt: Dict[int, int] = defaultdict(int)
+        sp_ops_top = [f'${ch}' for ch in SPECIAL_CHARS_TOP] + [f'^{ch}' for ch in SPECIAL_CHARS_TOP]
         for depth in range(2, min(3, max_depth) + 1):
             for t_op in transform_ops:
                 for ops in itertools.product(sp_ops_top, repeat=depth - 1):
                     seed = f"{t_op} {' '.join(ops)}"
                     if HashcatRuleValidator.validate_rule_for_gpu(seed):
                         sbd[depth].add(seed)
-                        h_cnt[depth] += 1
         # I
-        i_cnt: Dict[int, int] = defaultdict(int)
         for depth in range(2, min(4, max_depth) + 1):
             n_digits = depth - 1
             for digit_combo in itertools.product(digits, repeat=n_digits):
@@ -2643,48 +1659,35 @@ class GPUEngine:
                     app = ' '.join(f'${d}' for d in digit_combo) + f' ${sp}'
                     if HashcatRuleValidator.validate_rule_for_gpu(app):
                         sbd[depth].add(app)
-                        i_cnt[depth] += 1
                     pre = f'^{sp} ' + ' '.join(f'^{d}' for d in reversed(digit_combo))
                     if HashcatRuleValidator.validate_rule_for_gpu(pre):
                         sbd[depth].add(pre)
-                        i_cnt[depth] += 1
         # J
-        j_cnt: Dict[int, int] = defaultdict(int)
         for op in LEET_OPS:
             if HashcatRuleValidator.validate_rule_for_gpu(op):
                 sbd[1].add(op)
-                j_cnt[1] += 1
         if max_depth >= 2:
-            leet_followup = (
-                [f'${d}' for d in digits] +
-                [f'^{d}' for d in digits] +
-                [f'${ch}' for ch in SPECIAL_CHARS_CORE] +
-                [f'^{ch}' for ch in SPECIAL_CHARS_CORE]
-            )
+            leet_followup = [f'${d}' for d in digits] + [f'^{d}' for d in digits] + \
+                            [f'${ch}' for ch in SPECIAL_CHARS_CORE] + [f'^{ch}' for ch in SPECIAL_CHARS_CORE]
             for leet_op in LEET_OPS:
                 for follow in leet_followup:
                     chain = f"{leet_op} {follow}"
                     if HashcatRuleValidator.validate_rule_for_gpu(chain):
                         sbd[2].add(chain)
-                        j_cnt[2] += 1
             for i_l, l1 in enumerate(LEET_OPS):
                 for l2 in LEET_OPS:
                     if l1 != l2:
                         chain = f"{l1} {l2}"
                         if HashcatRuleValidator.validate_rule_for_gpu(chain):
                             sbd[2].add(chain)
-                            j_cnt[2] += 1
         # K
-        k_cnt: Dict[int, int] = defaultdict(int)
         if max_depth >= 2:
             for t1 in transform_ops:
                 for t2 in transform_ops:
                     chain = f"{t1} {t2}"
                     if HashcatRuleValidator.validate_rule_for_gpu(chain):
                         sbd[2].add(chain)
-                        k_cnt[2] += 1
         # L
-        l_cnt: Dict[int, int] = defaultdict(int)
         for depth in range(2, min(3, max_depth) + 1):
             n_digits = depth - 1
             for sp in SPECIAL_CHARS_CORE:
@@ -2692,27 +1695,20 @@ class GPUEngine:
                     app = f'${sp} ' + ' '.join(f'${d}' for d in digit_combo)
                     if HashcatRuleValidator.validate_rule_for_gpu(app):
                         sbd[depth].add(app)
-                        l_cnt[depth] += 1
                     pre = ' '.join(f'^{d}' for d in digit_combo) + f' ^{sp}'
                     if HashcatRuleValidator.validate_rule_for_gpu(pre):
                         sbd[depth].add(pre)
-                        l_cnt[depth] += 1
         # M
-        m_cnt: Dict[int, int] = defaultdict(int)
         if max_depth >= 2:
             for leet_op in LEET_OPS:
                 for t_op in transform_ops:
                     chain_lt = f"{leet_op} {t_op}"
                     if HashcatRuleValidator.validate_rule_for_gpu(chain_lt):
                         sbd[2].add(chain_lt)
-                        m_cnt[2] += 1
                     chain_tl = f"{t_op} {leet_op}"
                     if HashcatRuleValidator.validate_rule_for_gpu(chain_tl):
                         sbd[2].add(chain_tl)
-                        m_cnt[2] += 1
-
-        log_debug(f"Seed families built max_depth={max_depth} "
-                  f"total={sum(len(v) for v in sbd.values()):,}")
+        log_debug(f"Seed families built max_depth={max_depth} total={sum(len(v) for v in sbd.values()):,}")
         return dict(sbd)
 
     def run_seed_extraction_pass(self, base_words: list, sbd: dict,
@@ -2724,31 +1720,21 @@ class GPUEngine:
         if not self.rule_index:
             self.gpu_rules  = HashcatRuleValidator.validate_rules_for_gpu(phase1_rules)
             self.rule_index = {r: i for i, r in enumerate(self.gpu_rules)}
-
         multi_seeds: List[str] = []
         for depth, chains in sorted(sbd.items()):
             if depth >= 2:
                 multi_seeds.extend(chains)
-
         if not multi_seeds:
             log_info("[SEED]    No multi-depth seeds to test")
             return Counter()
-
         total = sum(len(v) for d, v in sbd.items() if d >= 2)
-        log_info(f"[SEED]    Numeric seed pass: {total:,} chains across "
-                 f"{sum(1 for d in sbd if d >= 2)} depth(s)")
-
+        log_info(f"[SEED]    Numeric seed pass: {total:,} chains across {sum(1 for d in sbd if d >= 2)} depth(s)")
         counter = Counter()
         cbs = self.params['CHAINS_PER_BATCH']
         wsb = self.params['WORD_SUB_BATCH']
         n_batches = (len(multi_seeds) + cbs - 1) // cbs
-
-        with tqdm(total=n_batches,
-                  desc=green("  SeedPass"),
-                  unit="batch",
-                  ncols=88,
-                  bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}",
-                  ) as pbar:
+        with tqdm(total=n_batches, desc=green("  SeedPass"), unit="batch", ncols=88,
+                  bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}") as pbar:
             for ci in range(0, len(multi_seeds), cbs):
                 cb = multi_seeds[ci:ci + cbs]
                 for wi in range(0, len(base_words), wsb):
@@ -2763,8 +1749,7 @@ class GPUEngine:
                     if not self._safe_queue_finish():
                         self._consecutive_errors += 1
                 if self._consecutive_errors >= self._MAX_CONSECUTIVE_ERRORS:
-                    log_warn(f"[GPU] {self._consecutive_errors} consecutive failures — "
-                             "aborting seed pass gracefully")
+                    log_warn(f"[GPU] {self._consecutive_errors} consecutive failures — aborting seed pass")
                     break
                 pbar.update(1)
                 pbar.set_postfix({"hits": cyan(str(len(counter)))}, refresh=False)
@@ -2812,12 +1797,8 @@ class GPUEngine:
         cbs     = self.params['CHAINS_PER_BATCH']
         wsb     = self.params['WORD_SUB_BATCH']
         n_batches = (len(chains)+cbs-1)//cbs
-        with tqdm(total=n_batches,
-                  desc=green("  STAGE 2 "),
-                  unit="batch",
-                  ncols=88,
-                  bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}",
-                  ) as pbar:
+        with tqdm(total=n_batches, desc=green("  STAGE 2 "), unit="batch", ncols=88,
+                  bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}") as pbar:
             for ci in range(0, len(chains), cbs):
                 cb = chains[ci:ci+cbs]
                 for wi in range(0, len(base_words), wsb):
@@ -2832,8 +1813,7 @@ class GPUEngine:
                     if not self._safe_queue_finish():
                         self._consecutive_errors += 1
                 if self._consecutive_errors >= self._MAX_CONSECUTIVE_ERRORS:
-                    log_warn(f"[GPU] {self._consecutive_errors} consecutive failures — "
-                             "aborting STAGE 2 gracefully")
+                    log_warn(f"[GPU] {self._consecutive_errors} consecutive failures — aborting STAGE 2")
                     break
                 pbar.update(1)
                 pbar.set_postfix({"rules": cyan(str(len(counter)))}, refresh=False)
@@ -2844,9 +1824,11 @@ class GPUEngine:
     def _run_chain_kernel(self, words, chains):
         seqs = []; depths = []
         for chain in chains:
-            parts = chain.split(); depths.append(len(parts))
-            idxs  = [self.rule_index.get(r,-1) for r in parts]
-            while len(idxs) < self.params['MAX_CHAIN_DEPTH']: idxs.append(-1)
+            parts = chain.split()
+            depths.append(len(parts))
+            idxs = [self.rule_index.get(r, -1) for r in parts]
+            while len(idxs) < self.params['MAX_CHAIN_DEPTH']:
+                idxs.append(-1)
             seqs.extend(idxs)
         bd = self.prepare_words_data(words)
         mf = cl.mem_flags; bufs = []
@@ -2864,12 +1846,9 @@ class GPUEngine:
             cl.enqueue_copy(self.queue, fc, np.array([0], dtype=np.int32))
             tot = len(words)*len(chains)
             gs  = ((tot+self.local_work_size-1)//self.local_work_size)*self.local_work_size
-            # Używamy np.int32
             self.kernel_chain.set_args(bb, bbo, bbl, rb, rbo, rbl, csb, cdb, self.bloom_buf,
-                                       np.int32(len(words)),
-                                       np.int32(len(chains)),
-                                       np.int32(self.params['MAX_CHAIN_DEPTH']),
-                                       fo, fc)
+                                       np.int32(len(words)), np.int32(len(chains)),
+                                       np.int32(self.params['MAX_CHAIN_DEPTH']), fo, fc)
             cl.enqueue_nd_range_kernel(self.queue, self.kernel_chain, (gs,), (self.local_work_size,))
             if not self._safe_queue_finish():
                 return []
@@ -2894,7 +1873,7 @@ class GPUEngine:
                 except: pass
 
 # ====================================================================
-# --- STAGE 3 — GENETIC ALGORITHM RULE EVOLVER ---
+# --- STAGE 3 — GENETIC ALGORITHM RULE EVOLVER (unchanged) ---
 # ====================================================================
 class GeneticRuleEvolver:
     def __init__(
@@ -2924,17 +1903,11 @@ class GeneticRuleEvolver:
         _total = mut_replace_p + mut_insert_p + mut_delete_p
         if _total <= 0:
             _total = 1.0
-        self._mut_weights = [
-            mut_replace_p / _total,
-            mut_insert_p  / _total,
-            mut_delete_p  / _total,
-        ]
+        self._mut_weights = [mut_replace_p / _total, mut_insert_p / _total, mut_delete_p / _total]
         self.seed_hits = seed_hits or Counter()
-        self.seed_chains_sorted: List[str] = [
-            r for r, _ in sorted(self.seed_hits.items(), key=lambda kv: -kv[1])
-        ] if self.seed_hits else []
+        self.seed_chains_sorted: List[str] = [r for r, _ in sorted(self.seed_hits.items(), key=lambda kv: -kv[1])] if self.seed_hits else []
         self.known_rules: set = known_rules if known_rules is not None else set()
-        self._sig_cache:   Dict[str, tuple]             = {}
+        self._sig_cache:   Dict[str, tuple] = {}
         self._sig_to_best: Dict[tuple, Tuple[str, int]] = {}
 
     def _random_chain(self, depth: int = 0) -> list:
@@ -3000,8 +1973,7 @@ class GeneticRuleEvolver:
             if len(hot) >= 2:
                 a, b = random.sample(hot, 2)
             elif len(hot) == 1:
-                a = hot[0]
-                b = random.choice(self.rule_pool)
+                a = hot[0]; b = random.choice(self.rule_pool)
             else:
                 break
             pop_set.add((a, b))
@@ -3010,9 +1982,7 @@ class GeneticRuleEvolver:
         while len(pop_set) < n_hot + n_seeded and tries < max_tries:
             tries += 1
             if self.max_depth >= 3:
-                depth = (random.randint(3, self.max_depth)
-                         if random.random() < 0.70
-                         else 2)
+                depth = random.randint(3, self.max_depth) if random.random() < 0.70 else 2
             else:
                 depth = random.randint(2, self.max_depth)
             if hot:
@@ -3037,31 +2007,25 @@ class GeneticRuleEvolver:
             fill_tries = 0
             while len(fill_set) < n_fill and fill_tries < max_fill_tries:
                 fill_tries += 1
-                d = (random.randint(3, self.max_depth)
-                     if self.max_depth >= 3 and random.random() < 0.60
-                     else random.randint(2, self.max_depth))
+                d = random.randint(3, self.max_depth) if self.max_depth >= 3 and random.random() < 0.60 else random.randint(2, self.max_depth)
                 fill_set.add(tuple(self._random_chain(d)))
         else:
             max_tries = n_fill * 20
             tries = 0
             while len(fill_set) < n_fill and tries < max_tries:
                 tries += 1
-                d = (random.randint(3, self.max_depth)
-                     if self.max_depth >= 3 and random.random() < 0.60
-                     else random.randint(2, self.max_depth))
+                d = random.randint(3, self.max_depth) if self.max_depth >= 3 and random.random() < 0.60 else random.randint(2, self.max_depth)
                 fill_set.add(tuple(self._random_chain(d)))
         for ind in fill_set:
             pop_set.add(ind)
         result = [list(ind) for ind in pop_set]
         while len(result) < self.pop_size:
-            d = (random.randint(3, self.max_depth)
-                 if self.max_depth >= 3 and random.random() < 0.50
-                 else random.randint(2, self.max_depth))
+            d = random.randint(3, self.max_depth) if self.max_depth >= 3 and random.random() < 0.50 else random.randint(2, self.max_depth)
             result.append(self._random_chain(d))
         return result[:self.pop_size]
 
     def evaluate_population(self, population: list) -> dict:
-        chain_strs   = [' '.join(tokens) for tokens in population]
+        chain_strs = [' '.join(tokens) for tokens in population]
         valid_chains = [c for c in chain_strs if HashcatRuleValidator.validate_rule_for_gpu(c)]
         raw_map: dict = {c: 0 for c in chain_strs}
         if not valid_chains:
@@ -3082,9 +2046,9 @@ class GeneticRuleEvolver:
         return raw_map
 
     def _tournament_select(self, fitness_list: list) -> list:
-        k          = min(self.tournament_k, len(fitness_list))
+        k = min(self.tournament_k, len(fitness_list))
         contenders = random.sample(fitness_list, k)
-        winner, _  = max(contenders, key=lambda x: x[1])
+        winner, _ = max(contenders, key=lambda x: x[1])
         return list(winner)
 
     def _crossover(self, p1: list, p2: list) -> tuple:
@@ -3098,9 +2062,9 @@ class GeneticRuleEvolver:
 
     def _mutate(self, tokens: list) -> list:
         tokens = list(tokens)
-        op     = random.choices(['replace', 'insert', 'delete'], weights=self._mut_weights)[0]
+        op = random.choices(['replace', 'insert', 'delete'], weights=self._mut_weights)[0]
         if op == 'replace':
-            idx         = random.randrange(len(tokens))
+            idx = random.randrange(len(tokens))
             tokens[idx] = random.choice(self.rule_pool)
         elif op == 'insert' and len(tokens) < self.max_depth:
             idx = random.randint(0, len(tokens))
@@ -3109,7 +2073,7 @@ class GeneticRuleEvolver:
             idx = random.randrange(len(tokens))
             tokens.pop(idx)
         else:
-            idx         = random.randrange(len(tokens))
+            idx = random.randrange(len(tokens))
             tokens[idx] = random.choice(self.rule_pool)
         return tokens
 
@@ -3124,19 +2088,13 @@ class GeneticRuleEvolver:
         all_new: Counter = Counter()
         n_elite = max(1, int(self.pop_size * self.elite_frac))
         STAGNATION_THRESHOLD = 5
-        stagnation_counter   = 0
-        best_ever_score      = 0
-        log_info(f"[S3]    pop={self.pop_size}  max_gen={generations}  "
-                 f"elite={self.elite_frac:.0%}  budget={time_budget:.0f}s  "
-                 f"pool={len(self.rule_pool):,} rules  known={len(self.known_rules):,}")
+        stagnation_counter = 0
+        best_ever_score = 0
+        log_info(f"[S3]    pop={self.pop_size}  max_gen={generations}  elite={self.elite_frac:.0%}  budget={time_budget:.0f}s  pool={len(self.rule_pool):,} rules  known={len(self.known_rules):,}")
         pop = self.initial_population(hot_rules)
         last_gen = 0
-        with tqdm(total=generations,
-                  desc=green("  STAGE 3 "),
-                  unit="gen",
-                  ncols=88,
-                  bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}",
-                  ) as pbar:
+        with tqdm(total=generations, desc=green("  STAGE 3 "), unit="gen", ncols=88,
+                  bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}") as pbar:
             for gen in range(generations):
                 last_gen = gen
                 if time.time() - t_start >= time_budget:
@@ -3152,14 +2110,12 @@ class GeneticRuleEvolver:
                         if all_new[chain_str] == raw_hits:
                             n_novel_this_gen += 1
                 fitness_list = sorted(
-                    [(tuple(ind), raw_map.get(' '.join(ind), 0) *
-                      (2 if ' '.join(ind) not in self.known_rules else 1))
-                     for ind in pop],
+                    [(tuple(ind), raw_map.get(' '.join(ind), 0) * (2 if ' '.join(ind) not in self.known_rules else 1)) for ind in pop],
                     key=lambda x: -x[1],
                 )
                 best_score = fitness_list[0][1] if fitness_list else 0
                 if best_score > best_ever_score:
-                    best_ever_score    = best_score
+                    best_ever_score = best_score
                     stagnation_counter = 0
                 else:
                     stagnation_counter += 1
@@ -3172,9 +2128,7 @@ class GeneticRuleEvolver:
                     refresh_set = {fitness_list[0][0]} if fitness_list else set()
                     while len(refresh_chains) < n_refresh and rt < n_refresh * 20:
                         rt += 1
-                        d = (random.randint(3, self.max_depth)
-                             if depth_bias and random.random() < 0.60
-                             else random.randint(2, self.max_depth))
+                        d = random.randint(3, self.max_depth) if depth_bias and random.random() < 0.60 else random.randint(2, self.max_depth)
                         ind = tuple(self._random_chain(d))
                         if ind not in refresh_set:
                             refresh_chains.append(list(ind))
@@ -3183,19 +2137,15 @@ class GeneticRuleEvolver:
                     pop = keep_top + refresh_chains
                     pop = pop[:self.pop_size]
                     pbar.update(1)
-                    pbar.set_postfix({"best": cyan(str(best_score)),
-                                      "new":  cyan(str(len(all_new))),
-                                      "sigs": cyan(str(len(self._sig_to_best))),
-                                      "stag": yellow("REFRESH")},
-                                     refresh=False)
+                    pbar.set_postfix({"best": cyan(str(best_score)), "new": cyan(str(len(all_new))), "sigs": cyan(str(len(self._sig_to_best))), "stag": yellow("REFRESH")}, refresh=False)
                     continue
-                elites   = [list(ind) for ind, _ in fitness_list[:n_elite]]
+                elites = [list(ind) for ind, _ in fitness_list[:n_elite]]
                 next_pop = list(elites)
                 next_set = {tuple(e) for e in elites}
                 depth_bias = self.max_depth >= 3
                 max_breed_attempts = (self.pop_size - len(next_pop)) * 8
-                breed_attempts     = 0
-                n_sig_replaced     = 0
+                breed_attempts = 0
+                n_sig_replaced = 0
                 while len(next_pop) < self.pop_size and breed_attempts < max_breed_attempts:
                     breed_attempts += 1
                     p1 = self._tournament_select(fitness_list)
@@ -3211,11 +2161,9 @@ class GeneticRuleEvolver:
                             continue
                         if self._sig_is_covered(' '.join(child)):
                             n_sig_replaced += 1
-                            d = (random.randint(3, self.max_depth)
-                                 if depth_bias and random.random() < 0.70
-                                 else random.randint(2, self.max_depth))
+                            d = random.randint(3, self.max_depth) if depth_bias and random.random() < 0.70 else random.randint(2, self.max_depth)
                             child = self._random_chain(d)
-                            key   = tuple(child)
+                            key = tuple(child)
                             if key in next_set:
                                 continue
                         next_pop.append(child)
@@ -3223,25 +2171,18 @@ class GeneticRuleEvolver:
                 fill_attempts = 0
                 while len(next_pop) < self.pop_size and fill_attempts < self.pop_size * 4:
                     fill_attempts += 1
-                    d = (random.randint(3, self.max_depth)
-                         if depth_bias and random.random() < 0.50
-                         else random.randint(2, self.max_depth))
+                    d = random.randint(3, self.max_depth) if depth_bias and random.random() < 0.50 else random.randint(2, self.max_depth)
                     ind = tuple(self._random_chain(d))
                     if ind not in next_set:
                         next_pop.append(list(ind))
                         next_set.add(ind)
                 pop = next_pop[:self.pop_size]
                 pbar.update(1)
-                pbar.set_postfix({"best": cyan(str(best_score)),
-                                  "new":  cyan(str(len(all_new))),
-                                  "sigs": cyan(str(len(self._sig_to_best)))},
-                                 refresh=False)
+                pbar.set_postfix({"best": cyan(str(best_score)), "new": cyan(str(len(all_new))), "sigs": cyan(str(len(self._sig_to_best)))}, refresh=False)
         elapsed = time.time() - t_start
-        n_chains      = len(all_new)
+        n_chains = len(all_new)
         n_sig_classes = len(self._sig_to_best)
-        log_info(f"[S3]    Evolution complete — {bold(green(str(n_chains)))} unique chains passed bloom filter  "
-                 f"({bold(cyan(str(n_sig_classes)))} distinct functional signatures)  "
-                 f"({elapsed:.1f}s, {last_gen + 1} generation(s))")
+        log_info(f"[S3]    Evolution complete — {bold(green(str(n_chains)))} unique chains passed bloom filter  ({bold(cyan(str(n_sig_classes)))} distinct functional signatures)  ({elapsed:.1f}s, {last_gen + 1} generation(s))")
         return all_new
 
 # --------------------------------------------------------------------
@@ -3256,8 +2197,7 @@ class GPUExtractor:
                  token_strip=False, token_strip_min_stem=4,
                  token_strip_max_prefix=4, token_strip_max_suffix=4,
                  token_strip_min_leet_amb=3,
-                 token_strip_workers=0, token_strip_chunk_size=0,
-                 token_strip_no_new_modes=False):
+                 token_strip_workers=0, token_strip_chunk_size=0):
         self.base_count               = base_count
         self.target_count             = target_count
         self.max_depth                = max_depth
@@ -3277,13 +2217,11 @@ class GPUExtractor:
         self.token_strip_min_leet_amb = token_strip_min_leet_amb
         self.token_strip_workers      = token_strip_workers
         self.token_strip_chunk_size   = token_strip_chunk_size
-        self.token_strip_no_new_modes = token_strip_no_new_modes
-        self.params              = calculate_dynamic_parameters(
-            base_count, target_count, None, target_hours, bloom_mb_override=bloom_mb)
+        self.params                   = calculate_dynamic_parameters(base_count, target_count, None, target_hours, bloom_mb_override=bloom_mb)
         self.params['MAX_CHAIN_DEPTH'] = max_depth
-        self.rules_gen           = GPUCompatibleRulesGenerator()
-        self.gpu_engine          = GPUEngine(self.params)
-        self.validator           = HashcatRuleValidator()
+        self.rules_gen                = GPUCompatibleRulesGenerator()
+        self.gpu_engine               = GPUEngine(self.params)
+        self.validator                = HashcatRuleValidator()
 
     def load_seed_rules(self):
         if not self.seed_rules_file: return []
@@ -3311,17 +2249,10 @@ class GPUExtractor:
         all_seeds   = self.load_seed_rules()
 
         if self.token_strip:
-            log_section("STAGE 0 — Token-Strip Rule Extraction")
+            log_section("STAGE 0 — Token-Strip Rule Extraction (Core + Insert)")
             base_set_for_ts = set(base_words)
-            log_info(f"[S0]    {len(target_words):,} target words  base {len(base_set_for_ts):,}  "
-                     f"min-stem={self.token_strip_min_stem}  "
-                     f"prefix={self.token_strip_max_prefix}  "
-                     f"suffix={self.token_strip_max_suffix}  "
-                     f"leet-amb={self.token_strip_min_leet_amb}")
-            _new_modes_label = yellow('disabled (--token-strip-no-new-modes)') \
-                if self.token_strip_no_new_modes else green('enabled (15 modes)')
-            log_info(f"[S0]    Modes: {_new_modes_label}  "
-                     f"workers: {self.token_strip_workers or mp.cpu_count()}")
+            log_info(f"[S0]    {len(target_words):,} target words  base {len(base_set_for_ts):,}  min-stem={self.token_strip_min_stem}  prefix={self.token_strip_max_prefix}  suffix={self.token_strip_max_suffix}  leet-amb={self.token_strip_min_leet_amb}")
+            log_info(f"[S0]    Workers: {self.token_strip_workers or mp.cpu_count()}")
             ts_all = extract_token_strip_rules(
                 target_words, base_set_for_ts,
                 max_depth=self.max_depth,
@@ -3331,7 +2262,6 @@ class GPUExtractor:
                 max_leet_ambiguity=self.token_strip_min_leet_amb,
                 workers=self.token_strip_workers,
                 chunk_size=self.token_strip_chunk_size,
-                enable_new_modes=not self.token_strip_no_new_modes,
             )
             for r in ts_all:
                 depth = len(r.split())
@@ -3374,28 +2304,17 @@ class GPUExtractor:
         if seed_chains and self.max_depth < 2:
             log_warn(f"[SEED] {len(seed_chains)} chain seed(s) ignored — requires --max-depth >= 2")
 
-        # Clear STAGE 0 index globals
-        global _p0_worker_base_set, _p0_worker_base_by_len, _p0_worker_base_lower_idx
-        global _p0_worker_purge_idx, _p0_worker_substr_idx, _p0_worker_omit_idx
-        global _p0_worker_prefix_idx, _p0_worker_ascii_idx, _p0_worker_overwrite_idx
-        _p0_worker_base_set       = set()
-        _p0_worker_base_by_len    = {}
-        _p0_worker_base_lower_idx = {}
-        _p0_worker_purge_idx      = {}
-        _p0_worker_substr_idx     = {}
-        _p0_worker_omit_idx       = {}
-        _p0_worker_prefix_idx     = {}
-        _p0_worker_ascii_idx      = {}
-        _p0_worker_overwrite_idx  = {}
+        # Clear STAGE 0 globals
+        global _p0_worker_base_set, _p0_worker_base_by_len
+        _p0_worker_base_set = set()
+        _p0_worker_base_by_len = {}
         log_debug("[MEM] STAGE 0 index globals cleared before STAGE 1")
 
-        # Bloom filter on CPU
         log_info("[GPU]  Building bloom filter on CPU …")
         if not self.gpu_engine.compile_kernel(): return all_counts
         bloom_filter = self.gpu_engine.generate_bloom_filter(target_words)
         self.gpu_engine.upload_bloom_filter(bloom_filter)
 
-        # STAGE 1
         log_section("STAGE 1 — Single Rule Search")
         seed_note = f"  ({len(extra_seeds_valid)} from seeds)" if extra_seeds_valid else ""
         log_info(f"[S1]    {len(base_words):,} base words × {len(rules_phase1):,} atomic rules{seed_note}")
@@ -3404,7 +2323,6 @@ class GPUExtractor:
         t1 = time.time()
         all_counts.update(single)
 
-        # STAGE S
         seed_hits = Counter()
         if self.builtin_seeds:
             log_section("STAGE S — Seed Extraction (families A-M)")
@@ -3417,8 +2335,7 @@ class GPUExtractor:
                     n_injected += len(sbd[depth]) - before
                 if n_injected:
                     log_info(f"[SEED]    STAGE 0 injected {bold(cyan(str(n_injected)))} chain(s) into STAGE S sbd")
-            seed_hits = self.gpu_engine.run_seed_extraction_pass(
-                base_words, sbd, bloom_filter, rules_phase1)
+            seed_hits = self.gpu_engine.run_seed_extraction_pass(base_words, sbd, bloom_filter, rules_phase1)
             all_counts.update(seed_hits)
             ts = time.time()
         else:
@@ -3426,22 +2343,18 @@ class GPUExtractor:
             sbd = {}
             ts = t1
 
-        # STAGE 2
         if self.max_depth > 1:
             log_section("STAGE 2 — Rule Chain Search")
             if self.genetic and self.max_depth >= 2:
                 _min_ga_secs    = 120.0
                 _ga_frac        = 0.20
-                _reserved_for_ga = max(_min_ga_secs,
-                                       self.params['TARGET_SECONDS'] * _ga_frac)
+                _reserved_for_ga = max(_min_ga_secs, self.params['TARGET_SECONDS'] * _ga_frac)
             else:
                 _reserved_for_ga = 0.0
             remaining = max(0, self.params['TARGET_SECONDS'] - (ts-t0) - _reserved_for_ga)
             budget    = remaining * self.params['EST_COMBOS_PER_SEC'] * TIME_SAFETY_FACTOR
             depths    = list(range(2, self.max_depth+1))
-            depth_budgets = ({d: int(budget/len(depths)/(len(base_words)*d)) for d in depths}
-                             if budget > 0 and base_words and depths
-                             else {d: 0 for d in depths})
+            depth_budgets = ({d: int(budget/len(depths)/(len(base_words)*d)) for d in depths} if budget > 0 and base_words and depths else {d: 0 for d in depths})
             for d in depths:
                 key = f'depth{d}_override'
                 if key in depth_overrides and depth_overrides[key] is not None:
@@ -3454,14 +2367,10 @@ class GPUExtractor:
                     depth_budgets = {d: int(v*scale) for d,v in depth_budgets.items()}
             for d, bgt in depth_budgets.items():
                 self.params[f'CHAIN_GEN_LIMIT_{d}'] = bgt
-            log_info(f"[S2]    depth 2-{self.max_depth} | " +
-                     " | ".join(f"d{d}:{v:,}" for d,v in depth_budgets.items()))
-            chains = self.gpu_engine.process_all_words_chain_rules(
-                base_words, rules_phase1, self.max_depth, bloom_filter, single,
-                seed_chains=seed_chains, prebuilt_sbd=sbd)
+            log_info(f"[S2]    depth 2-{self.max_depth} | " + " | ".join(f"d{d}:{v:,}" for d,v in depth_budgets.items()))
+            chains = self.gpu_engine.process_all_words_chain_rules(base_words, rules_phase1, self.max_depth, bloom_filter, single, seed_chains=seed_chains, prebuilt_sbd=sbd)
             all_counts.update(chains)
 
-        # STAGE 3
         if self.genetic and self.max_depth >= 2:
             log_section("STAGE 3 — Genetic Algorithm Rule Evolution")
             rule_pool = HashcatRuleValidator.validate_rules_for_gpu(rules_phase1)
@@ -3471,8 +2380,7 @@ class GPUExtractor:
             if self.genetic and self.max_depth >= 2:
                 _min_ga_secs    = 120.0
                 _ga_frac        = 0.20
-                _reserved_for_ga = max(_min_ga_secs,
-                                       self.params['TARGET_SECONDS'] * _ga_frac)
+                _reserved_for_ga = max(_min_ga_secs, self.params['TARGET_SECONDS'] * _ga_frac)
             else:
                 _reserved_for_ga = 0.0
             ga_budget = max(remaining, _reserved_for_ga)
@@ -3492,12 +2400,9 @@ class GPUExtractor:
             all_counts.update(ga_hits)
             new_from_ga = len(all_counts) - before
             n_truly_novel = sum(1 for r in ga_hits if r not in known_rules_set)
-            log_info(f"[S3]    {bold(cyan(str(new_from_ga)))} net new rules from STAGE 3  "
-                     f"({bold(green(str(len(ga_hits))))} total GA hits, "
-                     f"{bold(cyan(str(n_truly_novel)))} genuinely novel)")
+            log_info(f"[S3]    {bold(cyan(str(new_from_ga)))} net new rules from STAGE 3  ({bold(green(str(len(ga_hits))))} total GA hits, {bold(cyan(str(n_truly_novel)))} genuinely novel)")
 
-        validated = Counter({r: c for r,c in all_counts.items()
-                             if HashcatRuleValidator.validate_rule_for_gpu(r)})
+        validated = Counter({r: c for r,c in all_counts.items() if HashcatRuleValidator.validate_rule_for_gpu(r)})
         return validated
 
 # --------------------------------------------------------------------
@@ -3522,7 +2427,7 @@ def load_wordlist(filename: str) -> list:
 # ====================================================================
 def main() -> None:
     global VERBOSE, ALLOW_REJECT_RULES
-    ap = argparse.ArgumentParser(prog='rulest', description='GPU-Compatible Hashcat Rules Engine',
+    ap = argparse.ArgumentParser(prog='rulest', description='GPU-Compatible Hashcat Rules Engine (core token‑strip)',
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('base_wordlist', nargs='?', default=None)
     ap.add_argument('target_wordlist', nargs='?', default=None)
@@ -3546,7 +2451,6 @@ def main() -> None:
     pt.add_argument('--token-strip-min-leet-amb', type=int, default=3, metavar='N')
     pt.add_argument('--token-strip-workers', type=int, default=0, metavar='N')
     pt.add_argument('--token-strip-chunk-size', type=int, default=0, metavar='N')
-    pt.add_argument('--token-strip-no-new-modes', action='store_true')
     ga = ap.add_argument_group('STAGE 3 — Genetic Algorithm')
     ga.add_argument('--genetic', action='store_true')
     ga.add_argument('--genetic-generations', type=int, default=50, metavar='N')
@@ -3568,28 +2472,17 @@ def main() -> None:
 
     log_info(f"  base      : {bold(args.base_wordlist)}")
     log_info(f"  target    : {bold(args.target_wordlist)}")
-    log_info(f"  depth     : {bold(str(args.max_depth))}  |  "
-             f"hours: {bold(str(args.target_hours))}  |  "
-             f"bloom: {bold(str(args.bloom_mb or BLOOM_FILTER_MAX_MB))}MB  "
-             f"{bold(cyan('(on CPU)'))}")
+    log_info(f"  depth     : {bold(str(args.max_depth))}  |  hours: {bold(str(args.target_hours))}  |  bloom: {bold(str(args.bloom_mb or BLOOM_FILTER_MAX_MB))}MB  {bold(cyan('(on CPU)'))}")
     _bs = red('DISABLED (--no-builtin-seeds)') if args.no_builtin_seeds else green('enabled (families A-M)')
     log_info(f"  builtin seeds (STAGE S) : {_bs}")
     if args.token_strip:
         _inj = green('→ STAGE S sbd') if not args.no_builtin_seeds else yellow('→ STAGE 1 only')
-        _ml = green('15 modes') if not args.token_strip_no_new_modes else yellow('5 modes')
-        log_info(f"  {bold(cyan('STAGE 0'))} : {green('CPU exact-match')}  "
-                 f"min-stem={args.token_strip_min_stem}  "
-                 f"prefix={args.token_strip_max_prefix}  "
-                 f"suffix={args.token_strip_max_suffix}  "
-                 f"leet-amb={args.token_strip_min_leet_amb}  "
-                 f"workers={args.token_strip_workers or mp.cpu_count()}  "
-                 f"modes={_ml}  {_inj}")
+        log_info(f"  {bold(cyan('STAGE 0'))} : {green('CPU exact-match (core + insert)')}  min-stem={args.token_strip_min_stem}  prefix={args.token_strip_max_prefix}  suffix={args.token_strip_max_suffix}  leet-amb={args.token_strip_min_leet_amb}  workers={args.token_strip_workers or mp.cpu_count()}  {_inj}")
     if args.seed_rules: log_info(f"  seeds     : {bold(args.seed_rules)}")
     if args.genetic:
         if not 0.0 < args.genetic_elite < 1.0:
             log_error("--genetic-elite must be between 0.0 and 1.0"); sys.exit(1)
         log_info(f"  {bold(green('STAGE 3 GA'))} : pop={args.genetic_pop}  gen={args.genetic_generations}  elite={args.genetic_elite:.0%}")
-    log_info(f"  {bold(cyan('hang fix'))} : bloom on CPU + STAGE 0 indexes freed after pool")
     print()
 
     base_words   = load_wordlist(args.base_wordlist)
@@ -3613,7 +2506,6 @@ def main() -> None:
         token_strip_min_leet_amb  = args.token_strip_min_leet_amb,
         token_strip_workers       = args.token_strip_workers,
         token_strip_chunk_size    = args.token_strip_chunk_size,
-        token_strip_no_new_modes  = args.token_strip_no_new_modes,
     )
     extractor._output_path = args.output
     depth_overrides = {f'depth{i}_override': getattr(args, f'depth{i}_chains') for i in range(2, 11)}
@@ -3633,13 +2525,13 @@ def main() -> None:
 
     si = sorted(final_counts.items(), key=lambda kv: (-kv[1], len(kv[0].split()), kv[0]))
     with open(args.output, 'w', encoding='utf-8') as f:
-        f.write("# rulest — GPU-Compatible Hashcat Rules Engine\n")
+        f.write("# rulest — GPU-Compatible Hashcat Rules Engine (core token‑strip)\n")
         f.write(f"# Generated      : {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write(f"# Base           : {os.path.basename(args.base_wordlist)}\n")
         f.write(f"# Target         : {os.path.basename(args.target_wordlist)}\n")
         f.write(f"# Depth          : 1-{args.max_depth}\n")
         f.write(f"# Bloom          : {args.bloom_mb or BLOOM_FILTER_MAX_MB} MB  (on CPU)\n")
-        f.write(f"# STAGE 0        : overwrite mode ON  GPU-verified candidates\n")
+        f.write(f"# STAGE 0        : core + insert mode  GPU-verified candidates\n")
         if args.genetic:
             f.write(f"# STAGE 3 GA     : pop={args.genetic_pop}  gen={args.genetic_generations}  elite={args.genetic_elite:.0%}\n")
         f.write("#\n")
@@ -3665,8 +2557,7 @@ def main() -> None:
     log_info(f"  Rules removed      : {bold(red(str(removed)))}")
     log_info(f"  Output file        : {bold(args.output)}")
     log_info(cyan(sep))
-    top = sorted([(r,s) for r,s in final_counts.items() if r!=':'],
-                 key=lambda kv: (-kv[1], len(kv[0].split()), kv[0]))[:20]
+    top = sorted([(r,s) for r,s in final_counts.items() if r!=':'], key=lambda kv: (-kv[1], len(kv[0].split()), kv[0]))[:20]
     if top:
         print(); log_info(f"  Top {len(top)} rules by GPU frequency:")
         for i,(r,s) in enumerate(top, 1):
