@@ -1245,6 +1245,49 @@ __kernel void find_rule_chains_gpu(
         }}
     }}
 }}
+
+/* ---------------------------------------------------------------
+ * build_bloom_filter_gpu
+ *
+ * Each work-item processes one word and sets the BLOOM_HASH_FUNCTIONS
+ * bits in the bloom filter using the same FNV-1a pair used by bloom().
+ *
+ * The filter is a flat int32 array (BLOOM_FILTER_SIZE / 32 elements).
+ * Bit `idx` lives at bf[idx/32], bit position idx%32.
+ * atomic_or guarantees race-free writes from all work-items.
+ *
+ * The resulting memory layout (little-endian int32 → viewed as uint8)
+ * is byte-for-byte identical to what generate_bloom_filter() produces,
+ * so the existing byte-level bloom() check kernel is fully compatible.
+ * --------------------------------------------------------------- */
+__kernel void build_bloom_filter_gpu(
+    __global const unsigned char *bw,
+    __global const int *bo,
+    __global const int *bl,
+    const int nw,
+    __global volatile int *bf)
+{{
+    int gid = get_global_id(0);
+    if (gid >= nw) return;
+
+    int wlen = bl[gid];
+    __global const unsigned char *word = bw + bo[gid];
+
+    /* FNV-1a with seed1 */
+    uint h1 = 0xDEADBEEFu ^ 2166136261U;
+    for (int i = 0; i < wlen; i++) {{ h1 ^= word[i]; h1 *= 16777619U; }}
+
+    /* FNV-1a with seed2 */
+    uint h2 = 0xCAFEBABEu ^ 2166136261U;
+    for (int i = 0; i < wlen; i++) {{ h2 ^= word[i]; h2 *= 16777619U; }}
+
+    for (int i = 0; i < BLOOM_HASH_FUNCTIONS; i++) {{
+        uint idx  = (h1 + (uint)i * h2) % (uint)BLOOM_FILTER_SIZE;
+        uint widx = idx >> 5u;            /* idx / 32 */
+        int  mask = (int)(1u << (idx & 31u));  /* 1 << (idx % 32) */
+        atomic_or((__global int*)bf + (int)widx, mask);
+    }}
+}}
 """
 
 # --------------------------------------------------------------------
@@ -1262,6 +1305,7 @@ class GPUEngine:
         self.gpu_rules           = []
         self.kernel_single       = None
         self.kernel_chain        = None
+        self.kernel_bloom        = None
         self._consecutive_errors = 0
         self._MAX_CONSECUTIVE_ERRORS = 5
         self._cached_free_vram   = None
@@ -1343,6 +1387,7 @@ class GPUEngine:
             self.program       = prog
             self.kernel_single = prog.find_single_rules_gpu
             self.kernel_chain  = prog.find_rule_chains_gpu
+            self.kernel_bloom  = prog.build_bloom_filter_gpu
             log_debug("OpenCL kernel compiled successfully")
             return self.program
         except Exception as e:
@@ -1359,7 +1404,7 @@ class GPUEngine:
             t.start()
             t.join(timeout=_RELEASE_TIMEOUT)
         for attr in ('bloom_buf', 'program', 'kernel_single', 'kernel_chain',
-                     'queue', 'context'):
+                     'kernel_bloom', 'queue', 'context'):
             obj = getattr(self, attr, None)
             if obj is not None:
                 _timed_release(obj)
@@ -1426,6 +1471,81 @@ class GPUEngine:
                 idx = (h1 + i*h2) % self.params['BLOOM_FILTER_SIZE']
                 bf[idx//8] |= 1 << (idx%8)
         return bf
+
+    def generate_bloom_filter_gpu(self, target_words: list) -> np.ndarray:
+        """Build the Bloom filter on the GPU using OpenCL atomic_or operations.
+
+        Each work-item handles one word, computing the same two FNV-1a hashes
+        used by the existing bloom() check kernel and atomically ORing the
+        corresponding bits into a flat int32 buffer.  The resulting uint8 view
+        is byte-for-byte identical to what the CPU path produces, so the check
+        kernel needs no changes.
+
+        Falls back transparently to the CPU path on any error.
+        """
+        bsz_bits   = self.params['BLOOM_FILTER_SIZE']
+        bsz_uint32 = bsz_bits // 32      # int32 words in the filter
+        bsz_bytes  = bsz_bits // 8       # bytes in the filter
+        nw         = len(target_words)
+
+        if not self.context or not self.program or not self.kernel_bloom:
+            log_debug("[BLOOM] GPU kernel not ready — falling back to CPU")
+            return self.generate_bloom_filter(target_words)
+
+        log_debug(f"[BLOOM] GPU bloom build: {bsz_bytes//1024//1024}MB, {nw:,} words, "
+                  f"lws={self.local_work_size}")
+        mf   = cl.mem_flags
+        bufs = []
+        try:
+            wf, wo, wl = self._flatten(target_words)
+
+            words_buf   = cl.Buffer(self.context, mf.READ_ONLY  | mf.COPY_HOST_PTR, hostbuf=wf)
+            offsets_buf = cl.Buffer(self.context, mf.READ_ONLY  | mf.COPY_HOST_PTR, hostbuf=wo)
+            lengths_buf = cl.Buffer(self.context, mf.READ_ONLY  | mf.COPY_HOST_PTR, hostbuf=wl)
+            bufs.extend([words_buf, offsets_buf, lengths_buf])
+
+            # Bloom filter as zeroed int32 array (atomic_or needs int* in OpenCL 1.x)
+            bf_init = np.zeros(bsz_uint32, dtype=np.int32)
+            bf_buf  = cl.Buffer(self.context, mf.READ_WRITE | mf.COPY_HOST_PTR, hostbuf=bf_init)
+            bufs.append(bf_buf)
+
+            gs = ((nw + self.local_work_size - 1) // self.local_work_size) * self.local_work_size
+
+            self.kernel_bloom.set_args(
+                words_buf, offsets_buf, lengths_buf,
+                np.int32(nw), bf_buf,
+            )
+            cl.enqueue_nd_range_kernel(
+                self.queue, self.kernel_bloom, (gs,), (self.local_work_size,)
+            )
+
+            if not self._safe_queue_finish():
+                raise RuntimeError("queue.finish() timed out during GPU bloom build")
+
+            # Read back the int32 result and reinterpret as bytes.
+            # On a little-endian host (x86 / ARM) the byte ordering is:
+            #   bf_int32[k] byte[0..3]  ↔  bf_bytes[4k..4k+3]
+            # which matches the bit layout expected by bloom() in the check kernel.
+            bf_result = np.empty(bsz_uint32, dtype=np.int32)
+            cl.enqueue_copy(self.queue, bf_result, bf_buf)
+            self._safe_queue_finish()
+
+            bf_bytes = bf_result.view(np.uint8).copy()   # .copy() ensures C-contiguous
+            assert len(bf_bytes) == bsz_bytes, (
+                f"Bloom byte length mismatch: {len(bf_bytes)} != {bsz_bytes}"
+            )
+            log_debug(f"[BLOOM] GPU bloom build done — "
+                      f"{int(np.count_nonzero(bf_bytes)):,} non-zero bytes")
+            return bf_bytes
+
+        except Exception as exc:
+            log_warn(f"[BLOOM] GPU bloom build failed ({exc}) — falling back to CPU")
+            return self.generate_bloom_filter(target_words)
+
+        finally:
+            for b in bufs:
+                try: b.release()
+                except Exception: pass
 
     def upload_bloom_filter(self, bf):
         mf = cl.mem_flags
@@ -2310,9 +2430,9 @@ class GPUExtractor:
         _p0_worker_base_by_len = {}
         log_debug("[MEM] STAGE 0 index globals cleared before STAGE 1")
 
-        log_info("[GPU]  Building bloom filter on CPU …")
+        log_info("[GPU]  Building bloom filter on GPU …")
         if not self.gpu_engine.compile_kernel(): return all_counts
-        bloom_filter = self.gpu_engine.generate_bloom_filter(target_words)
+        bloom_filter = self.gpu_engine.generate_bloom_filter_gpu(target_words)
         self.gpu_engine.upload_bloom_filter(bloom_filter)
 
         log_section("STAGE 1 — Single Rule Search")
@@ -2472,7 +2592,7 @@ def main() -> None:
 
     log_info(f"  base      : {bold(args.base_wordlist)}")
     log_info(f"  target    : {bold(args.target_wordlist)}")
-    log_info(f"  depth     : {bold(str(args.max_depth))}  |  hours: {bold(str(args.target_hours))}  |  bloom: {bold(str(args.bloom_mb or BLOOM_FILTER_MAX_MB))}MB  {bold(cyan('(on CPU)'))}")
+    log_info(f"  depth     : {bold(str(args.max_depth))}  |  hours: {bold(str(args.target_hours))}  |  bloom: {bold(str(args.bloom_mb or BLOOM_FILTER_MAX_MB))}MB  {bold(cyan('(GPU-accelerated)'))}")
     _bs = red('DISABLED (--no-builtin-seeds)') if args.no_builtin_seeds else green('enabled (families A-M)')
     log_info(f"  builtin seeds (STAGE S) : {_bs}")
     if args.token_strip:
@@ -2530,7 +2650,7 @@ def main() -> None:
         f.write(f"# Base           : {os.path.basename(args.base_wordlist)}\n")
         f.write(f"# Target         : {os.path.basename(args.target_wordlist)}\n")
         f.write(f"# Depth          : 1-{args.max_depth}\n")
-        f.write(f"# Bloom          : {args.bloom_mb or BLOOM_FILTER_MAX_MB} MB  (on CPU)\n")
+        f.write(f"# Bloom          : {args.bloom_mb or BLOOM_FILTER_MAX_MB} MB  (GPU-accelerated, CPU fallback)\n")
         f.write(f"# STAGE 0        : core + insert mode  GPU-verified candidates\n")
         if args.genetic:
             f.write(f"# STAGE 3 GA     : pop={args.genetic_pop}  gen={args.genetic_generations}  elite={args.genetic_elite:.0%}\n")
