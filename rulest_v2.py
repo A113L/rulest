@@ -92,7 +92,7 @@ BANNER = f"""{green(bold('''
  ██╔══██╗██║   ██║██║     ██═══╝  ╚════██║   ██║
  ██║  ██║╚██████╔╝███████╗███████╗███████║   ██║
  ╚═╝  ╚═╝ ╚═════╝ ╚══════╝╚══════╝╚══════╝   ╚═╝'''))}{C.END}
-  {dim('GPU-Compatible Hashcat Rules Engine (core token‑strip)')}
+  {dim('GPU-Compatible Hashcat Rules Engine')}
   {dim('github.com/A113L/rulest')}
 """
 
@@ -1557,7 +1557,7 @@ class GPUEngine:
 
             log_debug(f"[BLOOM] GPU bloom build done — "
                       f"{n_set:,} / {bsz_uint32:,} int32 words non-zero "
-                      f"({n_set*100//bsz_uint32}% fill)")
+                      f"({n_set * 3200 / bsz_bits:.2f}% bit fill)")
             return bf_bytes
 
         except Exception as exc:
@@ -2708,3 +2708,4 @@ def main() -> None:
 
 if __name__ == '__main__':
     main()
+
