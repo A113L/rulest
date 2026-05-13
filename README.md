@@ -1086,6 +1086,3 @@ MIT
 ## Credits
 
 https://github.com/synacktiv/rulesfinder
-
-
-https://github.com/synacktiv/rulesfinder
