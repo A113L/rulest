@@ -64,8 +64,8 @@ A complete redesign built around GPU efficiency, Hashcat compatibility, and inte
  
 **Key capabilities:**
 - ✅ Full **Hashcat GPU rule validation** (max 31 ops, correct argument types)
-- ✅ **Bloom filter** on-GPU for fast membership testing with configurable false-positive rate
-- ✅ **Phase 0 — Token-Strip Rule Extraction** (`--token-strip`): optional CPU pre-pass running **6 extraction modes** across every target word with full multiprocessing support (`--token-strip-workers`); decomposes passwords into base stem + rule chain using letter, digit, reverse, delete-edge, dup/fold modes (original five) plus insert (`iNX`); single-rule discoveries feed Phase 1; multi-rule chains are injected into Phase S and Phase 2
+- ✅ **Bloom filter built on GPU** — the filter is constructed entirely on-device using an OpenCL `atomic_or` kernel (`build_bloom_filter_gpu`), then reused in-place for all membership tests; CPU fallback activates automatically on any GPU error
+- ✅ **Phase 0 — Token-Strip Rule Extraction** (`--token-strip`): optional CPU pre-pass running **6 extraction modes** across every target word with full multiprocessing support (`--token-strip-workers`); decomposes passwords into base stem + rule chain using letter, digit, reverse, delete-edge, dup/fold, and insert (`iNX`) modes; single-rule discoveries feed Phase 1; multi-rule chains are injected into Phase S and Phase 2
 - ✅ **Four-phase extraction**: token-strip pre-pass (Phase 0) → single-rule sweep (Phase 1) → built-in seed pass (Phase S) → informed chain generation (Phase 2)
 - ✅ **Built-in seed families** (A–M): thirteen deterministically generated seed families covering numeric prefixes/suffixes, mixed prepend/append, transform+digit combos, date patterns, special-character append/prepend/transform/combo patterns, leet substitutions, double-transform chains, special-before-digit patterns, and leet+transform combos — run by default as a dedicated extraction pass, independent of `--max-depth` and the random-chain time budget; can be skipped with `--no-builtin-seeds`
 - ✅ **Signature-based functional minimization**: removes functionally equivalent rules post-GPU using a deterministic probe set, keeping only the highest-frequency representative per equivalence class
@@ -108,7 +108,7 @@ Three root-cause bugs that caused Phase 3 to produce identical results with and 
 | **Built-in seed families** | ❌ Not implemented | ✅ Thirteen families (A–M): numeric prepend/append, mixed, transform+digit, date patterns, special-char append/prepend/transform/combo (F–I), leet substitutions (J), double-transform chains (K), special-before-digit (L), leet+transform (M); run by default as a dedicated pass independent of `--max-depth`; disable with `--no-builtin-seeds` |
 | **Token-strip pre-pass** | ❌ Not implemented | ✅ Phase 0 (`--token-strip`): **6 extraction modes** with multiprocessing; new flags: `--token-strip-workers`, `--token-strip-chunk-size` |
 | **Genetic algorithm** | ❌ Not implemented | ✅ Optional Phase 3 (`--genetic`): novelty-weighted evolutionary search (2× fitness bonus for chains not yet in known_rules) with dedicated time reservation (20 % of `--target-hours`, min 120 s) and stagnation-triggered population refresh; discovers deep-chain patterns that random Phase 2 sampling misses |
-| **Target lookup** | Python `set` (host RAM, per-result) | 16–256 MB Bloom filter uploaded once to GPU VRAM (FNV-1a, 4 hash functions) |
+| **Target lookup** | Python `set` (host RAM, per-result) | Bloom filter built **on GPU** (`build_bloom_filter_gpu`, `atomic_or` kernel), uploaded once to VRAM; CPU fallback on error; 16–256 MB, FNV-1a, 4 hash functions |
 | **Chain state** | Temp `.tmp` files on disk per depth | In-memory, GPU buffer-based with proper release and `gc.collect()` |
 | **Memory management** | Halve batch on OOM, no VRAM awareness | Dynamic sizing based on actual free VRAM estimate + 55% usage safety factor |
 | **Hit counting** | ❌ Not implemented | ✅ Full `Counter`-based frequency tracking, sorted output |
@@ -240,19 +240,21 @@ usage: rulest.py -w WORDLIST [-b BASE_WORDLIST] [-d CHAIN_DEPTH]
 │  │                                               │  │
 │  │  Phase 0 ────────▶  TokenStripExtractor       │  │
 │  │  (--token-strip;     CPU-only  ·  optional;   │  │
-│  │   default off;       6 modes, MP workers;    │  │
+│  │   default off;       6 modes, MP workers;     │  │
 │  │   runs pre-GPU)      singles → Phase 1 atoms; │  │
 │  │                      chains  → Ph.S + Ph.2    │  │
 │  │                                               │  │
 │  │  ┌─────────────┐    ┌───────────────────────┐ │  │
 │  │  │ Bloom Filter│    │  OpenCL Kernel        │ │  │
-│  │  │ (16–256 MB  │    │  ┌─────────────────┐  │ │  │
-│  │  │  VRAM)      │    │  │find_single_rules│  │ │  │
-│  │  └─────────────┘    │  ├─────────────────┤  │ │  │
-│  │                     │  │find_rule_chains │  │ │  │
-│  │  Phase 1 ────────▶  │  └─────────────────┘  │ │  │
-│  │  (all words ×       └───────────────────────┘ │  │
-│  │   single rules)                               │  │
+│  │  │ (16–256 MB  │◀───│  ┌───────────────────┐│ │  │
+│  │  │  VRAM)      │    │  │build_bloom_filter ││ │  │
+│  │  │ built on GPU│    │  │  (atomic_or)      ││ │  │
+│  │  │ CPU fallback│    │  ├───────────────────┤│ │  │
+│  │  └─────────────┘    │  │find_single_rules  ││ │  │
+│  │                     │  ├───────────────────┤│ │  │
+│  │  Phase 1 ────────▶  │  │find_rule_chains   ││ │  │
+│  │  (all words ×       │  └───────────────────┘│ │  │
+│  │   single rules)     └───────────────────────┘ │  │
 │  │                                               │  │
 │  │  Phase S ────────▶  Built-in seed families    │  │
 │  │  (Families A–M;      direct extraction pass,  │  │
@@ -278,16 +280,16 @@ usage: rulest.py -w WORDLIST [-b BASE_WORDLIST] [-d CHAIN_DEPTH]
  
 **Phase 0 — Token-Strip Rule Extraction** *(optional, `--token-strip`)*
 
-A CPU-only pre-pass running **14 extraction modes** with multiprocessing. Seven inverted indexes are built once in the main process and inherited by all workers via CoW fork (zero serialization on Linux/macOS; passed via `initargs` on Windows/spawn).
+A CPU-only pre-pass running **6 extraction modes** with multiprocessing. The base wordlist is loaded into a shared set that worker processes inherit via CoW fork (zero serialization on Linux/macOS; passed via `initargs` on Windows/spawn).
 
-Original 5 modes: letter (case + leet + boundary ops), digit (digit-stem with dynamic boundary), reverse (`r` prefix), delete-edge (`[`/`]` prefix), dup/fold (`d`/`f`), insert (`iNX`).
+The 6 modes are: letter (case + leet + boundary ops), digit (digit-stem with dynamic boundary), reverse (`r` prefix), delete-edge (`[`/`]` prefix), dup/fold (`d`/`f`), and insert (`iNX`).
 
-Validated single-rule discoveries are merged into Phase 1's atomic rule pool; multi-rule chains are injected into Phase S's seed-by-depth table and forwarded to Phase 2. Use `--token-strip-no-new-modes` to restrict to the original 5 modes; `--token-strip-workers` controls parallelism.
+Validated single-rule discoveries are merged into Phase 1's atomic rule pool; multi-rule chains are injected into Phase S's seed-by-depth table and forwarded to Phase 2.
 
 See [Phase 0 — Token-Strip Rule Extraction](#-phase-0--token-strip-rule-extraction) for full details.
 
 **Phase 1 — Single Rule Sweep**
-All base words are processed against every GPU-compatible single rule in parallel. The Bloom filter (built from the entire target wordlist and uploaded once) allows near-zero-cost hit detection on-device using FNV-1a hashing with 4 independent hash functions. Results feed a `Counter` of rule → hit frequency.
+All base words are processed against every GPU-compatible single rule in parallel. The Bloom filter is built entirely on-device by `build_bloom_filter_gpu` — an OpenCL kernel where each work-item hashes one word with two FNV-1a seeds and atomically sets the corresponding bits using `atomic_or`. The result is left in VRAM and reused by all subsequent phases without re-uploading. Near-zero-cost hit detection then uses 4 independent hash functions per candidate. Results feed a `Counter` of rule → hit frequency.
  
 **Phase S — Built-in Seed Extraction**
 A dedicated extraction pass that runs the thirteen built-in seed families (A–M) through the GPU chain kernel. This phase runs by default, regardless of `--max-depth` and the random-chain time budget; it can be disabled with `--no-builtin-seeds`. Depth-1 seeds are skipped (already covered by Phase 1); all multi-rule seed chains at depths 2 and above are tested directly against the Bloom filter. The prebuilt seed families are then forwarded to Phase 2 as scaffolding atoms to avoid regeneration and double-counting. See [Built-in Seed Families (A–M)](#-built-in-seed-families) for a full description.
@@ -307,8 +309,12 @@ An evolutionary search that runs after Phase 2. A dedicated budget of **20 % of 
 After all phases complete, every candidate rule is applied to the built-in probe set in pure Python. Rules producing identical outputs on all probe words are grouped; only the highest-GPU-hit representative per group survives. See [Functional Minimization](#-functional-minimization) for details.
  
 ### Bloom Filter
- 
-The on-GPU Bloom filter uses FNV-1a hashing with two seeds (`0xDEADBEEF` and `0xCAFEBABE`) and 4 hash functions, sized between **16 MB** (low-VRAM devices < 4 GB) and **256 MB** (default max; override with `--bloom-mb`). Size scales logarithmically with combined wordlist size.
+
+The Bloom filter is built **on the GPU** by `build_bloom_filter_gpu`, a dedicated OpenCL kernel compiled alongside the rule-application kernels. Each work-item processes one target word: it computes the same two FNV-1a hashes (`0xDEADBEEF` / `0xCAFEBABE` seeds) used by the check path and atomically sets the corresponding bits with `atomic_or` on a flat `int32` buffer. Atomicity guarantees race-free writes from all concurrent work-items. The resulting buffer is reinterpreted as a `uint8` array (little-endian bit layout is identical to the CPU path) and kept in VRAM for all membership tests.
+
+If the GPU build fails for any reason (context not ready, allocation error, `queue.finish` timeout), `generate_bloom_filter_gpu` silently falls back to the CPU path so the run continues uninterrupted.
+
+Filter size ranges from **16 MB** (low-VRAM devices < 4 GB) to **256 MB** (default max; override with `--bloom-mb`). Size scales logarithmically with combined wordlist size, and the FPR is logged at startup with a warning if it exceeds 1 %.
  
 ### VRAM Management
  
@@ -524,9 +530,9 @@ Phase 0 is an optional **CPU-only pre-pass** activated by `--token-strip`. It ru
 
 ### Extraction Modes
 
-Phase 0 runs **6 extraction modes** per target word. The original 6 modes are always active
+Phase 0 runs **6 extraction modes** per target word:
 
-#### Original 6 modes
+#### The 6 modes
 
 | Mode | Hashcat rules | Trigger | Description |
 |---|---|---|---|
@@ -569,7 +575,7 @@ When the cased middle segment can be expressed by a single compact operator (`u`
 
 ### Algorithm
 
-For each target word, every `(prefix_len, suffix_len)` split within the configured bounds is tried (letter/digit/reverse/delete-edge modes). The v1.1 modes use index lookups instead of exhaustive splits:
+For each target word, every `(prefix_len, suffix_len)` split within the configured bounds is tried (letter/digit/reverse/delete-edge modes):
 
 1. The boundary prefix/suffix must consist entirely of digits and common special characters. Scanning stops as soon as a non-boundary character is encountered.
 2. The middle segment is leet-decoded: ambiguous chars like `1` (→ `i` or `l`) are branched exhaustively up to `--token-strip-min-leet-amb` positions.
@@ -837,18 +843,17 @@ These constants are defined at the top of `rulest_v2.py` and can be tuned for ad
 `rulest_output.txt` (or your specified `-o` path):
  
 ```
-# rulest — GPU-Compatible Hashcat Rules Engine
+# rulest — GPU-Compatible Hashcat Rules Engine (core token‑strip)
 # Generated      : 2025-08-01 14:32:07
 # Base           : rockyou.txt
 # Target         : target_plain.txt
 # Depth          : 1–3
-# Bloom          : 256 MB
-# Phase 0 TS     : enabled  modes=14  workers=16  min-stem=4  leet-amb=3
-# Phase 3 GA     : enabled  pop=200  gen=50  elite=15%
+# Bloom          : 256 MB  (GPU-accelerated, CPU fallback)
+# STAGE 0        : core + insert mode  GPU-verified candidates
+# STAGE 3 GA     : pop=200  gen=50  elite=15%
 #
-# GPU raw candidates      : 9,214  (bloom hits, includes false positives)
-# Post-processing         : signature-based minimization
-#   Path                  : in-memory  (threshold 500,000)
+# GPU raw candidates      : 9,214
+# Minimization            : in-memory  (threshold 500,000)
 #   Probe words           : 37  (built-in)
 #   Equiv. rules removed  : 4,393
 #
@@ -887,7 +892,8 @@ sa@ $0
 | Reduce terminal noise | Set `VERBOSE = False` in the script header or omit `--debug` |
 | Increase hot-rule aggressiveness | Raise `HOT_RULE_RATIO` toward `1.0` (reduces random exploration) |
 | Enable token-strip pre-pass | Add `--token-strip` — most effective when the target wordlist contains structured transformations (leet speak, capitalized words, boundary digits) |
-| Speed up Phase 0 | Add `--token-strip-no-new-modes` to restrict to the original 5 modes; or lower `--token-strip-max-prefix` / `--token-strip-max-suffix` |
+| Maximize Phase 0 coverage | Use larger `--token-strip-max-prefix` / `--token-strip-max-suffix` (e.g. `6`) and raise `--token-strip-min-leet-amb` for targets with heavy leet encoding |
+| Speed up Phase 0 | Lower `--token-strip-max-prefix` / `--token-strip-max-suffix`; reduce `--token-strip-min-leet-amb` |
 | Tune Phase 0 parallelism | `--token-strip-workers N` — default 0 uses all cores; set to 1 to force single-process; tune `--token-strip-chunk-size` for progress granularity vs dispatch overhead |
 | Tune token-strip leet scope | Raise `--token-strip-min-leet-amb` (e.g. `5`) to decode more ambiguous leet chars at the cost of more branching |
 | Enable evolutionary search | Add `--genetic` with `--max-depth 3` or higher — Phase 3 adds no value at depth 2 since Phase 2 already covers it exhaustively |
@@ -1000,7 +1006,7 @@ python rulest_v2.py rockyou.txt target.txt --max-depth 5 --target-hours 4.0 \
  
 **Token-strip pre-pass — extract rules from structured target wordlist:**
 ```bash
-# Phase 0 scans the target using all 14 modes (default)
+# Phase 0 runs all 6 modes (letter, digit, reverse, delete-edge, dup/fold, insert)
 # and injects verified chains into Phase 1, Phase S, and Phase 2
 python rulest_v2.py rockyou.txt target.txt \
   --token-strip \
@@ -1008,9 +1014,8 @@ python rulest_v2.py rockyou.txt target.txt \
   -o with_token_strip.txt
 ```
 
-**Token-strip — use all CPU cores, default 6-mode extraction:**
+**Token-strip — explicit worker count:**
 ```bash
-# Skip v1.1 modes (insert, swap, range, char-dup, ascii, truncate, purge, repeat, sep-title)
 python rulest_v2.py rockyou.txt target.txt \
   --token-strip \
   --token-strip-workers 8 \
@@ -1032,14 +1037,14 @@ python rulest_v2.py rockyou.txt target.txt \
   -o extended_leet.txt
 ```
 
-**Benchmark Phase 0 contribution and mode impact:**
+**Benchmark Phase 0 contribution:**
 ```bash
 # Without token-strip — baseline
 python rulest_v2.py base.txt target.txt --max-depth 3 --target-hours 1.0 -o no_ts.txt
 
-# With token-strip, 6 modes
+# With token-strip
 python rulest_v2.py base.txt target.txt --max-depth 3 --target-hours 1.0 \
-  --token-strip -o with_ts_6modes.txt
+  --token-strip -o with_ts.txt
 ```
 
 **Skip built-in seed families (Phase S disabled):**
@@ -1079,5 +1084,8 @@ python rulest_v2.py base.txt target.txt --max-depth 3 --target-hours 2.0 \
 MIT
  
 ## Credits
+
+https://github.com/synacktiv/rulesfinder
+
 
 https://github.com/synacktiv/rulesfinder
