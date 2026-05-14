@@ -35,7 +35,7 @@ Falls back transparently to the CPU path on any driver or context error.
 
 - STAGE 0 → words/sec (CPU workers)
 - STAGE 1 → combos/sec = words_processed × total_rules / elapsed
-- SEEDPASS / STAGE 2 → combos/sec = accumulated (words × chains) / elapsed
+-  / STAGE 2 → combos/sec = accumulated (words × chains) / elapsed
 - STAGE 3 GA → combos/sec = (pop_size × base_words × generations) / elapsed
 - Minimization (both in‑memory and disk‑backed) → rules/sec
 - Human‑readable speed formatting – Added _fmt_speed() helper that auto‑scales to K/M/G (e.g., 12.3M combos/s).
@@ -300,7 +300,8 @@ MAX_HASHCAT_CHAIN    = 31
 
 VRAM_USAGE_FACTOR    = 0.55
 BLOOM_HASH_FUNCTIONS = 4
-BLOOM_FILTER_MAX_MB  = 256
+# Default fallback if no device info available
+DEFAULT_BLOOM_MB = 128
 
 BASELINE_COMBOS_PER_SEC         = 120_000_000
 LOW_END_COMPUTE_UNITS_THRESHOLD = 20
@@ -1198,7 +1199,19 @@ def get_max_allocation(device):
     except: return 1024**3
 
 # --------------------------------------------------------------------
-# Dynamic parameters (unchanged)
+# Automatic bloom size based on VRAM
+# --------------------------------------------------------------------
+def get_auto_bloom_mb(free_vram_gb: float) -> int:
+    """Return recommended bloom filter size in MB based on free VRAM."""
+    if free_vram_gb >= 8.0:
+        return 512
+    elif free_vram_gb >= 4.0:
+        return 128
+    else:
+        return 64
+
+# --------------------------------------------------------------------
+# Dynamic parameters (unchanged except bloom sizing and removed warnings)
 # --------------------------------------------------------------------
 def calculate_dynamic_parameters(base_count, target_count, device=None,
                                   target_hours=0.5, bloom_mb_override=None):
@@ -1237,28 +1250,24 @@ def calculate_dynamic_parameters(base_count, target_count, device=None,
 
     vram_scale = max(0.25, min(1.0, vgb / 8.0))
     ts         = target_hours * 3600
-    eff_bloom  = bloom_mb_override or BLOOM_FILTER_MAX_MB
+
+    # Automatic bloom size if not overridden
+    if bloom_mb_override is not None and bloom_mb_override > 0:
+        eff_bloom = bloom_mb_override
+    else:
+        eff_bloom = get_auto_bloom_mb(vgb)
+        log_debug(f"[BLOOM] Auto bloom size: {eff_bloom} MB (VRAM: {vgb:.1f} GB)")
+
     bsize_b    = eff_bloom * 1024 * 1024
-    _LOW_VRAM_BLOOM_CAP_MB = 32
-    if vgb < 4 and bsize_b > _LOW_VRAM_BLOOM_CAP_MB * 1024 * 1024:
-        if bloom_mb_override:
-            log_warn(
-                f"VRAM ~{vgb:.1f}GB < 4GB — bloom filter {eff_bloom}MB may not fit alongside "
-                f"GPU buffers. If the program crashes, try --bloom-mb {_LOW_VRAM_BLOOM_CAP_MB}."
-            )
-        else:
-            bsize_b = _LOW_VRAM_BLOOM_CAP_MB * 1024 * 1024
-            log_debug(f"[BLOOM] VRAM ~{vgb:.1f}GB < 4GB, brak --bloom-mb → cap do {_LOW_VRAM_BLOOM_CAP_MB}MB")
     bloom_bits = bsize_b * 8
 
     if target_count > 0:
         fill = 1.0 - math.exp(-BLOOM_HASH_FUNCTIONS * target_count / bloom_bits)
         fpr  = fill ** BLOOM_HASH_FUNCTIONS
-        msg  = (f"Bloom: {bsize_b//1024//1024}MB, fill={fill:.3%}, FPR~{fpr:.6%}"
-                + (" ← HIGH, raise --bloom-mb" if fpr > 0.01 else ""))
-        log_debug(msg)
+        msg  = f"Bloom: {bsize_b//1024//1024}MB, fill={fill:.3%}, FPR~{fpr:.6%}"
         if fpr > 0.01:
-            log_warn(f"Bloom filter FPR {fpr:.3%} is high — consider --bloom-mb {eff_bloom*2}")
+            log_warn(f"Bloom filter FPR {fpr:.3%} is high — consider using --bloom-mb with a larger value (e.g. {eff_bloom*2} MB)")
+        log_debug(msg)
 
     params = {
         'BLOOM_FILTER_SIZE'         : bloom_bits,
@@ -2122,7 +2131,7 @@ class GPUEngine:
         wsb = self.params['WORD_SUB_BATCH']
         n_batches = (len(multi_seeds) + cbs - 1) // cbs
         _sp_t0 = time.time(); _sp_accum_combos = 0
-        with tqdm(total=n_batches, desc=green("  SEEDPASS"), unit="batch", ncols=88,
+        with tqdm(total=n_batches, desc=green("  "), unit="batch", ncols=88,
                   bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}") as pbar:
             for ci in range(0, len(multi_seeds), cbs):
                 _kb.check_pause()
@@ -2895,7 +2904,7 @@ def main() -> None:
 
     log_info(f"  base      : {bold(args.base_wordlist)}")
     log_info(f"  target    : {bold(args.target_wordlist)}")
-    log_info(f"  depth     : {bold(str(args.max_depth))}  |  hours: {bold(str(args.target_hours))}  |  bloom: {bold(str(args.bloom_mb or BLOOM_FILTER_MAX_MB))}MB  {bold(cyan('(GPU-accelerated)'))}")
+    log_info(f"  depth     : {bold(str(args.max_depth))}  |  hours: {bold(str(args.target_hours))}  |  bloom: {bold(str(args.bloom_mb or 'auto'))}MB  {bold(cyan('(GPU-accelerated)'))}")
     _bs = red('DISABLED (--no-builtin-seeds)') if args.no_builtin_seeds else green('enabled (families A-M)')
     log_info(f"  builtin seeds (STAGE S) : {_bs}")
     if args.token_strip:
@@ -2958,7 +2967,8 @@ def main() -> None:
         f.write(f"# Base           : {os.path.basename(args.base_wordlist)}\n")
         f.write(f"# Target         : {os.path.basename(args.target_wordlist)}\n")
         f.write(f"# Depth          : 1-{args.max_depth}\n")
-        f.write(f"# Bloom          : {args.bloom_mb or BLOOM_FILTER_MAX_MB} MB  (GPU-accelerated, CPU fallback)\n")
+        bloom_mb = args.bloom_mb if args.bloom_mb > 0 else "auto"
+        f.write(f"# Bloom          : {bloom_mb} MB  (GPU-accelerated, CPU fallback)\n")
         f.write(f"# STAGE 0        : core + insert mode  GPU-verified candidates\n")
         if args.genetic:
             f.write(f"# STAGE 3 GA     : pop={args.genetic_pop}  gen={args.genetic_generations}  elite={args.genetic_elite:.0%}\n")
@@ -2991,7 +3001,7 @@ def main() -> None:
     if top:
         print(); log_info(f"  Top {len(top)} rules by GPU frequency:")
         for i,(r,s) in enumerate(top, 1):
-            log_info(f"  {dim(str(i).rjust(3)+'.')} {dim(f'd={len(r.split())}')}  {r:<42s}  {cyan(str(s))}")
+            log_info(f"  {dim(str(i).rjust(3)+'.')}  {dim(f'd={len(r.split())}')}  {r:<42s}  {cyan(str(s))}")
     print()
 
 if __name__ == '__main__':
