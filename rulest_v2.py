@@ -2,16 +2,29 @@
 """
 rulest — GPU-Compatible Hashcat Rules Engine
 ====================================================================
-Stripped version: only 5 basic token‑strip modes + insert mode.
+# Stripped version: only 5 basic token‑strip modes + insert mode.
 All extra modes (swap, range, char‑duplicate, ascii‑transform, truncate,
 purge, repeat, separator‑title, overwrite) have been removed.
 
-Main changes:
+# Main changes:
 - No --token-strip-no-new-modes flag.
 - No extra indexes (purge, substr, omit, prefix, ascii, overwrite) are built.
 - Worker processes only call letter, digit, reverse, delete‑edge, duplicate,
   and insert extraction functions.
 - Insert mode is kept (--max-depth >= 2).
+
+# GPU Bloom filter build – Bloom filter construction is now fully GPU‑accelerated using atomic_or in OpenCL, dramatically reducing setup time for large target wordlists. Falls back to CPU if the device does not support global atomics.
+
+# Speed indicators in progress bars – All major stages now show average throughput:
+
+- STAGE 0 → words/sec (CPU workers)
+- STAGE 1 → combos/sec = words_processed × total_rules / elapsed
+- SEEDPASS / STAGE 2 → combos/sec = accumulated (words × chains) / elapsed
+- STAGE 3 GA → combos/sec = (pop_size × base_words × generations) / elapsed
+- Minimization (both in‑memory and disk‑backed) → rules/sec
+- Human‑readable speed formatting – Added _fmt_speed() helper that auto‑scales to K/M/G (e.g., 12.3M combos/s).
+
+# Improved startup hint – The pause (p), resume (r), and early‑quit (q) key instructions are now displayed more prominently. display it well formatted in codeblock
 """
 
 import os
@@ -34,6 +47,19 @@ import gc
 import datetime
 import multiprocessing as mp
 import threading
+import shutil
+
+# Platform keyboard helpers (best-effort; silently disabled if unavailable)
+try:
+    import tty as _tty, termios as _termios, select as _select
+    _HAS_TERMIOS = True
+except ImportError:
+    _HAS_TERMIOS = False
+try:
+    import msvcrt as _msvcrt
+    _HAS_MSVCRT = True
+except ImportError:
+    _HAS_MSVCRT = False
 
 # ================== GLOBAL FLAGS ===================
 VERBOSE            = False   # set by --debug
@@ -41,6 +67,145 @@ ALLOW_REJECT_RULES = False   # set by --allow-reject-rules
 # ==================================================
 
 os.environ['PYOPENCL_COMPILER_OUTPUT'] = '0'
+
+# ====================================================================
+# --- SPEED FORMATTER ---
+# ====================================================================
+def _fmt_speed(value: float, unit: str = "") -> str:
+    """Format a speed value (e.g., 12345 -> '12.3K').
+    Unit is appended after scaling (e.g., 'words' -> '12.3K words/s')."""
+    if value < 1000:
+        return f"{value:.1f} {unit}/s"
+    elif value < 1_000_000:
+        return f"{value/1000:.1f}K {unit}/s"
+    elif value < 1_000_000_000:
+        return f"{value/1_000_000:.1f}M {unit}/s"
+    else:
+        return f"{value/1_000_000_000:.1f}G {unit}/s"
+
+# ====================================================================
+# --- KEYBOARD CONTROLLER (p=pause  r=resume  q=early-quit) ---
+# ====================================================================
+class KeyboardController:
+    """Non-blocking keyboard listener for pause / resume / early-quit.
+
+    Runs in a daemon thread.  Silently disabled when stdin is not a tty
+    or when neither termios (Unix) nor msvcrt (Windows) is available.
+
+    Controls
+    --------
+    p  — pause between batches (prints status, blocks until r or q)
+    r  — resume after pause
+    q  — request early exit; current results are saved & minimized
+    """
+
+    def __init__(self) -> None:
+        self._paused  = False
+        self._quit    = False
+        self._lock    = threading.Lock()
+        self._thread: Optional[threading.Thread] = None
+        self._active  = False
+
+    # ── public API ────────────────────────────────────────────────────
+
+    def start(self) -> None:
+        if not sys.stdin.isatty():
+            return
+        if not (_HAS_TERMIOS or _HAS_MSVCRT):
+            return
+        self._active = True
+        self._thread = threading.Thread(target=self._reader, daemon=True,
+                                        name='kb-listener')
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._active = False
+
+    def check_pause(self) -> None:
+        """Block the calling thread while paused.  Returns immediately otherwise."""
+        while True:
+            with self._lock:
+                if not self._paused or self._quit:
+                    return
+            time.sleep(0.15)
+
+    @property
+    def quit_requested(self) -> bool:
+        with self._lock:
+            return self._quit
+
+    @property
+    def is_paused(self) -> bool:
+        with self._lock:
+            return self._paused
+
+    # ── internals ─────────────────────────────────────────────────────
+
+    def _handle(self, ch: str) -> None:
+        ch = ch.lower()
+        if ch == 'p':
+            with self._lock:
+                if self._quit:
+                    return
+                self._paused = True
+            w = min(max(shutil.get_terminal_size((80, 24)).columns - 2, 44), 92)
+            print(f"\n{yellow('─' * w)}")
+            print(f"{yellow('│')} {bold('PAUSED')}  —  press {bold(green('r'))} to resume  |  {bold(yellow('q'))} to save current results & quit")
+            print(f"{yellow('─' * w)}")
+        elif ch == 'r':
+            with self._lock:
+                if not self._paused:
+                    return
+                self._paused = False
+            w = min(max(shutil.get_terminal_size((80, 24)).columns - 2, 44), 92)
+            print(f"\n{green('─' * w)}")
+            print(f"{green('│')} {bold('RESUMED')}")
+            print(f"{green('─' * w)}\n")
+        elif ch == 'q':
+            with self._lock:
+                already = self._quit
+                self._quit   = True
+                self._paused = False   # unblock if currently paused
+            if not already:
+                w = min(max(shutil.get_terminal_size((80, 24)).columns - 2, 44), 92)
+                print(f"\n{yellow('─' * w)}")
+                print(f"{yellow('│')} {bold(yellow('EARLY EXIT REQUESTED'))}  —  finishing current batch then saving results …")
+                print(f"{yellow('─' * w)}\n")
+
+    def _reader_termios(self) -> None:
+        fd  = sys.stdin.fileno()
+        old = _termios.tcgetattr(fd)
+        try:
+            _tty.setcbreak(fd)          # keeps OPOST → \n still becomes \r\n
+            while self._active:
+                if _select.select([sys.stdin], [], [], 0.15)[0]:
+                    ch = sys.stdin.read(1)
+                    self._handle(ch)
+        except Exception:
+            pass
+        finally:
+            try:
+                _termios.tcsetattr(fd, _termios.TCSADRAIN, old)
+            except Exception:
+                pass
+
+    def _reader_msvcrt(self) -> None:
+        while self._active:
+            if _msvcrt.kbhit():
+                ch = _msvcrt.getwch()
+                self._handle(ch)
+            else:
+                time.sleep(0.05)
+
+    def _reader(self) -> None:
+        if _HAS_TERMIOS:
+            self._reader_termios()
+        elif _HAS_MSVCRT:
+            self._reader_msvcrt()
+
+
+_kb = KeyboardController()
+
 
 # ====================================================================
 # --- COLORS ---
@@ -76,11 +241,11 @@ def log_error(msg: str) -> None:
     print(red(f"[ERROR] {msg}"))
 
 def log_section(title: str) -> None:
-    if VERBOSE:
-        bar = '─' * 56
-        print(f"\n{cyan(bar)}")
-        print(f"{cyan('│')} {bold(title)}")
-        print(f"{cyan(bar)}")
+    w   = min(max(shutil.get_terminal_size((80, 24)).columns - 2, 44), 92)
+    bar = '─' * w
+    print(f"\n{cyan(bar)}")
+    print(f"{cyan('│')} {bold(title.upper())}")
+    print(f"{cyan(bar)}")
 
 # ====================================================================
 # --- BANNER ---
@@ -433,13 +598,17 @@ def minimize_by_signature(rule_counter: Counter, probe_words: List[str]) -> Coun
     log_info(f"[MINIMIZE] Probe words : {bold(str(len(probe_words)))}")
     if n > MINIMIZE_DISK_THRESHOLD:
         log_info(f"[MINIMIZE] {cyan(f'{n:,} rules exceeds threshold {MINIMIZE_DISK_THRESHOLD:,}')} — using {bold('disk-backed')} SQLite path")
+        log_debug(f"[MINIMIZE] Disk path chosen: {n:,} rules > threshold {MINIMIZE_DISK_THRESHOLD:,}")
         return _minimize_disk(rule_counter, probe_words)
     else:
+        log_debug(f"[MINIMIZE] In-memory path chosen: {n:,} rules ≤ threshold {MINIMIZE_DISK_THRESHOLD:,}")
         return _minimize_mem(rule_counter, probe_words)
 
 def _minimize_mem(rule_counter: Counter, probe_words: List[str]) -> Counter:
     sig_map: Dict[tuple, List[Tuple[str, int]]] = defaultdict(list)
     rule_items = list(rule_counter.items())
+    start_time = time.time()
+    processed = 0
     with tqdm(total=len(rule_items), desc=green("  Minimizing"), unit="rule", ncols=88,
               bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}") as pbar:
         n_groups = 0
@@ -447,8 +616,10 @@ def _minimize_mem(rule_counter: Counter, probe_words: List[str]) -> Counter:
             sig = compute_rule_signature(rule, probe_words)
             sig_map[sig].append((rule, gpu_count))
             n_groups = len(sig_map)
+            processed += 1
             pbar.update(1)
-            pbar.set_postfix({"unique_sigs": cyan(str(n_groups))}, refresh=False)
+            speed = processed / (time.time() - start_time) if processed > 5 else 0
+            pbar.set_postfix({"unique_sigs": cyan(str(n_groups)), "speed": _fmt_speed(speed, "rules")}, refresh=False)
     def _group_key(item: Tuple[str, int]) -> tuple:
         rule, gpu_count = item
         return (-gpu_count, len(rule.split()), rule)
@@ -497,6 +668,8 @@ def _minimize_disk(rule_counter: Counter, probe_words: List[str]) -> Counter:
         n_total = len(rule_items)
         batch: List[Tuple[str, str, int, int]] = []
         log_info(f"[MINIMIZE] Temp DB     : {dim(tmp_path)}")
+        start_time = time.time()
+        processed = 0
         with tqdm(total=n_total, desc=green("  Minimizing"), unit="rule", ncols=88,
                   bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}") as pbar:
             for rule, count in rule_items:
@@ -508,14 +681,16 @@ def _minimize_disk(rule_counter: Counter, probe_words: List[str]) -> Counter:
                 if len(batch) >= MINIMIZE_DISK_BATCH_SIZE:
                     conn.executemany(_UPSERT, batch)
                     conn.commit()
-                    n_committed = len(batch)
+                    processed += len(batch)
                     batch.clear()
                     (n_sigs,) = conn.execute('SELECT COUNT(*) FROM sig_best').fetchone()
-                    pbar.set_postfix({"unique_sigs": cyan(str(n_sigs))}, refresh=False)
+                    speed = processed / (time.time() - start_time) if processed > 5 else 0
+                    pbar.set_postfix({"unique_sigs": cyan(str(n_sigs)), "speed": _fmt_speed(speed, "rules")}, refresh=False)
                     pbar.update(MINIMIZE_DISK_BATCH_SIZE)
             if batch:
                 conn.executemany(_UPSERT, batch)
                 conn.commit()
+                processed += len(batch)
                 pbar.update(len(batch))
         survivors = Counter()
         (n_sigs,) = conn.execute('SELECT COUNT(*) FROM sig_best').fetchone()
@@ -894,12 +1069,17 @@ def extract_token_strip_rules(target_words: List[str], base_set: Set[str],
     else:
         pool_kw = dict(processes=n_workers, initializer=_worker_init_p0,
                        initargs=(base_set, base_by_len))
+    start_time = time.time()
+    processed_words = 0
     with ctx.Pool(**pool_kw) as pool:
         with tqdm(total=n_words, desc=green("  STAGE 0 "), unit="word", ncols=88,
                   bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}") as pbar:
             for task_arg, chunk_result in zip(task_args, pool.imap_unordered(_process_chunk_p0, task_args)):
                 found |= chunk_result
-                pbar.set_postfix({"rules": cyan(str(len(found)))}, refresh=False)
+                processed_words += len(task_arg[0])
+                elapsed = time.time() - start_time
+                speed = processed_words / elapsed if elapsed > 0 else 0
+                pbar.set_postfix({"rules": cyan(str(len(found))), "speed": _fmt_speed(speed, "words")}, refresh=False)
                 pbar.update(len(task_arg[0]))
     _p0_worker_base_set = set()
     _p0_worker_base_by_len = {}
@@ -1009,16 +1189,32 @@ def calculate_dynamic_parameters(base_count, target_count, device=None,
                                   target_hours=0.5, bloom_mb_override=None):
     if device:
         try:
-            mwgs = device.get_info(cl.device_info.MAX_WORK_GROUP_SIZE)
-            mcu  = device.get_info(cl.device_info.MAX_COMPUTE_UNITS)
-            fv   = estimate_free_vram(device)
-            vgb  = fv / 1024**3
-            isn  = 'NVIDIA' in device.get_info(cl.device_info.NAME).upper()
-            lws  = max(s for s in POSSIBLE_WORK_GROUP_SIZES if s <= mwgs)
+            mwgs    = device.get_info(cl.device_info.MAX_WORK_GROUP_SIZE)
+            mcu     = device.get_info(cl.device_info.MAX_COMPUTE_UNITS)
+            mhz     = device.get_info(cl.device_info.MAX_CLOCK_FREQUENCY)   # MHz
+            fv      = estimate_free_vram(device)
+            vgb     = fv / 1024**3
+            name_up = device.get_info(cl.device_info.NAME).upper()
+            isn     = 'NVIDIA' in name_up
+            lws     = max(s for s in POSSIBLE_WORK_GROUP_SIZES if s <= mwgs)
             if isn and mcu >= 38: lws = min(512, lws)
-            est  = (LOW_END_COMBOS_PER_SEC if mcu < LOW_END_COMPUTE_UNITS_THRESHOLD
-                    else BASELINE_COMBOS_PER_SEC)
-            log_debug(f"GPU: CU={mcu}, VRAM~{vgb:.1f}GB, WGS={lws}, est={est//1_000_000}M combos/s")
+
+            # Dynamic throughput estimate: CU × clock × base_rate × arch_factor
+            # Calibrated so that 40 CU @ 1500 MHz → 120 M/s (= BASELINE_COMBOS_PER_SEC)
+            # and 20 CU @ 1000 MHz → 40 M/s (= LOW_END_COMBOS_PER_SEC).
+            _BASE_RATE = 2_000   # combos/s per (CU · MHz)
+            if isn:
+                _arch = 1.5   # NVIDIA: wider warps, stronger int pipelines
+            elif 'AMD' in name_up or 'RADEON' in name_up or 'GFX' in name_up:
+                _arch = 1.2
+            elif 'INTEL' in name_up:
+                _arch = 0.7
+            else:
+                _arch = 1.0
+            est = max(5_000_000, min(2_000_000_000, int(mcu * mhz * _BASE_RATE * _arch)))
+
+            log_debug(f"GPU: CU={mcu}, MHz={mhz}, VRAM~{vgb:.1f}GB, WGS={lws}, "
+                      f"arch_factor={_arch}, est={est//1_000_000}M combos/s")
         except Exception:
             lws = 256; est = BASELINE_COMBOS_PER_SEC; mcu = 38; fv = 2*1024**3; vgb = 2.0
     else:
@@ -1040,7 +1236,7 @@ def calculate_dynamic_parameters(base_count, target_count, device=None,
         if fpr > 0.01:
             log_warn(f"Bloom filter FPR {fpr:.3%} is high — consider --bloom-mb {eff_bloom*2}")
 
-    return {
+    params = {
         'BLOOM_FILTER_SIZE'         : bloom_bits,
         'WORDS_PER_BATCH'           : max(1000, int(BASE_WORDS_PER_BATCH  * vram_scale)),
         'CHAINS_PER_BATCH'          : max(500,  int(BASE_CHAINS_PER_BATCH * vram_scale)),
@@ -1054,6 +1250,16 @@ def calculate_dynamic_parameters(base_count, target_count, device=None,
         'vram_scale'                : vram_scale,
         'free_vram'                 : fv,
     }
+    log_debug(
+        f"[PARAMS] bloom={bloom_bits//8//1024//1024}MB  "
+        f"words_batch={params['WORDS_PER_BATCH']:,}  "
+        f"chains_batch={params['CHAINS_PER_BATCH']:,}  "
+        f"word_sub={params['WORD_SUB_BATCH']:,}  "
+        f"max_results={params['MAX_SAFE_RESULTS_PER_BATCH']:,}  "
+        f"lws={lws}  est={est//1_000_000}M/s  "
+        f"target={ts:.0f}s  vram_scale={vram_scale:.2f}"
+    )
+    return params
 
 # --------------------------------------------------------------------
 # GPU-compatible rules generator (unchanged)
@@ -1300,7 +1506,7 @@ __kernel void build_bloom_filter_gpu(
 """
 
 # --------------------------------------------------------------------
-# GPU Engine (unchanged except minor logging)
+# GPU Engine (modified: quiet kernel logs, compilation dots restored)
 # --------------------------------------------------------------------
 class GPUEngine:
     def __init__(self, params):
@@ -1352,8 +1558,11 @@ class GPUEngine:
             self._refresh_cached_limits()
             vram_gb = self._cached_free_vram / 1024**3
             log_info(f"[GPU]  {bold(self.device.name.strip())}")
+            _cl_ver  = self.device.get_info(cl.device_info.VERSION)
+            _drv_ver = self.device.get_info(cl.device_info.DRIVER_VERSION)
             log_debug(f"       WGS={self.local_work_size}, VRAM~{vram_gb:.1f}GB, "
-                      f"CU={self.device.get_info(cl.device_info.MAX_COMPUTE_UNITS)}")
+                      f"CU={self.device.get_info(cl.device_info.MAX_COMPUTE_UNITS)}, "
+                      f"OpenCL={_cl_ver.strip()}, driver={_drv_ver.strip()}")
             return True
         except Exception as e:
             log_error(f"GPU init failed: {e}"); return False
@@ -1385,6 +1594,7 @@ class GPUEngine:
             t = threading.Thread(target=_build, daemon=True)
             t.start()
             print("[GPU]  Compiling OpenCL kernel ", end='', flush=True)
+            # Print a dot every 10 seconds (original behavior)
             while t.is_alive():
                 t.join(timeout=10)
                 if t.is_alive():
@@ -1471,7 +1681,8 @@ class GPUEngine:
     def generate_bloom_filter(self, target_words):
         bsz = self.params['BLOOM_FILTER_SIZE'] // 8
         bf  = np.zeros(bsz, dtype=np.uint8)
-        log_debug(f"Building bloom filter: {bsz//1024//1024}MB for {len(target_words):,} words")
+        log_debug(f"[BLOOM] CPU bloom build: {bsz//1024//1024}MB for {len(target_words):,} words")
+        _t_bloom = time.time()
         for w in tqdm(target_words, desc=green("  Bloom filter"), unit="word", ncols=88,
                       leave=False, bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}]"):
             wb = w.encode('latin-1')
@@ -1479,6 +1690,7 @@ class GPUEngine:
             for i in range(BLOOM_HASH_FUNCTIONS):
                 idx = (h1 + i*h2) % self.params['BLOOM_FILTER_SIZE']
                 bf[idx//8] |= 1 << (idx%8)
+        log_debug(f"[BLOOM] CPU bloom build done in {time.time()-_t_bloom:.1f}s")
         return bf
 
     def generate_bloom_filter_gpu(self, target_words: list) -> np.ndarray:
@@ -1622,21 +1834,35 @@ class GPUEngine:
         log_debug(f"STAGE 1: {len(base_words):,} words × {len(self.gpu_rules):,} rules")
         counter = Counter()
         bs      = self.params['WORDS_PER_BATCH']
+        n_rules = len(self.gpu_rules)
+        total_combos = 0
+        start_time = time.time()
         with tqdm(total=len(base_words), desc=green("  STAGE 1 "), unit="word", ncols=88,
                   bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}") as pbar:
             for i in range(0, len(base_words), bs):
+                _kb.check_pause()
+                if _kb.quit_requested:
+                    log_warn("[S1]    Early exit — stopping STAGE 1")
+                    break
                 batch = base_words[i:i+bs]
                 if batch:
                     found = self._run_single_kernel(self.prepare_words_data(batch))
                     if found:
                         self._consecutive_errors = 0
                         counter.update(found)
-                        pbar.set_postfix({"rules": cyan(str(len(counter)))}, refresh=False)
                     elif self.queue is None:
                         self._consecutive_errors += 1
                         if self._consecutive_errors >= self._MAX_CONSECUTIVE_ERRORS:
                             log_warn(f"[GPU] {self._consecutive_errors} consecutive failures — aborting STAGE 1")
                             break
+                processed_words = i + len(batch)
+                elapsed = time.time() - start_time
+                combos = processed_words * n_rules
+                if elapsed > 0:
+                    speed = combos / elapsed
+                    pbar.set_postfix({"rules": cyan(str(len(counter))), "speed": _fmt_speed(speed, "combos")}, refresh=False)
+                else:
+                    pbar.set_postfix({"rules": cyan(str(len(counter)))}, refresh=False)
                 pbar.update(len(batch))
         gc.collect()
         log_info(f"[S1]    {bold(green(str(len(counter))))} unique rules passed bloom filter")
@@ -1651,6 +1877,8 @@ class GPUEngine:
             bb=B(bd['words_flat']); bbo=B(bd['word_offsets']); bbl=B(bd['word_lengths'])
             rb, rbo, rbl = self._get_rules_buffers(mf)
             outs = self.safe_output_buffer_size(bd['num_words'], bd['num_rules'])
+            # Quiet: removed log_debug for output buffer size
+            # log_debug(f"[S1-K] output_buf={outs} slots  ({bd['num_words']} words × {bd['num_rules']} rules)")
             fo = cl.Buffer(self.context, mf.WRITE_ONLY, outs*MAX_CHAIN_STRING_LEN); bufs.append(fo)
             fc = cl.Buffer(self.context, mf.READ_WRITE, 4);                         bufs.append(fc)
             cl.enqueue_copy(self.queue, fc, np.array([0], dtype=np.int32))
@@ -1665,6 +1893,8 @@ class GPUEngine:
             cnt = np.zeros(1, dtype=np.int32)
             cl.enqueue_copy(self.queue, cnt, fc)
             n = min(cnt[0], outs); out = []
+            # Quiet: removed log_debug for GPU returned hits
+            # log_debug(f"[S1-K] GPU returned {int(cnt[0])} hit(s) (cap={outs}  → {n} decoded)")
             if n > 0:
                 data = np.zeros(n*MAX_CHAIN_STRING_LEN, dtype=np.uint8)
                 cl.enqueue_copy(self.queue, data, fo)
@@ -1875,9 +2105,15 @@ class GPUEngine:
         cbs = self.params['CHAINS_PER_BATCH']
         wsb = self.params['WORD_SUB_BATCH']
         n_batches = (len(multi_seeds) + cbs - 1) // cbs
-        with tqdm(total=n_batches, desc=green("  SeedPass"), unit="batch", ncols=88,
+        total_combos = 0
+        start_time = time.time()
+        with tqdm(total=n_batches, desc=green("  SEEDPASS"), unit="batch", ncols=88,
                   bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}") as pbar:
             for ci in range(0, len(multi_seeds), cbs):
+                _kb.check_pause()
+                if _kb.quit_requested:
+                    log_warn("[SEED]  Early exit — stopping seed pass")
+                    break
                 cb = multi_seeds[ci:ci + cbs]
                 for wi in range(0, len(base_words), wsb):
                     wb = base_words[wi:wi + wsb]
@@ -1886,6 +2122,7 @@ class GPUEngine:
                         if found:
                             self._consecutive_errors = 0
                             counter.update(found)
+                            total_combos += len(wb) * len(cb)
                         elif self.queue is None:
                             self._consecutive_errors += 1
                     if not self._safe_queue_finish():
@@ -1894,7 +2131,9 @@ class GPUEngine:
                     log_warn(f"[GPU] {self._consecutive_errors} consecutive failures — aborting seed pass")
                     break
                 pbar.update(1)
-                pbar.set_postfix({"hits": cyan(str(len(counter)))}, refresh=False)
+                elapsed = time.time() - start_time
+                speed = total_combos / elapsed if elapsed > 0 else 0
+                pbar.set_postfix({"hits": cyan(str(len(counter))), "speed": _fmt_speed(speed, "combos")}, refresh=False)
         log_info(f"[SEED]    {bold(green(str(len(counter))))} unique seed chains passed bloom filter")
         return counter
 
@@ -1905,6 +2144,7 @@ class GPUEngine:
         if not valid: return []
         found_s = set(single_found.keys()) if single_found else set()
         hot     = [r for r in valid if r in found_s]
+        log_debug(f"[S2]    generate_informed_chains: {len(valid)} valid rules, {len(hot)} hot rules from STAGE 1")
         chains  = set(valid)
         n_user_direct = 0
         if seed_chains:
@@ -1939,9 +2179,15 @@ class GPUEngine:
         cbs     = self.params['CHAINS_PER_BATCH']
         wsb     = self.params['WORD_SUB_BATCH']
         n_batches = (len(chains)+cbs-1)//cbs
+        total_combos = 0
+        start_time = time.time()
         with tqdm(total=n_batches, desc=green("  STAGE 2 "), unit="batch", ncols=88,
                   bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}") as pbar:
             for ci in range(0, len(chains), cbs):
+                _kb.check_pause()
+                if _kb.quit_requested:
+                    log_warn("[S2]    Early exit — stopping STAGE 2")
+                    break
                 cb = chains[ci:ci+cbs]
                 for wi in range(0, len(base_words), wsb):
                     wb = base_words[wi:wi+wsb]
@@ -1950,6 +2196,7 @@ class GPUEngine:
                         if found:
                             self._consecutive_errors = 0
                             counter.update(found)
+                            total_combos += len(wb) * len(cb)
                         elif self.queue is None:
                             self._consecutive_errors += 1
                     if not self._safe_queue_finish():
@@ -1958,13 +2205,17 @@ class GPUEngine:
                     log_warn(f"[GPU] {self._consecutive_errors} consecutive failures — aborting STAGE 2")
                     break
                 pbar.update(1)
-                pbar.set_postfix({"rules": cyan(str(len(counter)))}, refresh=False)
+                elapsed = time.time() - start_time
+                speed = total_combos / elapsed if elapsed > 0 else 0
+                pbar.set_postfix({"rules": cyan(str(len(counter))), "speed": _fmt_speed(speed, "combos")}, refresh=False)
         gc.collect()
         log_info(f"[S2]    {bold(green(str(len(counter))))} unique chain rules passed bloom filter")
         return counter
 
     def _run_chain_kernel(self, words, chains):
         seqs = []; depths = []
+        # Quiet: removed log_debug for _run_chain_kernel
+        # log_debug(f"[S2-K] _run_chain_kernel: {len(words)} words × {len(chains)} chains  max_depth={self.params['MAX_CHAIN_DEPTH']}")
         for chain in chains:
             parts = chain.split()
             depths.append(len(parts))
@@ -1997,6 +2248,8 @@ class GPUEngine:
             cnt = np.zeros(1, dtype=np.int32)
             cl.enqueue_copy(self.queue, cnt, fc)
             n = min(cnt[0], outs); out = []
+            # Quiet: removed log_debug for GPU returned hits
+            # log_debug(f"[S2-K] GPU returned {int(cnt[0])} hit(s) (cap={outs}  → {n} decoded)")
             if n > 0:
                 data = np.zeros(n*MAX_CHAIN_STRING_LEN, dtype=np.uint8)
                 cl.enqueue_copy(self.queue, data, fo)
@@ -2015,7 +2268,7 @@ class GPUEngine:
                 except: pass
 
 # ====================================================================
-# --- STAGE 3 — GENETIC ALGORITHM RULE EVOLVER (unchanged) ---
+# --- STAGE 3 — GENETIC ALGORITHM RULE EVOLVER (unchanged except speed) ---
 # ====================================================================
 class GeneticRuleEvolver:
     def __init__(
@@ -2235,14 +2488,22 @@ class GeneticRuleEvolver:
         log_info(f"[S3]    pop={self.pop_size}  max_gen={generations}  elite={self.elite_frac:.0%}  budget={time_budget:.0f}s  pool={len(self.rule_pool):,} rules  known={len(self.known_rules):,}")
         pop = self.initial_population(hot_rules)
         last_gen = 0
+        n_base_words = len(self.base_words)
+        total_combos = 0
+        start_time = time.time()
         with tqdm(total=generations, desc=green("  STAGE 3 "), unit="gen", ncols=88,
                   bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}") as pbar:
             for gen in range(generations):
                 last_gen = gen
+                _kb.check_pause()
+                if _kb.quit_requested:
+                    log_debug(f"[S3]    Early exit at generation {gen} — stopping GA")
+                    break
                 if time.time() - t_start >= time_budget:
                     log_debug(f"[S3]    Time budget exhausted at generation {gen}.")
                     break
                 raw_map = self.evaluate_population(pop)
+                total_combos += self.pop_size * n_base_words
                 new_sigs = self._update_sig_registry(raw_map)
                 n_novel_this_gen = 0
                 for chain_str, raw_hits in raw_map.items():
@@ -2279,7 +2540,9 @@ class GeneticRuleEvolver:
                     pop = keep_top + refresh_chains
                     pop = pop[:self.pop_size]
                     pbar.update(1)
-                    pbar.set_postfix({"best": cyan(str(best_score)), "new": cyan(str(len(all_new))), "sigs": cyan(str(len(self._sig_to_best))), "stag": yellow("REFRESH")}, refresh=False)
+                    elapsed = time.time() - start_time
+                    speed = total_combos / elapsed if elapsed > 0 else 0
+                    pbar.set_postfix({"best": cyan(str(best_score)), "new": cyan(str(len(all_new))), "sigs": cyan(str(len(self._sig_to_best))), "speed": _fmt_speed(speed, "combos"), "stag": yellow("REFRESH")}, refresh=False)
                     continue
                 elites = [list(ind) for ind, _ in fitness_list[:n_elite]]
                 next_pop = list(elites)
@@ -2320,7 +2583,9 @@ class GeneticRuleEvolver:
                         next_set.add(ind)
                 pop = next_pop[:self.pop_size]
                 pbar.update(1)
-                pbar.set_postfix({"best": cyan(str(best_score)), "new": cyan(str(len(all_new))), "sigs": cyan(str(len(self._sig_to_best)))}, refresh=False)
+                elapsed = time.time() - start_time
+                speed = total_combos / elapsed if elapsed > 0 else 0
+                pbar.set_postfix({"best": cyan(str(best_score)), "new": cyan(str(len(all_new))), "sigs": cyan(str(len(self._sig_to_best))), "speed": _fmt_speed(speed, "combos")}, refresh=False)
         elapsed = time.time() - t_start
         n_chains = len(all_new)
         n_sig_classes = len(self._sig_to_best)
@@ -2368,14 +2633,20 @@ class GPUExtractor:
     def load_seed_rules(self):
         if not self.seed_rules_file: return []
         seeds = []
+        rejected = 0
         try:
+            log_debug(f"[SEED] Loading seed rules from: {self.seed_rules_file}")
             with open(self.seed_rules_file, 'r', encoding='latin-1') as f:
                 for line in f:
                     line = line.strip('\n\r')
                     if line and not line.startswith('#'):
                         if self.validator.validate_rule_for_gpu(line):
                             seeds.append(line)
+                        else:
+                            rejected += 1
             log_info(f"[SEED] Loaded {bold(str(len(seeds)))} seed rules")
+            if rejected:
+                log_debug(f"[SEED] Rejected {rejected} invalid/GPU-incompatible seed rule(s)")
         except Exception as e:
             log_warn(f"Seed rules load failed: {e}")
         return seeds
@@ -2383,18 +2654,19 @@ class GPUExtractor:
     def extract_rules(self, base_words, target_words, **depth_overrides):
         all_counts = Counter()
         rules      = self.rules_gen.generate_gpu_compatible_rules()
+        log_debug(f"[RULES] {len(rules):,} GPU-compatible atomic rules generated")
         ts_rules_singles: List[str] = []
         ts_rules_chains:  List[str] = []
         ts_sbd: Dict[int, set]      = defaultdict(set)
         ts_extra_singles: List[str] = []
         builtin_set = set(rules)
         all_seeds   = self.load_seed_rules()
+        log_debug(f"[RULES] Seed rules after load: {len(all_seeds)} (builtin_seeds={self.builtin_seeds}, token_strip={self.token_strip})")
 
         if self.token_strip:
             log_section("STAGE 0 — Token-Strip Rule Extraction (Core + Insert)")
             base_set_for_ts = set(base_words)
             log_info(f"[S0]    {len(target_words):,} target words  base {len(base_set_for_ts):,}  min-stem={self.token_strip_min_stem}  prefix={self.token_strip_max_prefix}  suffix={self.token_strip_max_suffix}  leet-amb={self.token_strip_min_leet_amb}")
-            log_info(f"[S0]    Workers: {self.token_strip_workers or mp.cpu_count()}")
             ts_all = extract_token_strip_rules(
                 target_words, base_set_for_ts,
                 max_depth=self.max_depth,
@@ -2463,10 +2735,11 @@ class GPUExtractor:
         t0 = time.time()
         single = self.gpu_engine.process_all_words_single_rule(base_words, rules_phase1, bloom_filter)
         t1 = time.time()
+        log_debug(f"[S1]    Elapsed: {t1-t0:.1f}s  ({len(single)} unique rules so far)")
         all_counts.update(single)
 
         seed_hits = Counter()
-        if self.builtin_seeds:
+        if self.builtin_seeds and not _kb.quit_requested:
             log_section("STAGE S — Seed Extraction (families A-M)")
             sbd = self.gpu_engine.build_numeric_seed_families(max_depth=self.max_depth)
             if ts_sbd:
@@ -2481,11 +2754,14 @@ class GPUExtractor:
             all_counts.update(seed_hits)
             ts = time.time()
         else:
-            log_info(f"[SEED]    {yellow('Skipped')} (--no-builtin-seeds)")
+            if _kb.quit_requested:
+                log_warn("[SEED]    Skipped — early exit requested")
+            else:
+                log_info(f"[SEED]    {yellow('Skipped')} (--no-builtin-seeds)")
             sbd = {}
             ts = t1
 
-        if self.max_depth > 1:
+        if self.max_depth > 1 and not _kb.quit_requested:
             log_section("STAGE 2 — Rule Chain Search")
             if self.genetic and self.max_depth >= 2:
                 _min_ga_secs    = 120.0
@@ -2513,7 +2789,7 @@ class GPUExtractor:
             chains = self.gpu_engine.process_all_words_chain_rules(base_words, rules_phase1, self.max_depth, bloom_filter, single, seed_chains=seed_chains, prebuilt_sbd=sbd)
             all_counts.update(chains)
 
-        if self.genetic and self.max_depth >= 2:
+        if self.genetic and self.max_depth >= 2 and not _kb.quit_requested:
             log_section("STAGE 3 — Genetic Algorithm Rule Evolution")
             rule_pool = HashcatRuleValidator.validate_rules_for_gpu(rules_phase1)
             hot_rules = [r for r, _ in sorted(single.items(), key=lambda kv: -kv[1])]
@@ -2631,6 +2907,11 @@ def main() -> None:
     target_words = load_wordlist(args.target_wordlist)
     print()
 
+    _kb.start()
+    if sys.stdin.isatty() and (_HAS_TERMIOS or _HAS_MSVCRT):
+        log_info(dim(f"  keys: {bold('p')}=pause  {bold('r')}=resume  {bold('q')}=save & quit early"))
+        print()
+
     t_start   = time.time()
     extractor = GPUExtractor(
         len(base_words), len(target_words), args.max_depth,
@@ -2652,7 +2933,10 @@ def main() -> None:
     extractor._output_path = args.output
     depth_overrides = {f'depth{i}_override': getattr(args, f'depth{i}_chains') for i in range(2, 11)}
     raw_counts = extractor.extract_rules(base_words, target_words, **depth_overrides)
+    _kb.stop()
     del target_words; gc.collect()
+    if _kb.quit_requested:
+        log_warn("[QUIT]  Early exit — saving partial results")
     log_info(f"\n[GPU]  Raw bloom-filter candidates: {bold(cyan(str(len(raw_counts))))}"); print()
 
     final_counts = minimize_by_signature(raw_counts, BUILTIN_PROBES)
@@ -2690,7 +2974,9 @@ def main() -> None:
             if r != ':': f.write(f"{r}\n")
     log_info(f"[OUT]  Minimized rules written to: {bold(args.output)}")
 
-    elapsed = time.time() - t_start; sep = '─'*56; print()
+    elapsed = time.time() - t_start
+    sep = '─' * min(max(shutil.get_terminal_size((80, 24)).columns - 2, 44), 92)
+    print()
     log_info(cyan(sep))
     log_info(f"  {bold('DONE')}  rulest finished in {bold(f'{elapsed:.1f}s')}")
     log_info(cyan(sep))
@@ -2708,4 +2994,3 @@ def main() -> None:
 
 if __name__ == '__main__':
     main()
-
