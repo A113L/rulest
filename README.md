@@ -246,7 +246,7 @@ usage: rulest.py -w WORDLIST [-b BASE_WORDLIST] [-d CHAIN_DEPTH]
 │  │                                               │  │
 │  │  ┌─────────────┐    ┌───────────────────────┐ │  │
 │  │  │ Bloom Filter│    │  OpenCL Kernel        │ │  │
-│  │  │ (16–256 MB  │◀───│  ┌───────────────────┐│ │  │
+│  │  │ (64–512 MB  │◀───│  ┌───────────────────┐│ │  │
 │  │  │  VRAM)      │    │  │build_bloom_filter ││ │  │
 │  │  │ built on GPU│    │  │  (atomic_or)      ││ │  │
 │  │  │ CPU fallback│    │  ├───────────────────┤│ │  │
@@ -314,7 +314,7 @@ The Bloom filter is built **on the GPU** by `build_bloom_filter_gpu`, a dedicate
 
 If the GPU build fails for any reason (context not ready, allocation error, `queue.finish` timeout), `generate_bloom_filter_gpu` silently falls back to the CPU path so the run continues uninterrupted.
 
-Filter size ranges from **16 MB** (low-VRAM devices < 4 GB) to **256 MB** (default max; override with `--bloom-mb`). Size scales logarithmically with combined wordlist size, and the FPR is logged at startup with a warning if it exceeds 1 %.
+Filter size ranges from **64 MB** (low-VRAM devices < 4 GB) to **512 MB** (default max; override with `--bloom-mb`). Size scales logarithmically with combined wordlist size, and the FPR is logged at startup with a warning if it exceeds 1 %.
  
 ### VRAM Management
  
