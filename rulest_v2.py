@@ -1224,8 +1224,17 @@ def calculate_dynamic_parameters(base_count, target_count, device=None,
     vram_scale = max(0.25, min(1.0, vgb / 8.0))
     ts         = target_hours * 3600
     eff_bloom  = bloom_mb_override or BLOOM_FILTER_MAX_MB
-    bsize_b    = min(1024*1024*eff_bloom*2, eff_bloom*1024*1024)
-    if vgb < 4: bsize_b = min(bsize_b, 32*1024*1024)
+    bsize_b    = eff_bloom * 1024 * 1024
+    _LOW_VRAM_BLOOM_CAP_MB = 32
+    if vgb < 4 and bsize_b > _LOW_VRAM_BLOOM_CAP_MB * 1024 * 1024:
+        if bloom_mb_override:
+            log_warn(
+                f"VRAM ~{vgb:.1f}GB < 4GB — bloom filter {eff_bloom}MB may not fit alongside "
+                f"GPU buffers. If the program crashes, try --bloom-mb {_LOW_VRAM_BLOOM_CAP_MB}."
+            )
+        else:
+            bsize_b = _LOW_VRAM_BLOOM_CAP_MB * 1024 * 1024
+            log_debug(f"[BLOOM] VRAM ~{vgb:.1f}GB < 4GB, brak --bloom-mb → cap do {_LOW_VRAM_BLOOM_CAP_MB}MB")
     bloom_bits = bsize_b * 8
 
     if target_count > 0:
@@ -2093,7 +2102,7 @@ class GPUEngine:
         cbs = self.params['CHAINS_PER_BATCH']
         wsb = self.params['WORD_SUB_BATCH']
         n_batches = (len(multi_seeds) + cbs - 1) // cbs
-        with tqdm(total=n_batches, desc=green("  SeedPass"), unit="batch", ncols=88,
+        with tqdm(total=n_batches, desc=green("  SEEDPASS"), unit="batch", ncols=88,
                   bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}") as pbar:
             for ci in range(0, len(multi_seeds), cbs):
                 _kb.check_pause()
