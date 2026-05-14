@@ -2,7 +2,7 @@
 """
 rulest — GPU-Compatible Hashcat Rules Engine
 ====================================================================
-# Stripped version: only 5 basic token‑strip modes + insert mode.
+Stripped version: only 5 basic token‑strip modes + insert mode.
 All extra modes (swap, range, char‑duplicate, ascii‑transform, truncate,
 purge, repeat, separator‑title, overwrite) have been removed.
 
@@ -13,7 +13,23 @@ purge, repeat, separator‑title, overwrite) have been removed.
   and insert extraction functions.
 - Insert mode is kept (--max-depth >= 2).
 
-# GPU Bloom filter build – Bloom filter construction is now fully GPU‑accelerated using atomic_or in OpenCL, dramatically reducing setup time for large target wordlists. Falls back to CPU if the device does not support global atomics.
+# Bloom Filter — GPU Build (build_bloom_filter_gpu)
+
+Previously the Bloom filter was always built on the CPU: every target word was
+hashed twice in Python and the corresponding bits were set one at a time in a
+NumPy byte array.  For large target wordlists (hundreds of thousands of words)
+this was the single slowest part of startup.
+The filter is now built entirely on the GPU via a dedicated OpenCL kernel
+(build_bloom_filter_gpu).  Each work-item handles one word — computing the
+same pair of FNV-1a hashes used by the membership-check kernel — and atomically
+ORs the resulting bits into a flat int32 buffer using atomic_or.  The
+uint8 view read back from the device is byte-for-byte identical to the CPU
+output, so the check kernel required no changes.
+A plain zeroed int32 array is used as the backing buffer (rather than uchar)
+because OpenCL 1.x atomic_or requires a 32-bit pointer; the bit-index
+arithmetic is adjusted accordingly, with an explicit 64-bit modulo guard for
+512 MB filters where BLOOM_FILTER_SIZE == 2^32.
+Falls back transparently to the CPU path on any driver or context error.
 
 # Speed indicators in progress bars – All major stages now show average throughput:
 
@@ -67,21 +83,6 @@ ALLOW_REJECT_RULES = False   # set by --allow-reject-rules
 # ==================================================
 
 os.environ['PYOPENCL_COMPILER_OUTPUT'] = '0'
-
-# ====================================================================
-# --- SPEED FORMATTER ---
-# ====================================================================
-def _fmt_speed(value: float, unit: str = "") -> str:
-    """Format a speed value (e.g., 12345 -> '12.3K').
-    Unit is appended after scaling (e.g., 'words' -> '12.3K words/s')."""
-    if value < 1000:
-        return f"{value:.1f} {unit}/s"
-    elif value < 1_000_000:
-        return f"{value/1000:.1f}K {unit}/s"
-    elif value < 1_000_000_000:
-        return f"{value/1_000_000:.1f}M {unit}/s"
-    else:
-        return f"{value/1_000_000_000:.1f}G {unit}/s"
 
 # ====================================================================
 # --- KEYBOARD CONTROLLER (p=pause  r=resume  q=early-quit) ---
@@ -240,6 +241,16 @@ def log_warn(msg: str) -> None:
 def log_error(msg: str) -> None:
     print(red(f"[ERROR] {msg}"))
 
+def _fmt_speed(n: float, unit: str = "combos") -> str:
+    """Format a throughput number as e.g. '12.3M combos/s' or '4.5K rules/s'."""
+    if n >= 1_000_000_000:
+        return f"{n/1_000_000_000:.1f}G {unit}/s"
+    if n >= 1_000_000:
+        return f"{n/1_000_000:.1f}M {unit}/s"
+    if n >= 1_000:
+        return f"{n/1_000:.1f}K {unit}/s"
+    return f"{n:.0f} {unit}/s"
+
 def log_section(title: str) -> None:
     w   = min(max(shutil.get_terminal_size((80, 24)).columns - 2, 44), 92)
     bar = '─' * w
@@ -263,6 +274,20 @@ BANNER = f"""{green(bold('''
 
 def print_banner() -> None:
     print(BANNER)
+
+def _print_controls() -> None:
+    """Print keyboard-control hint block — only when running in an interactive TTY."""
+    if not (sys.stdin.isatty() and (_HAS_TERMIOS or _HAS_MSVCRT)):
+        return
+    w   = min(max(shutil.get_terminal_size((80, 24)).columns - 2, 44), 92)
+    sep = dim('─' * (w - 2))
+    print(f"  {sep}")
+    print(f"  {bold('Controls')}  "
+          f"{cyan(bold('[p]'))} pause processing   "
+          f"{green(bold('[r]'))} resume after pause   "
+          f"{yellow(bold('[q]'))} save partial results & quit")
+    print(f"  {sep}")
+    print()
 
 # ====================================================================
 # --- CONSTANTS ---
@@ -607,8 +632,6 @@ def minimize_by_signature(rule_counter: Counter, probe_words: List[str]) -> Coun
 def _minimize_mem(rule_counter: Counter, probe_words: List[str]) -> Counter:
     sig_map: Dict[tuple, List[Tuple[str, int]]] = defaultdict(list)
     rule_items = list(rule_counter.items())
-    start_time = time.time()
-    processed = 0
     with tqdm(total=len(rule_items), desc=green("  Minimizing"), unit="rule", ncols=88,
               bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}") as pbar:
         n_groups = 0
@@ -616,10 +639,8 @@ def _minimize_mem(rule_counter: Counter, probe_words: List[str]) -> Counter:
             sig = compute_rule_signature(rule, probe_words)
             sig_map[sig].append((rule, gpu_count))
             n_groups = len(sig_map)
-            processed += 1
             pbar.update(1)
-            speed = processed / (time.time() - start_time) if processed > 5 else 0
-            pbar.set_postfix({"unique_sigs": cyan(str(n_groups)), "speed": _fmt_speed(speed, "rules")}, refresh=False)
+            pbar.set_postfix({"unique_sigs": cyan(str(n_groups))}, refresh=False)
     def _group_key(item: Tuple[str, int]) -> tuple:
         rule, gpu_count = item
         return (-gpu_count, len(rule.split()), rule)
@@ -668,8 +689,6 @@ def _minimize_disk(rule_counter: Counter, probe_words: List[str]) -> Counter:
         n_total = len(rule_items)
         batch: List[Tuple[str, str, int, int]] = []
         log_info(f"[MINIMIZE] Temp DB     : {dim(tmp_path)}")
-        start_time = time.time()
-        processed = 0
         with tqdm(total=n_total, desc=green("  Minimizing"), unit="rule", ncols=88,
                   bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}") as pbar:
             for rule, count in rule_items:
@@ -681,16 +700,13 @@ def _minimize_disk(rule_counter: Counter, probe_words: List[str]) -> Counter:
                 if len(batch) >= MINIMIZE_DISK_BATCH_SIZE:
                     conn.executemany(_UPSERT, batch)
                     conn.commit()
-                    processed += len(batch)
                     batch.clear()
                     (n_sigs,) = conn.execute('SELECT COUNT(*) FROM sig_best').fetchone()
-                    speed = processed / (time.time() - start_time) if processed > 5 else 0
-                    pbar.set_postfix({"unique_sigs": cyan(str(n_sigs)), "speed": _fmt_speed(speed, "rules")}, refresh=False)
+                    pbar.set_postfix({"unique_sigs": cyan(str(n_sigs))}, refresh=False)
                     pbar.update(MINIMIZE_DISK_BATCH_SIZE)
             if batch:
                 conn.executemany(_UPSERT, batch)
                 conn.commit()
-                processed += len(batch)
                 pbar.update(len(batch))
         survivors = Counter()
         (n_sigs,) = conn.execute('SELECT COUNT(*) FROM sig_best').fetchone()
@@ -1069,17 +1085,16 @@ def extract_token_strip_rules(target_words: List[str], base_set: Set[str],
     else:
         pool_kw = dict(processes=n_workers, initializer=_worker_init_p0,
                        initargs=(base_set, base_by_len))
-    start_time = time.time()
-    processed_words = 0
+    _s0_t0 = time.time(); _s0_words_done = 0
     with ctx.Pool(**pool_kw) as pool:
         with tqdm(total=n_words, desc=green("  STAGE 0 "), unit="word", ncols=88,
                   bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}") as pbar:
             for task_arg, chunk_result in zip(task_args, pool.imap_unordered(_process_chunk_p0, task_args)):
                 found |= chunk_result
-                processed_words += len(task_arg[0])
-                elapsed = time.time() - start_time
-                speed = processed_words / elapsed if elapsed > 0 else 0
-                pbar.set_postfix({"rules": cyan(str(len(found))), "speed": _fmt_speed(speed, "words")}, refresh=False)
+                _s0_words_done += len(task_arg[0])
+                _s0_el = time.time() - _s0_t0
+                _s0_spd = _fmt_speed(_s0_words_done / _s0_el if _s0_el > 0 else 0, "words")
+                pbar.set_postfix({"rules": cyan(str(len(found))), "spd": green(_s0_spd)}, refresh=False)
                 pbar.update(len(task_arg[0]))
     _p0_worker_base_set = set()
     _p0_worker_base_by_len = {}
@@ -1223,8 +1238,17 @@ def calculate_dynamic_parameters(base_count, target_count, device=None,
     vram_scale = max(0.25, min(1.0, vgb / 8.0))
     ts         = target_hours * 3600
     eff_bloom  = bloom_mb_override or BLOOM_FILTER_MAX_MB
-    bsize_b    = min(1024*1024*eff_bloom*2, eff_bloom*1024*1024)
-    if vgb < 4: bsize_b = min(bsize_b, 32*1024*1024)
+    bsize_b    = eff_bloom * 1024 * 1024
+    _LOW_VRAM_BLOOM_CAP_MB = 32
+    if vgb < 4 and bsize_b > _LOW_VRAM_BLOOM_CAP_MB * 1024 * 1024:
+        if bloom_mb_override:
+            log_warn(
+                f"VRAM ~{vgb:.1f}GB < 4GB — bloom filter {eff_bloom}MB may not fit alongside "
+                f"GPU buffers. If the program crashes, try --bloom-mb {_LOW_VRAM_BLOOM_CAP_MB}."
+            )
+        else:
+            bsize_b = _LOW_VRAM_BLOOM_CAP_MB * 1024 * 1024
+            log_debug(f"[BLOOM] VRAM ~{vgb:.1f}GB < 4GB, brak --bloom-mb → cap do {_LOW_VRAM_BLOOM_CAP_MB}MB")
     bloom_bits = bsize_b * 8
 
     if target_count > 0:
@@ -1506,7 +1530,7 @@ __kernel void build_bloom_filter_gpu(
 """
 
 # --------------------------------------------------------------------
-# GPU Engine (modified: quiet kernel logs, compilation dots restored)
+# GPU Engine (unchanged except minor logging)
 # --------------------------------------------------------------------
 class GPUEngine:
     def __init__(self, params):
@@ -1594,7 +1618,6 @@ class GPUEngine:
             t = threading.Thread(target=_build, daemon=True)
             t.start()
             print("[GPU]  Compiling OpenCL kernel ", end='', flush=True)
-            # Print a dot every 10 seconds (original behavior)
             while t.is_alive():
                 t.join(timeout=10)
                 if t.is_alive():
@@ -1834,9 +1857,7 @@ class GPUEngine:
         log_debug(f"STAGE 1: {len(base_words):,} words × {len(self.gpu_rules):,} rules")
         counter = Counter()
         bs      = self.params['WORDS_PER_BATCH']
-        n_rules = len(self.gpu_rules)
-        total_combos = 0
-        start_time = time.time()
+        _s1_t0 = time.time(); _s1_words_done = 0; _s1_n_rules = len(self.gpu_rules)
         with tqdm(total=len(base_words), desc=green("  STAGE 1 "), unit="word", ncols=88,
                   bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}") as pbar:
             for i in range(0, len(base_words), bs):
@@ -1855,14 +1876,11 @@ class GPUEngine:
                         if self._consecutive_errors >= self._MAX_CONSECUTIVE_ERRORS:
                             log_warn(f"[GPU] {self._consecutive_errors} consecutive failures — aborting STAGE 1")
                             break
-                processed_words = i + len(batch)
-                elapsed = time.time() - start_time
-                combos = processed_words * n_rules
-                if elapsed > 0:
-                    speed = combos / elapsed
-                    pbar.set_postfix({"rules": cyan(str(len(counter))), "speed": _fmt_speed(speed, "combos")}, refresh=False)
-                else:
-                    pbar.set_postfix({"rules": cyan(str(len(counter)))}, refresh=False)
+                    _s1_words_done += len(batch)
+                    _s1_el = time.time() - _s1_t0
+                    _s1_combos = _s1_words_done * _s1_n_rules
+                    _s1_spd = _fmt_speed(_s1_combos / _s1_el if _s1_el > 0 else 0)
+                    pbar.set_postfix({"rules": cyan(str(len(counter))), "spd": green(_s1_spd)}, refresh=False)
                 pbar.update(len(batch))
         gc.collect()
         log_info(f"[S1]    {bold(green(str(len(counter))))} unique rules passed bloom filter")
@@ -1877,8 +1895,6 @@ class GPUEngine:
             bb=B(bd['words_flat']); bbo=B(bd['word_offsets']); bbl=B(bd['word_lengths'])
             rb, rbo, rbl = self._get_rules_buffers(mf)
             outs = self.safe_output_buffer_size(bd['num_words'], bd['num_rules'])
-            # Quiet: removed log_debug for output buffer size
-            # log_debug(f"[S1-K] output_buf={outs} slots  ({bd['num_words']} words × {bd['num_rules']} rules)")
             fo = cl.Buffer(self.context, mf.WRITE_ONLY, outs*MAX_CHAIN_STRING_LEN); bufs.append(fo)
             fc = cl.Buffer(self.context, mf.READ_WRITE, 4);                         bufs.append(fc)
             cl.enqueue_copy(self.queue, fc, np.array([0], dtype=np.int32))
@@ -1893,8 +1909,8 @@ class GPUEngine:
             cnt = np.zeros(1, dtype=np.int32)
             cl.enqueue_copy(self.queue, cnt, fc)
             n = min(cnt[0], outs); out = []
-            # Quiet: removed log_debug for GPU returned hits
-            # log_debug(f"[S1-K] GPU returned {int(cnt[0])} hit(s) (cap={outs}  → {n} decoded)")
+            if cnt[0] > 0:
+                log_debug(f"[S1-K] {int(cnt[0])} hit(s)  (cap={outs}  → {n} decoded)")
             if n > 0:
                 data = np.zeros(n*MAX_CHAIN_STRING_LEN, dtype=np.uint8)
                 cl.enqueue_copy(self.queue, data, fo)
@@ -2105,8 +2121,7 @@ class GPUEngine:
         cbs = self.params['CHAINS_PER_BATCH']
         wsb = self.params['WORD_SUB_BATCH']
         n_batches = (len(multi_seeds) + cbs - 1) // cbs
-        total_combos = 0
-        start_time = time.time()
+        _sp_t0 = time.time(); _sp_accum_combos = 0
         with tqdm(total=n_batches, desc=green("  SEEDPASS"), unit="batch", ncols=88,
                   bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}") as pbar:
             for ci in range(0, len(multi_seeds), cbs):
@@ -2122,7 +2137,6 @@ class GPUEngine:
                         if found:
                             self._consecutive_errors = 0
                             counter.update(found)
-                            total_combos += len(wb) * len(cb)
                         elif self.queue is None:
                             self._consecutive_errors += 1
                     if not self._safe_queue_finish():
@@ -2130,10 +2144,11 @@ class GPUEngine:
                 if self._consecutive_errors >= self._MAX_CONSECUTIVE_ERRORS:
                     log_warn(f"[GPU] {self._consecutive_errors} consecutive failures — aborting seed pass")
                     break
+                _sp_accum_combos += len(cb) * len(base_words)
+                _sp_el = time.time() - _sp_t0
+                _sp_spd = _fmt_speed(_sp_accum_combos / _sp_el if _sp_el > 0 else 0)
                 pbar.update(1)
-                elapsed = time.time() - start_time
-                speed = total_combos / elapsed if elapsed > 0 else 0
-                pbar.set_postfix({"hits": cyan(str(len(counter))), "speed": _fmt_speed(speed, "combos")}, refresh=False)
+                pbar.set_postfix({"hits": cyan(str(len(counter))), "spd": green(_sp_spd)}, refresh=False)
         log_info(f"[SEED]    {bold(green(str(len(counter))))} unique seed chains passed bloom filter")
         return counter
 
@@ -2179,8 +2194,7 @@ class GPUEngine:
         cbs     = self.params['CHAINS_PER_BATCH']
         wsb     = self.params['WORD_SUB_BATCH']
         n_batches = (len(chains)+cbs-1)//cbs
-        total_combos = 0
-        start_time = time.time()
+        _s2_t0 = time.time(); _s2_accum_combos = 0
         with tqdm(total=n_batches, desc=green("  STAGE 2 "), unit="batch", ncols=88,
                   bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}") as pbar:
             for ci in range(0, len(chains), cbs):
@@ -2196,7 +2210,6 @@ class GPUEngine:
                         if found:
                             self._consecutive_errors = 0
                             counter.update(found)
-                            total_combos += len(wb) * len(cb)
                         elif self.queue is None:
                             self._consecutive_errors += 1
                     if not self._safe_queue_finish():
@@ -2204,18 +2217,17 @@ class GPUEngine:
                 if self._consecutive_errors >= self._MAX_CONSECUTIVE_ERRORS:
                     log_warn(f"[GPU] {self._consecutive_errors} consecutive failures — aborting STAGE 2")
                     break
+                _s2_accum_combos += len(cb) * len(base_words)
+                _s2_el = time.time() - _s2_t0
+                _s2_spd = _fmt_speed(_s2_accum_combos / _s2_el if _s2_el > 0 else 0)
                 pbar.update(1)
-                elapsed = time.time() - start_time
-                speed = total_combos / elapsed if elapsed > 0 else 0
-                pbar.set_postfix({"rules": cyan(str(len(counter))), "speed": _fmt_speed(speed, "combos")}, refresh=False)
+                pbar.set_postfix({"rules": cyan(str(len(counter))), "spd": green(_s2_spd)}, refresh=False)
         gc.collect()
         log_info(f"[S2]    {bold(green(str(len(counter))))} unique chain rules passed bloom filter")
         return counter
 
     def _run_chain_kernel(self, words, chains):
         seqs = []; depths = []
-        # Quiet: removed log_debug for _run_chain_kernel
-        # log_debug(f"[S2-K] _run_chain_kernel: {len(words)} words × {len(chains)} chains  max_depth={self.params['MAX_CHAIN_DEPTH']}")
         for chain in chains:
             parts = chain.split()
             depths.append(len(parts))
@@ -2248,8 +2260,8 @@ class GPUEngine:
             cnt = np.zeros(1, dtype=np.int32)
             cl.enqueue_copy(self.queue, cnt, fc)
             n = min(cnt[0], outs); out = []
-            # Quiet: removed log_debug for GPU returned hits
-            # log_debug(f"[S2-K] GPU returned {int(cnt[0])} hit(s) (cap={outs}  → {n} decoded)")
+            if cnt[0] > 0:
+                log_debug(f"[S2-K] {int(cnt[0])} hit(s)  (cap={outs}  → {n} decoded)")
             if n > 0:
                 data = np.zeros(n*MAX_CHAIN_STRING_LEN, dtype=np.uint8)
                 cl.enqueue_copy(self.queue, data, fo)
@@ -2268,7 +2280,7 @@ class GPUEngine:
                 except: pass
 
 # ====================================================================
-# --- STAGE 3 — GENETIC ALGORITHM RULE EVOLVER (unchanged except speed) ---
+# --- STAGE 3 — GENETIC ALGORITHM RULE EVOLVER (unchanged) ---
 # ====================================================================
 class GeneticRuleEvolver:
     def __init__(
@@ -2488,9 +2500,6 @@ class GeneticRuleEvolver:
         log_info(f"[S3]    pop={self.pop_size}  max_gen={generations}  elite={self.elite_frac:.0%}  budget={time_budget:.0f}s  pool={len(self.rule_pool):,} rules  known={len(self.known_rules):,}")
         pop = self.initial_population(hot_rules)
         last_gen = 0
-        n_base_words = len(self.base_words)
-        total_combos = 0
-        start_time = time.time()
         with tqdm(total=generations, desc=green("  STAGE 3 "), unit="gen", ncols=88,
                   bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}") as pbar:
             for gen in range(generations):
@@ -2503,7 +2512,6 @@ class GeneticRuleEvolver:
                     log_debug(f"[S3]    Time budget exhausted at generation {gen}.")
                     break
                 raw_map = self.evaluate_population(pop)
-                total_combos += self.pop_size * n_base_words
                 new_sigs = self._update_sig_registry(raw_map)
                 n_novel_this_gen = 0
                 for chain_str, raw_hits in raw_map.items():
@@ -2540,9 +2548,7 @@ class GeneticRuleEvolver:
                     pop = keep_top + refresh_chains
                     pop = pop[:self.pop_size]
                     pbar.update(1)
-                    elapsed = time.time() - start_time
-                    speed = total_combos / elapsed if elapsed > 0 else 0
-                    pbar.set_postfix({"best": cyan(str(best_score)), "new": cyan(str(len(all_new))), "sigs": cyan(str(len(self._sig_to_best))), "speed": _fmt_speed(speed, "combos"), "stag": yellow("REFRESH")}, refresh=False)
+                    pbar.set_postfix({"best": cyan(str(best_score)), "new": cyan(str(len(all_new))), "sigs": cyan(str(len(self._sig_to_best))), "stag": yellow("REFRESH")}, refresh=False)
                     continue
                 elites = [list(ind) for ind, _ in fitness_list[:n_elite]]
                 next_pop = list(elites)
@@ -2583,9 +2589,7 @@ class GeneticRuleEvolver:
                         next_set.add(ind)
                 pop = next_pop[:self.pop_size]
                 pbar.update(1)
-                elapsed = time.time() - start_time
-                speed = total_combos / elapsed if elapsed > 0 else 0
-                pbar.set_postfix({"best": cyan(str(best_score)), "new": cyan(str(len(all_new))), "sigs": cyan(str(len(self._sig_to_best))), "speed": _fmt_speed(speed, "combos")}, refresh=False)
+                pbar.set_postfix({"best": cyan(str(best_score)), "new": cyan(str(len(all_new))), "sigs": cyan(str(len(self._sig_to_best)))}, refresh=False)
         elapsed = time.time() - t_start
         n_chains = len(all_new)
         n_sig_classes = len(self._sig_to_best)
@@ -2880,6 +2884,7 @@ def main() -> None:
     ALLOW_REJECT_RULES = args.allow_reject_rules
     VERBOSE            = args.debug
     print_banner()
+    _print_controls()
     if args.list_devices: list_devices(); sys.exit(0)
     if not args.base_wordlist or not args.target_wordlist:
         ap.print_help(); print(); log_error("Both BASE and TARGET wordlists are required."); sys.exit(1)
@@ -2908,9 +2913,6 @@ def main() -> None:
     print()
 
     _kb.start()
-    if sys.stdin.isatty() and (_HAS_TERMIOS or _HAS_MSVCRT):
-        log_info(dim(f"  keys: {bold('p')}=pause  {bold('r')}=resume  {bold('q')}=save & quit early"))
-        print()
 
     t_start   = time.time()
     extractor = GPUExtractor(
