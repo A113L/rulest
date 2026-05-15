@@ -149,7 +149,7 @@ class KeyboardController:
                 if self._quit:
                     return
                 self._paused = True
-            w = min(max(shutil.get_terminal_size((80, 24)).columns - 2, 44), 92)
+            w = max(shutil.get_terminal_size((80, 24)).columns - 2, 44)
             print(f"\n{yellow('─' * w)}")
             print(f"{yellow('│')} {bold('PAUSED')}  —  press {bold(green('r'))} to resume  |  {bold(yellow('q'))} to save current results & quit")
             print(f"{yellow('─' * w)}")
@@ -158,7 +158,7 @@ class KeyboardController:
                 if not self._paused:
                     return
                 self._paused = False
-            w = min(max(shutil.get_terminal_size((80, 24)).columns - 2, 44), 92)
+            w = max(shutil.get_terminal_size((80, 24)).columns - 2, 44)
             print(f"\n{green('─' * w)}")
             print(f"{green('│')} {bold('RESUMED')}")
             print(f"{green('─' * w)}\n")
@@ -168,7 +168,7 @@ class KeyboardController:
                 self._quit   = True
                 self._paused = False   # unblock if currently paused
             if not already:
-                w = min(max(shutil.get_terminal_size((80, 24)).columns - 2, 44), 92)
+                w = max(shutil.get_terminal_size((80, 24)).columns - 2, 44)
                 print(f"\n{yellow('─' * w)}")
                 print(f"{yellow('│')} {bold(yellow('EARLY EXIT REQUESTED'))}  —  finishing current batch then saving results …")
                 print(f"{yellow('─' * w)}\n")
@@ -252,7 +252,7 @@ def _fmt_speed(n: float, unit: str = "combos") -> str:
     return f"{n:.0f} {unit}/s"
 
 def log_section(title: str) -> None:
-    w   = min(max(shutil.get_terminal_size((80, 24)).columns - 2, 44), 92)
+    w   = max(shutil.get_terminal_size((80, 24)).columns - 2, 44)
     bar = '─' * w
     print(f"\n{cyan(bar)}")
     print(f"{cyan('│')} {bold(title.upper())}")
@@ -279,7 +279,7 @@ def _print_controls() -> None:
     """Print keyboard-control hint block — only when running in an interactive TTY."""
     if not (sys.stdin.isatty() and (_HAS_TERMIOS or _HAS_MSVCRT)):
         return
-    w   = min(max(shutil.get_terminal_size((80, 24)).columns - 2, 44), 92)
+    w   = max(shutil.get_terminal_size((80, 24)).columns - 2, 44)
     sep = dim('─' * (w - 2))
     print(f"  {sep}")
     print(f"  {bold('Controls')}  "
@@ -633,15 +633,20 @@ def minimize_by_signature(rule_counter: Counter, probe_words: List[str]) -> Coun
 def _minimize_mem(rule_counter: Counter, probe_words: List[str]) -> Counter:
     sig_map: Dict[tuple, List[Tuple[str, int]]] = defaultdict(list)
     rule_items = list(rule_counter.items())
-    with tqdm(total=len(rule_items), desc=green("  Minimizing"), unit="rule", ncols=88,
+    with tqdm(total=len(rule_items), desc=green("  Minimizing"), unit="rule", ncols=shutil.get_terminal_size((80, 24)).columns,
               bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}") as pbar:
         n_groups = 0
+        _min_t0 = time.time()
+        _min_done = 0
         for rule, gpu_count in rule_items:
             sig = compute_rule_signature(rule, probe_words)
             sig_map[sig].append((rule, gpu_count))
             n_groups = len(sig_map)
+            _min_done += 1
             pbar.update(1)
-            pbar.set_postfix({"unique_sigs": cyan(str(n_groups))}, refresh=False)
+            _min_el = time.time() - _min_t0
+            _min_spd = _fmt_speed(_min_done / _min_el if _min_el > 0 else 0, "rules")
+            pbar.set_postfix({"unique_sigs": cyan(str(n_groups)), "spd": green(_min_spd)}, refresh=False)
     def _group_key(item: Tuple[str, int]) -> tuple:
         rule, gpu_count = item
         return (-gpu_count, len(rule.split()), rule)
@@ -690,8 +695,11 @@ def _minimize_disk(rule_counter: Counter, probe_words: List[str]) -> Counter:
         n_total = len(rule_items)
         batch: List[Tuple[str, str, int, int]] = []
         log_info(f"[MINIMIZE] Temp DB     : {dim(tmp_path)}")
-        with tqdm(total=n_total, desc=green("  Minimizing"), unit="rule", ncols=88,
+        with tqdm(total=n_total, desc=green("  Minimizing"), unit="rule", ncols=shutil.get_terminal_size((80, 24)).columns,
                   bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}") as pbar:
+            _min_t0 = time.time()
+            _min_done = 0
+            _min_spd = "0 rules/s"
             for rule, count in rule_items:
                 sig = compute_rule_signature(rule, probe_words)
                 sig_str = '\x00'.join(sig)
@@ -701,13 +709,20 @@ def _minimize_disk(rule_counter: Counter, probe_words: List[str]) -> Counter:
                 if len(batch) >= MINIMIZE_DISK_BATCH_SIZE:
                     conn.executemany(_UPSERT, batch)
                     conn.commit()
+                    _min_done += len(batch)
                     batch.clear()
                     (n_sigs,) = conn.execute('SELECT COUNT(*) FROM sig_best').fetchone()
-                    pbar.set_postfix({"unique_sigs": cyan(str(n_sigs))}, refresh=False)
+                    _min_el = time.time() - _min_t0
+                    _min_spd = _fmt_speed(_min_done / _min_el if _min_el > 0 else 0, "rules")
+                    pbar.set_postfix({"unique_sigs": cyan(str(n_sigs)), "spd": green(_min_spd)}, refresh=False)
                     pbar.update(MINIMIZE_DISK_BATCH_SIZE)
             if batch:
                 conn.executemany(_UPSERT, batch)
                 conn.commit()
+                _min_done += len(batch)
+                _min_el = time.time() - _min_t0
+                _min_spd = _fmt_speed(_min_done / _min_el if _min_el > 0 else 0, "rules")
+                pbar.set_postfix({"unique_sigs": cyan(str(conn.execute('SELECT COUNT(*) FROM sig_best').fetchone()[0])), "spd": green(_min_spd)}, refresh=False)
                 pbar.update(len(batch))
         survivors = Counter()
         (n_sigs,) = conn.execute('SELECT COUNT(*) FROM sig_best').fetchone()
@@ -1088,7 +1103,7 @@ def extract_token_strip_rules(target_words: List[str], base_set: Set[str],
                        initargs=(base_set, base_by_len))
     _s0_t0 = time.time(); _s0_words_done = 0
     with ctx.Pool(**pool_kw) as pool:
-        with tqdm(total=n_words, desc=green("  STAGE 0 "), unit="word", ncols=88,
+        with tqdm(total=n_words, desc=green("  STAGE 0 "), unit="word", ncols=shutil.get_terminal_size((80, 24)).columns,
                   bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}") as pbar:
             for task_arg, chunk_result in zip(task_args, pool.imap_unordered(_process_chunk_p0, task_args)):
                 found |= chunk_result
@@ -1274,7 +1289,7 @@ def calculate_dynamic_parameters(base_count, target_count, device=None,
         'WORDS_PER_BATCH'           : max(1000, int(BASE_WORDS_PER_BATCH  * vram_scale)),
         'CHAINS_PER_BATCH'          : max(500,  int(BASE_CHAINS_PER_BATCH * vram_scale)),
         'WORD_SUB_BATCH'            : max(5000, int(BASE_WORD_SUB_BATCH   * vram_scale)),
-        'MAX_SAFE_RESULTS_PER_BATCH': max(5000, int(BASE_MAX_SAFE_RESULTS * vram_scale)),
+        'MAX_SAFE_RESULTS_PER_BATCH': max(15000, int(BASE_MAX_SAFE_RESULTS * vram_scale)),
         'MAX_CHAINS_TO_FIND'        : 2**31 - 1,
         'LOCAL_WORK_SIZE'           : lws,
         'OPTIMAL_GLOBAL_MULTIPLIER' : mcu * OPTIMAL_GLOBAL_MULTIPLIER_BASE,
@@ -1577,7 +1592,7 @@ class GPUEngine:
         return min(max(avail, 0) // MAX_CHAIN_STRING_LEN,
                    self.params['MAX_SAFE_RESULTS_PER_BATCH'],
                    words_count * chains_count,
-                   5000) or 1
+                   15000) or 1
 
     def initialize_gpu(self, device_spec):
         try:
@@ -1715,7 +1730,7 @@ class GPUEngine:
         bf  = np.zeros(bsz, dtype=np.uint8)
         log_debug(f"[BLOOM] CPU bloom build: {bsz//1024//1024}MB for {len(target_words):,} words")
         _t_bloom = time.time()
-        for w in tqdm(target_words, desc=green("  Bloom filter"), unit="word", ncols=88,
+        for w in tqdm(target_words, desc=green("  Bloom filter"), unit="word", ncols=shutil.get_terminal_size((80, 24)).columns,
                       leave=False, bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}]"):
             wb = w.encode('latin-1')
             h1 = fnv1a_32(wb, FNV1A_SEED1); h2 = fnv1a_32(wb, FNV1A_SEED2)
@@ -1867,7 +1882,7 @@ class GPUEngine:
         counter = Counter()
         bs      = self.params['WORDS_PER_BATCH']
         _s1_t0 = time.time(); _s1_words_done = 0; _s1_n_rules = len(self.gpu_rules)
-        with tqdm(total=len(base_words), desc=green("  STAGE 1 "), unit="word", ncols=88,
+        with tqdm(total=len(base_words), desc=green("  STAGE 1 "), unit="word", ncols=shutil.get_terminal_size((80, 24)).columns,
                   bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}") as pbar:
             for i in range(0, len(base_words), bs):
                 _kb.check_pause()
@@ -1918,8 +1933,6 @@ class GPUEngine:
             cnt = np.zeros(1, dtype=np.int32)
             cl.enqueue_copy(self.queue, cnt, fc)
             n = min(cnt[0], outs); out = []
-            if cnt[0] > 0:
-                log_debug(f"[S1-K] {int(cnt[0])} hit(s)  (cap={outs}  → {n} decoded)")
             if n > 0:
                 data = np.zeros(n*MAX_CHAIN_STRING_LEN, dtype=np.uint8)
                 cl.enqueue_copy(self.queue, data, fo)
@@ -2131,7 +2144,7 @@ class GPUEngine:
         wsb = self.params['WORD_SUB_BATCH']
         n_batches = (len(multi_seeds) + cbs - 1) // cbs
         _sp_t0 = time.time(); _sp_accum_combos = 0
-        with tqdm(total=n_batches, desc=green("  "), unit="batch", ncols=88,
+        with tqdm(total=n_batches, desc=green("  SEED PASS "), unit="batch", ncols=shutil.get_terminal_size((80, 24)).columns,
                   bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}") as pbar:
             for ci in range(0, len(multi_seeds), cbs):
                 _kb.check_pause()
@@ -2157,7 +2170,7 @@ class GPUEngine:
                 _sp_el = time.time() - _sp_t0
                 _sp_spd = _fmt_speed(_sp_accum_combos / _sp_el if _sp_el > 0 else 0)
                 pbar.update(1)
-                pbar.set_postfix({"hits": cyan(str(len(counter))), "spd": green(_sp_spd)}, refresh=False)
+                pbar.set_postfix({"rules": cyan(str(len(counter))), "spd": green(_sp_spd)}, refresh=False)
         log_info(f"[SEED]    {bold(green(str(len(counter))))} unique seed chains passed bloom filter")
         return counter
 
@@ -2204,7 +2217,7 @@ class GPUEngine:
         wsb     = self.params['WORD_SUB_BATCH']
         n_batches = (len(chains)+cbs-1)//cbs
         _s2_t0 = time.time(); _s2_accum_combos = 0
-        with tqdm(total=n_batches, desc=green("  STAGE 2 "), unit="batch", ncols=88,
+        with tqdm(total=n_batches, desc=green("  STAGE 2 "), unit="batch", ncols=shutil.get_terminal_size((80, 24)).columns,
                   bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}") as pbar:
             for ci in range(0, len(chains), cbs):
                 _kb.check_pause()
@@ -2269,8 +2282,6 @@ class GPUEngine:
             cnt = np.zeros(1, dtype=np.int32)
             cl.enqueue_copy(self.queue, cnt, fc)
             n = min(cnt[0], outs); out = []
-            if cnt[0] > 0:
-                log_debug(f"[S2-K] {int(cnt[0])} hit(s)  (cap={outs}  → {n} decoded)")
             if n > 0:
                 data = np.zeros(n*MAX_CHAIN_STRING_LEN, dtype=np.uint8)
                 cl.enqueue_copy(self.queue, data, fo)
@@ -2506,10 +2517,13 @@ class GeneticRuleEvolver:
         STAGNATION_THRESHOLD = 5
         stagnation_counter = 0
         best_ever_score = 0
+        _s3_accum_combos = 0
+        _s3_spd = "0 combos/s"
+        _s3_total_novel = 0   # cumulative truly-novel rules (not in known_rules at GA start)
         log_info(f"[S3]    pop={self.pop_size}  max_gen={generations}  elite={self.elite_frac:.0%}  budget={time_budget:.0f}s  pool={len(self.rule_pool):,} rules  known={len(self.known_rules):,}")
         pop = self.initial_population(hot_rules)
         last_gen = 0
-        with tqdm(total=generations, desc=green("  STAGE 3 "), unit="gen", ncols=88,
+        with tqdm(total=generations, desc=green("  STAGE 3 "), unit="gen", ncols=shutil.get_terminal_size((80, 24)).columns,
                   bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}") as pbar:
             for gen in range(generations):
                 last_gen = gen
@@ -2521,14 +2535,20 @@ class GeneticRuleEvolver:
                     log_debug(f"[S3]    Time budget exhausted at generation {gen}.")
                     break
                 raw_map = self.evaluate_population(pop)
+                _s3_accum_combos += len(pop) * len(self.base_words)
+                _s3_el = time.time() - t_start
+                _s3_spd = _fmt_speed(_s3_accum_combos / _s3_el if _s3_el > 0 else 0)
                 new_sigs = self._update_sig_registry(raw_map)
                 n_novel_this_gen = 0
                 for chain_str, raw_hits in raw_map.items():
                     if raw_hits > 0 and HashcatRuleValidator.validate_rule_for_gpu(chain_str):
+                        is_new_entry = chain_str not in all_new
                         if raw_hits > all_new[chain_str]:
                             all_new[chain_str] = raw_hits
                         if all_new[chain_str] == raw_hits:
                             n_novel_this_gen += 1
+                        if is_new_entry and chain_str not in self.known_rules:
+                            _s3_total_novel += 1
                 fitness_list = sorted(
                     [(tuple(ind), raw_map.get(' '.join(ind), 0) * (2 if ' '.join(ind) not in self.known_rules else 1)) for ind in pop],
                     key=lambda x: -x[1],
@@ -2557,7 +2577,7 @@ class GeneticRuleEvolver:
                     pop = keep_top + refresh_chains
                     pop = pop[:self.pop_size]
                     pbar.update(1)
-                    pbar.set_postfix({"best": cyan(str(best_score)), "new": cyan(str(len(all_new))), "sigs": cyan(str(len(self._sig_to_best))), "stag": yellow("REFRESH")}, refresh=False)
+                    pbar.set_postfix({"best": cyan(str(best_score)), "new": cyan(str(len(all_new))), "total_new": bold(green(str(_s3_total_novel))), "sigs": cyan(str(len(self._sig_to_best))), "spd": green(_s3_spd), "stag": yellow("REFRESH")}, refresh=False)
                     continue
                 elites = [list(ind) for ind, _ in fitness_list[:n_elite]]
                 next_pop = list(elites)
@@ -2598,7 +2618,7 @@ class GeneticRuleEvolver:
                         next_set.add(ind)
                 pop = next_pop[:self.pop_size]
                 pbar.update(1)
-                pbar.set_postfix({"best": cyan(str(best_score)), "new": cyan(str(len(all_new))), "sigs": cyan(str(len(self._sig_to_best)))}, refresh=False)
+                pbar.set_postfix({"best": cyan(str(best_score)), "new": cyan(str(len(all_new))), "total_new": bold(green(str(_s3_total_novel))), "sigs": cyan(str(len(self._sig_to_best))), "spd": green(_s3_spd)}, refresh=False)
         elapsed = time.time() - t_start
         n_chains = len(all_new)
         n_sig_classes = len(self._sig_to_best)
@@ -2843,7 +2863,7 @@ def load_wordlist(filename: str) -> list:
     words = set()
     try:
         with open(filename, 'r', encoding='latin-1', errors='ignore') as f:
-            for line in tqdm(f, desc=green("  Loading  "), unit="line", ncols=88,
+            for line in tqdm(f, desc=green("  Loading  "), unit="line", ncols=shutil.get_terminal_size((80, 24)).columns,
                              leave=False, bar_format="{l_bar}{bar}| {n_fmt} [{elapsed}] {postfix}"):
                 w = line.strip()
                 if w and len(w) <= MAX_WORD_LEN: words.add(w)
@@ -2987,7 +3007,7 @@ def main() -> None:
     log_info(f"[OUT]  Minimized rules written to: {bold(args.output)}")
 
     elapsed = time.time() - t_start
-    sep = '─' * min(max(shutil.get_terminal_size((80, 24)).columns - 2, 44), 92)
+    sep = '─' * max(shutil.get_terminal_size((80, 24)).columns - 2, 44)
     print()
     log_info(cyan(sep))
     log_info(f"  {bold('DONE')}  rulest finished in {bold(f'{elapsed:.1f}s')}")
