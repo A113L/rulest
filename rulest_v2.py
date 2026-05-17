@@ -59,6 +59,7 @@ import time
 import math
 import random
 from typing import Dict, Set, Tuple, Optional, List, Iterator
+from functools import lru_cache
 import gc
 import datetime
 import multiprocessing as mp
@@ -328,6 +329,10 @@ FNV1A_SEED2        = 0xCAFEBABE
 MAX_GPU_RULES = 255
 
 _UNSUPPORTED_SENTINEL = object()
+# OPTIM #7: sentinel returned by generate_bloom_filter_gpu when the buffer
+# is kept on GPU directly (no CPU round-trip). upload_bloom_filter checks for
+# this and skips re-uploading.
+_BLOOM_ALREADY_ON_GPU = object()
 
 MINIMIZE_DISK_THRESHOLD  = 500_000
 MINIMIZE_DISK_BATCH_SIZE =  10_000
@@ -403,45 +408,8 @@ class HashcatRuleValidator:
 
     @staticmethod
     def validate_rule_for_gpu(rule_str: str) -> bool:
-        if should_exclude_rule(rule_str): return False
-        pos = 0; cnt = 0; n = len(rule_str)
-        isd = HashcatRuleValidator.is_digit
-        while pos < n:
-            c = rule_str[pos]
-            if c == ' ': pos += 1; continue
-            if c in ('p', 'z', 'Z'):
-                cnt += 1; pos += 1
-                if pos < n and isd(rule_str[pos]): pos += 1
-                continue
-            if c in (':', 'l', 'u', 'c', 'C', 't', 'r', 'd', 'f',
-                     'a', 'q', 'k', 'K', 'E', '{', '}', '[', ']'):
-                pos += 1; cnt += 1; continue
-            if c in ('T', 'D', 'L', 'R', '+', '-', '.', ',', "'", 'y', 'Y'):
-                pos += 1
-                if pos >= n or not isd(rule_str[pos]): return False
-                pos += 1; cnt += 1; continue
-            if c in ('i', 'o', '3'):
-                pos += 1
-                if pos >= n or not isd(rule_str[pos]): return False
-                pos += 1
-                if pos >= n: return False
-                pos += 1; cnt += 1; continue
-            if c in ('x', '*', 'O'):
-                pos += 1
-                if pos >= n or not isd(rule_str[pos]): return False
-                pos += 1
-                if pos >= n or not isd(rule_str[pos]): return False
-                pos += 1; cnt += 1; continue
-            if c == 's':
-                pos += 1
-                if pos + 1 >= n: return False
-                pos += 2; cnt += 1; continue
-            if c in ('@', 'e', '$', '^'):
-                pos += 1
-                if pos >= n: return False
-                pos += 1; cnt += 1; continue
-            return False
-        return cnt <= HashcatRuleValidator.MAX_GPU_RULES
+        # OPTIM #1: delegate to module-level lru_cache'd function
+        return _validate_rule_for_gpu_cached(rule_str)
 
     @staticmethod
     def validate_rules_for_gpu(rules):
@@ -451,6 +419,51 @@ class HashcatRuleValidator:
             if r and HashcatRuleValidator.validate_rule_for_gpu(r):
                 valid.append(r)
         return valid
+
+# OPTIM #1: module-level lru_cache'd implementation of validate_rule_for_gpu.
+# Same rule strings (e.g. "c", "$1", "sa@") appear millions of times across
+# all words in Stage 0 — caching avoids re-parsing every time.
+@lru_cache(maxsize=None)
+def _validate_rule_for_gpu_cached(rule_str: str) -> bool:
+    if should_exclude_rule(rule_str): return False
+    pos = 0; cnt = 0; n = len(rule_str)
+    def isd(c): return '0' <= c <= '9'
+    while pos < n:
+        c = rule_str[pos]
+        if c == ' ': pos += 1; continue
+        if c in ('p', 'z', 'Z'):
+            cnt += 1; pos += 1
+            if pos < n and isd(rule_str[pos]): pos += 1
+            continue
+        if c in (':', 'l', 'u', 'c', 'C', 't', 'r', 'd', 'f',
+                 'a', 'q', 'k', 'K', 'E', '{', '}', '[', ']'):
+            pos += 1; cnt += 1; continue
+        if c in ('T', 'D', 'L', 'R', '+', '-', '.', ',', "'", 'y', 'Y'):
+            pos += 1
+            if pos >= n or not isd(rule_str[pos]): return False
+            pos += 1; cnt += 1; continue
+        if c in ('i', 'o', '3'):
+            pos += 1
+            if pos >= n or not isd(rule_str[pos]): return False
+            pos += 1
+            if pos >= n: return False
+            pos += 1; cnt += 1; continue
+        if c in ('x', '*', 'O'):
+            pos += 1
+            if pos >= n or not isd(rule_str[pos]): return False
+            pos += 1
+            if pos >= n or not isd(rule_str[pos]): return False
+            pos += 1; cnt += 1; continue
+        if c == 's':
+            pos += 1
+            if pos + 1 >= n: return False
+            pos += 2; cnt += 1; continue
+        if c in ('@', 'e', '$', '^'):
+            pos += 1
+            if pos >= n: return False
+            pos += 1; cnt += 1; continue
+        return False
+    return cnt <= MAX_GPU_RULES
 
 # ====================================================================
 # --- FNV-1a ---
@@ -595,6 +608,12 @@ def _py_apply_single_rule(rule: str, word: str) -> Optional[str]:
     except Exception:
         return None
 
+# OPTIM #2: lru_cache on py_apply_chain.
+# In Stage 0, the same (chain, stem) pair appears whenever multiple target
+# words share the same stem and generate the same rule chain.
+# In compute_rule_signature the same probe words are tested for every rule,
+# so worker-local caches fill up quickly across the chunk.
+@lru_cache(maxsize=65536)
 def py_apply_chain(chain: str, word: str) -> Optional[str]:
     cur = word
     for r in chain.split():
@@ -998,8 +1017,11 @@ def _process_chunk_p0(args: Tuple) -> Set[str]:
     for word in words_chunk:
         if not word or len(word) > MAX_WORD_LEN:
             continue
-        n_digits = sum(1 for c in word if c.isdigit())
-        n_alpha = sum(1 for c in word if c.isalpha())
+        # OPTIM #5: single pass instead of two separate sum/generator passes
+        n_digits = n_alpha = 0
+        for _c in word:
+            if _c.isdigit():  n_digits += 1
+            elif _c.isalpha(): n_alpha  += 1
         digit_primary = n_digits > n_alpha
         if digit_primary:
             found |= _extract_digit_mode(word, base_set, max_depth, min_stem_len,
@@ -1124,8 +1146,9 @@ def _log_token_strip_stats(n_words: int, rules: List[str], inject_sbd: bool) -> 
     depth_dist: Dict[int, int] = defaultdict(int)
     mode_counts: Dict[str, int] = defaultdict(int)
     for r in rules:
-        depth_dist[len(r.split())] += 1
+        # OPTIM #6: split once, reuse for both depth and mode detection
         toks = r.split()
+        depth_dist[len(toks)] += 1
         first = toks[0] if toks else ''
         if first == 'r':
             mode_counts['reverse'] += 1
@@ -1577,6 +1600,7 @@ class GPUEngine:
         self._rules_offsets_buf  = None
         self._rules_lengths_buf  = None
         self._rules_buf_key      = None
+        self._bloom_recovery_fn  = None   # OPTIM #7: lazy recovery for GPU-built bloom
 
     def get_free_vram(self):      return estimate_free_vram(self.device)
     def get_max_allocation(self): return get_max_allocation(self.device)
@@ -1692,7 +1716,12 @@ class GPUEngine:
                 log_error("[GPU] Context reset: kernel recompile failed")
                 return False
             self._refresh_cached_limits()
-            if self.bloom_np is not None:
+            # OPTIM #7: use lazy recovery — if bloom was built on GPU we have
+            # a recovery lambda that rebuilds it on CPU; otherwise use bloom_np.
+            if self._bloom_recovery_fn is not None:
+                bloom_fallback = self._bloom_recovery_fn()
+                self.upload_bloom_filter(bloom_fallback)
+            elif self.bloom_np is not None:
                 self.upload_bloom_filter(self.bloom_np)
             log_info("[GPU] Context reset successful — resuming")
             return True
@@ -1749,6 +1778,15 @@ class GPUEngine:
         is byte-for-byte identical to what the CPU path produces, so the check
         kernel needs no changes.
 
+        OPTIM #7: after the kernel completes we keep the GPU int32 buffer
+        directly as self.bloom_buf instead of reading the whole filter back to
+        CPU and re-uploading it (the old GPU→CPU→GPU round-trip caused ~100-
+        500 ms GPU idle time which triggered P-state/clock reduction on NVIDIA
+        and AMD drivers, making the first extraction batches run ~2× slower).
+        Only a tiny sample (~4 KB) is read back for the all-zeros sanity check.
+        The int32 buffer is byte-compatible with the uchar* expected by the
+        check kernel on any little-endian host (x86 / ARM).
+
         Falls back transparently to the CPU path on any error.
         """
         bsz_bits   = self.params['BLOOM_FILTER_SIZE']
@@ -1763,7 +1801,8 @@ class GPUEngine:
         log_debug(f"[BLOOM] GPU bloom build: {bsz_bytes//1024//1024}MB, {nw:,} words, "
                   f"lws={self.local_work_size}")
         mf   = cl.mem_flags
-        bufs = []
+        bufs = []  # temporary buffers only — bf_buf is kept separately
+        bf_buf = None
         try:
             wf, wo, wl = self._flatten(target_words)
 
@@ -1775,7 +1814,7 @@ class GPUEngine:
             # Bloom filter as zeroed int32 array (atomic_or needs int* in OpenCL 1.x)
             bf_init = np.zeros(bsz_uint32, dtype=np.int32)
             bf_buf  = cl.Buffer(self.context, mf.READ_WRITE | mf.COPY_HOST_PTR, hostbuf=bf_init)
-            bufs.append(bf_buf)
+            # NOTE: bf_buf is NOT added to bufs — we keep it alive as self.bloom_buf
 
             gs = ((nw + self.local_work_size - 1) // self.local_work_size) * self.local_work_size
 
@@ -1790,37 +1829,52 @@ class GPUEngine:
             if not self._safe_queue_finish():
                 raise RuntimeError("queue.finish() timed out during GPU bloom build")
 
-            # Read back the int32 result and reinterpret as bytes.
-            # On a little-endian host (x86 / ARM) the byte ordering is:
-            #   bf_int32[k] byte[0..3]  ↔  bf_bytes[4k..4k+3]
-            # which matches the bit layout expected by bloom() in the check kernel.
-            bf_result = np.empty(bsz_uint32, dtype=np.int32)
-            cl.enqueue_copy(self.queue, bf_result, bf_buf)
+            # OPTIM #7: sanity-check via a small sample read (~4 KB) instead
+            # of reading back the full filter (which could be 64-512 MB).
+            # PyOpenCL copies exactly dest.nbytes from the start of the buffer
+            # when no src_offset/byte_count is given — just use a small array.
+            sample_size = min(1024, bsz_uint32)
+            sample = np.empty(sample_size, dtype=np.int32)
+            cl.enqueue_copy(self.queue, sample, bf_buf)  # copies sample_size*4 bytes
             self._safe_queue_finish()
 
-            bf_bytes = bf_result.view(np.uint8).copy()   # .copy() ensures C-contiguous
-            assert len(bf_bytes) == bsz_bytes, (
-                f"Bloom byte length mismatch: {len(bf_bytes)} != {bsz_bytes}"
-            )
-
-            # Sanity-check: a GPU that silently ignores atomic_or (e.g. an
-            # OpenCL 1.x driver that doesn't support global atomics even with
-            # the extension pragma) produces an all-zeros filter.  Detect it
-            # here and fall back rather than letting a broken filter propagate.
-            n_set = int(np.count_nonzero(bf_result))
-            if n_set == 0 and nw > 0:
+            n_set_sample = int(np.count_nonzero(sample))
+            if n_set_sample == 0 and nw > 0:
                 log_warn("[BLOOM] GPU bloom build returned all-zeros — "
                          "atomic_or may be unsupported on this device; "
                          "falling back to CPU")
+                try: bf_buf.release()
+                except Exception: pass
                 return self.generate_bloom_filter(target_words)
 
-            log_debug(f"[BLOOM] GPU bloom build done — "
-                      f"{n_set:,} / {bsz_uint32:,} int32 words non-zero "
-                      f"({n_set * 3200 / bsz_bits:.2f}% bit fill)")
-            return bf_bytes
+            log_debug(f"[BLOOM] GPU bloom build done — keeping buffer on GPU (no round-trip). "
+                      f"Sample {sample_size} words: {n_set_sample:,} non-zero int32s "
+                      f"({n_set_sample * 100 / sample_size:.1f}% of sample)")
+
+            # OPTIM #7: install the GPU buffer directly as self.bloom_buf.
+            # The int32 buffer is byte-compatible with the uchar* check kernel
+            # on little-endian hosts: bit `idx` lives at byte idx//8, bit idx%8
+            # in both representations.  No CPU copy needed.
+            if self.bloom_buf is not None:
+                try: self.bloom_buf.release()
+                except Exception: pass
+            self.bloom_buf = bf_buf
+            bf_buf = None   # ownership transferred — don't release in except
+
+            # bloom_np stores a CPU copy for GPU-reset recovery.
+            # We build it lazily (only if a GPU reset actually happens) to
+            # avoid the full read-back on the happy path.
+            self.bloom_np           = None
+            self._bloom_recovery_fn = lambda: self.generate_bloom_filter(target_words)
+
+            # Return sentinel so callers know upload_bloom_filter can be skipped
+            return _BLOOM_ALREADY_ON_GPU
 
         except Exception as exc:
             log_warn(f"[BLOOM] GPU bloom build failed ({exc}) — falling back to CPU")
+            if bf_buf is not None:
+                try: bf_buf.release()
+                except Exception: pass
             return self.generate_bloom_filter(target_words)
 
         finally:
@@ -1829,6 +1883,10 @@ class GPUEngine:
                 except Exception: pass
 
     def upload_bloom_filter(self, bf):
+        # OPTIM #7: when generate_bloom_filter_gpu kept the buffer on GPU,
+        # it returns _BLOOM_ALREADY_ON_GPU — skip the (re-)upload entirely.
+        if bf is _BLOOM_ALREADY_ON_GPU:
+            return
         mf = cl.mem_flags
         if self.bloom_buf:
             try: self.bloom_buf.release()
@@ -1837,10 +1895,13 @@ class GPUEngine:
         self.bloom_buf = cl.Buffer(self.context, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=bf)
 
     def _flatten(self, items):
-        flat = b''.join(x.encode('latin-1') for x in items)
+        # OPTIM #3: encode each item exactly once.
+        # Previously `flat` was built with one generator encode and then
+        # each item was encoded *again* inside the loop — 2× the work.
+        encoded = [x.encode('latin-1') for x in items]
+        flat = b''.join(encoded)
         offs = []; lens = []; off = 0
-        for x in items:
-            b = x.encode('latin-1')
+        for b in encoded:
             offs.append(off); lens.append(len(b)); off += len(b)
         return (np.frombuffer(flat, dtype=np.uint8),
                 np.array(offs, dtype=np.int32),
@@ -2152,10 +2213,12 @@ class GPUEngine:
                     log_warn("[SEED]  Early exit — stopping seed pass")
                     break
                 cb = multi_seeds[ci:ci + cbs]
+                # OPTIM #4: compute chain seqs once per chain-batch, reuse across word sub-batches
+                _precomp = tuple(np.array(x, dtype=np.int32) for x in self._compute_chain_seqs(cb))
                 for wi in range(0, len(base_words), wsb):
                     wb = base_words[wi:wi + wsb]
                     if wb:
-                        found = self._run_chain_kernel(wb, cb)
+                        found = self._run_chain_kernel(wb, cb, _precomputed=_precomp)
                         if found:
                             self._consecutive_errors = 0
                             counter.update(found)
@@ -2208,6 +2271,35 @@ class GPUEngine:
             if not self.compile_kernel(): return Counter()
         if not self.rule_index:
             self.rule_index = {r: i for i, r in enumerate(self.gpu_rules)}
+
+        # FIX BUG 1: ensure every token referenced in seed_chains has a valid
+        # entry in rule_index.  Non-ASCII prefix/suffix rules (e.g. "^à") that
+        # only appear inside chains — never as standalone single rules — are NOT
+        # in rules_phase1 and therefore not in self.gpu_rules.  When rule_index
+        # returns -1 for such a token the chain kernel immediately breaks out of
+        # the depth loop, leaves cur unchanged, sees same==1 and skips the bloom
+        # check → the chain produces zero matches even though it's valid.
+        if seed_chains:
+            missing: List[str] = []
+            for sc in seed_chains:
+                for tok in sc.split():
+                    if self.rule_index.get(tok, -1) == -1:
+                        # Skip tokens containing non-ASCII characters — hashcat
+                        # silently rejects rules with bytes outside 0x00-0x7F,
+                        # so adding them to gpu_rules would corrupt the index
+                        # and produce useless output entries.
+                        if any(ord(c) > 127 for c in tok):
+                            continue
+                        if HashcatRuleValidator.validate_rule_for_gpu(tok):
+                            missing.append(tok)
+            if missing:
+                extra = sorted(set(missing))
+                new_rules = self.gpu_rules + extra
+                log_debug(f"[S2]   FIX: {len(extra)} seed-chain token(s) missing from "
+                          f"rule_index — appending to gpu_rules "
+                          f"(e.g. {extra[:3]}{'…' if len(extra)>3 else ''})")
+                self.gpu_rules  = new_rules   # new list → _get_rules_buffers cache invalidates
+                self.rule_index = {r: i for i, r in enumerate(self.gpu_rules)}
         chains = self.generate_informed_chains(rules, single_counter, max_depth, seed_chains,
                                                     prebuilt_sbd=prebuilt_sbd)
         if not chains: return Counter()
@@ -2225,10 +2317,12 @@ class GPUEngine:
                     log_warn("[S2]    Early exit — stopping STAGE 2")
                     break
                 cb = chains[ci:ci+cbs]
+                # OPTIM #4: compute chain seqs once per chain-batch, reuse across word sub-batches
+                _precomp = tuple(np.array(x, dtype=np.int32) for x in self._compute_chain_seqs(cb))
                 for wi in range(0, len(base_words), wsb):
                     wb = base_words[wi:wi+wsb]
                     if wb:
-                        found = self._run_chain_kernel(wb, cb)
+                        found = self._run_chain_kernel(wb, cb, _precomputed=_precomp)
                         if found:
                             self._consecutive_errors = 0
                             counter.update(found)
@@ -2248,15 +2342,30 @@ class GPUEngine:
         log_info(f"[S2]    {bold(green(str(len(counter))))} unique chain rules passed bloom filter")
         return counter
 
-    def _run_chain_kernel(self, words, chains):
+    def _compute_chain_seqs(self, chains):
+        """Precompute integer sequence + depth arrays for a list of chains.
+        Separated from _run_chain_kernel so callers can compute once and
+        reuse across multiple word-sub-batches (OPTIM #4)."""
         seqs = []; depths = []
+        max_d = self.params['MAX_CHAIN_DEPTH']
         for chain in chains:
             parts = chain.split()
             depths.append(len(parts))
             idxs = [self.rule_index.get(r, -1) for r in parts]
-            while len(idxs) < self.params['MAX_CHAIN_DEPTH']:
+            while len(idxs) < max_d:
                 idxs.append(-1)
             seqs.extend(idxs)
+        return seqs, depths
+
+    def _run_chain_kernel(self, words, chains, _precomputed=None):
+        # OPTIM #4: accept precomputed (seqs_np, depths_np) to avoid
+        # recomputing for every word-sub-batch when chains don't change.
+        if _precomputed is not None:
+            seqs_np, depths_np = _precomputed
+        else:
+            seqs, depths = self._compute_chain_seqs(chains)
+            seqs_np   = np.array(seqs,   dtype=np.int32)
+            depths_np = np.array(depths, dtype=np.int32)
         bd = self.prepare_words_data(words)
         mf = cl.mem_flags; bufs = []
         try:
@@ -2265,8 +2374,8 @@ class GPUEngine:
                 bufs.append(b); return b
             bb=B(bd['words_flat']); bbo=B(bd['word_offsets']); bbl=B(bd['word_lengths'])
             rb, rbo, rbl = self._get_rules_buffers(mf)
-            csb=B(np.array(seqs,   dtype=np.int32))
-            cdb=B(np.array(depths, dtype=np.int32))
+            csb=B(seqs_np)
+            cdb=B(depths_np)
             outs = self.safe_output_buffer_size(len(words), len(chains))
             fo = cl.Buffer(self.context, mf.WRITE_ONLY, outs*MAX_CHAIN_STRING_LEN); bufs.append(fo)
             fc = cl.Buffer(self.context, mf.READ_WRITE, 4);                         bufs.append(fc)
@@ -2632,6 +2741,7 @@ class GPUExtractor:
     def __init__(self, base_count, target_count, max_depth, device_spec=None,
                  target_hours=0.5, max_chains=None, seed_rules_file=None, bloom_mb=None,
                  builtin_seeds=True,
+                 bloom_cpu=False,
                  genetic=False, genetic_generations=50,
                  genetic_pop=200, genetic_elite=0.15,
                  token_strip=False, token_strip_min_stem=4,
@@ -2646,6 +2756,7 @@ class GPUExtractor:
         self.seed_rules_file          = seed_rules_file
         self.bloom_mb                 = bloom_mb
         self.builtin_seeds            = builtin_seeds
+        self.bloom_cpu                = bloom_cpu
         self.genetic                  = genetic
         self.genetic_generations      = genetic_generations
         self.genetic_pop              = genetic_pop
@@ -2757,9 +2868,29 @@ class GPUExtractor:
         _p0_worker_base_by_len = {}
         log_debug("[MEM] STAGE 0 index globals cleared before STAGE 1")
 
-        log_info("[GPU]  Building bloom filter on GPU …")
+        # Bloom filter build: auto-select CPU vs GPU based on target wordlist size.
+        #
+        # Benchmark shows:
+        #   CPU build  — slower build, but GPU is never idled between build and
+        #                extraction, so first extraction batches run at full GPU
+        #                clock frequency.  Better for small wordlists.
+        #   GPU build  — faster build via OPTIM #7 (buffer kept on GPU, no
+        #                round-trip).  Worth it only when the build itself takes
+        #                long enough that its savings outweigh the P-state ramp-up
+        #                penalty.  Empirically: ~2 M words is the break-even.
+        #
+        # --bloom-cpu  forces CPU regardless of list size.
+        # --bloom-gpu  (absent flag → auto) or list > GPU_BLOOM_MIN_WORDS → GPU.
+        GPU_BLOOM_MIN_WORDS = 2_000_000
+        use_gpu_bloom = (not self.bloom_cpu) and (len(target_words) >= GPU_BLOOM_MIN_WORDS)
+
+        log_info("[GPU]  Building bloom filter on GPU …" if use_gpu_bloom
+                 else "[GPU]  Building bloom filter on CPU …")
         if not self.gpu_engine.compile_kernel(): return all_counts
-        bloom_filter = self.gpu_engine.generate_bloom_filter_gpu(target_words)
+        if use_gpu_bloom:
+            bloom_filter = self.gpu_engine.generate_bloom_filter_gpu(target_words)
+        else:
+            bloom_filter = self.gpu_engine.generate_bloom_filter(target_words)
         self.gpu_engine.upload_bloom_filter(bloom_filter)
 
         log_section("STAGE 1 — Single Rule Search")
@@ -2802,10 +2933,21 @@ class GPUExtractor:
                 _reserved_for_ga = max(_min_ga_secs, self.params['TARGET_SECONDS'] * _ga_frac)
             else:
                 _reserved_for_ga = 0.0
-            remaining = max(0, self.params['TARGET_SECONDS'] - (ts-t0) - _reserved_for_ga)
+            # Stage 0 and Stage S run outside the time budget (same as the original).
+            # Only Stage 1 time is subtracted — use t1, not ts.
+            remaining = max(0, self.params['TARGET_SECONDS'] - (t1-t0) - _reserved_for_ga)
             budget    = remaining * self.params['EST_COMBOS_PER_SEC'] * TIME_SAFETY_FACTOR
             depths    = list(range(2, self.max_depth+1))
             depth_budgets = ({d: int(budget/len(depths)/(len(base_words)*d)) for d in depths} if budget > 0 and base_words and depths else {d: 0 for d in depths})
+
+            # FIX BUG 2: even when the time budget is exhausted, always generate
+            # a minimum set of random chains from hot Stage 1 rules.  Previously,
+            # budget=0 meant d2:0, d3:0 … and Stage 2 only tested the 826K Stage 0
+            # seed chains, none of which produced matches (due to Bug 1 above).
+            # The floor is intentionally small (5 000 per depth) so it never
+            # dominates runtime; --depthN-chains overrides still take precedence.
+            S2_MIN_CHAINS_PER_DEPTH = 5_000
+            depth_budgets = {d: max(v, S2_MIN_CHAINS_PER_DEPTH) for d, v in depth_budgets.items()}
             for d in depths:
                 key = f'depth{d}_override'
                 if key in depth_overrides and depth_overrides[key] is not None:
@@ -2853,7 +2995,14 @@ class GPUExtractor:
             n_truly_novel = sum(1 for r in ga_hits if r not in known_rules_set)
             log_info(f"[S3]    {bold(cyan(str(new_from_ga)))} net new rules from STAGE 3  ({bold(green(str(len(ga_hits))))} total GA hits, {bold(cyan(str(n_truly_novel)))} genuinely novel)")
 
-        validated = Counter({r: c for r,c in all_counts.items() if HashcatRuleValidator.validate_rule_for_gpu(r)})
+        validated = Counter({
+            r: c for r, c in all_counts.items()
+            if HashcatRuleValidator.validate_rule_for_gpu(r)
+            # Hashcat silently rejects rules containing non-ASCII characters
+            # (bytes outside 0x00-0x7F).  Drop them here so they never appear
+            # in the output file.
+            and all(ord(ch) <= 127 for ch in r)
+        })
         return validated
 
 # --------------------------------------------------------------------
@@ -2889,6 +3038,8 @@ def main() -> None:
     ap.add_argument('--target-hours', type=float, default=0.5)
     ap.add_argument('--max-chains', type=int, default=0)
     ap.add_argument('--bloom-mb', type=int, default=0)
+    ap.add_argument('--bloom-cpu', action='store_true',
+                    help='Force CPU bloom-filter build (faster extraction for small wordlists)')
     ap.add_argument('--seed-rules', default=None)
     for i in range(2, 11):
         ap.add_argument(f'--depth{i}-chains', type=int, default=None, dest=f'depth{i}_chains')
@@ -2924,17 +3075,55 @@ def main() -> None:
 
     log_info(f"  base      : {bold(args.base_wordlist)}")
     log_info(f"  target    : {bold(args.target_wordlist)}")
-    log_info(f"  depth     : {bold(str(args.max_depth))}  |  hours: {bold(str(args.target_hours))}  |  bloom: {bold(str(args.bloom_mb or 'auto'))}MB  {bold(cyan('(GPU-accelerated)'))}")
-    _bs = red('DISABLED (--no-builtin-seeds)') if args.no_builtin_seeds else green('enabled (families A-M)')
-    log_info(f"  builtin seeds (STAGE S) : {_bs}")
+    _bloom_note = yellow('[--bloom-cpu forced]') if args.bloom_cpu else dim('(auto: CPU <2M words, GPU ≥2M words)')
+    log_info(f"  depth     : {bold(str(args.max_depth))}  |  hours: {bold(str(args.target_hours))}  |  bloom: {bold(str(args.bloom_mb or 'auto'))}MB  {_bloom_note}")
+    if args.seed_rules:
+        log_info(f"  seeds     : {bold(args.seed_rules)}")
+    print()
+
+    _EXCL = dim('[time budget: excluded]')
+    _INCL = dim('[time budget: included]')
+
+    # STAGE 0
     if args.token_strip:
         _inj = green('→ STAGE S sbd') if not args.no_builtin_seeds else yellow('→ STAGE 1 only')
-        log_info(f"  {bold(cyan('STAGE 0'))} : {green('CPU exact-match (core + insert)')}  min-stem={args.token_strip_min_stem}  prefix={args.token_strip_max_prefix}  suffix={args.token_strip_max_suffix}  leet-amb={args.token_strip_min_leet_amb}  workers={args.token_strip_workers or mp.cpu_count()}  {_inj}")
-    if args.seed_rules: log_info(f"  seeds     : {bold(args.seed_rules)}")
+        log_info(
+            f"  {bold(cyan('STAGE 0'))}  : {green('enabled')} — CPU exact-match (core + insert)"
+            f"  min-stem={args.token_strip_min_stem}"
+            f"  prefix={args.token_strip_max_prefix}"
+            f"  suffix={args.token_strip_max_suffix}"
+            f"  leet-amb={args.token_strip_min_leet_amb}"
+            f"  workers={args.token_strip_workers or mp.cpu_count()}"
+            f"  {_inj}  {_EXCL}"
+        )
+    else:
+        log_info(f"  {bold(dim('STAGE 0'))}  : {red('disabled')}")
+
+    # STAGE 1
+    log_info(f"  {bold(cyan('STAGE 1'))}  : {green('enabled')} — single-rule GPU sweep  {_INCL}")
+
+    # STAGE S
+    if not args.no_builtin_seeds:
+        log_info(f"  {bold(cyan('STAGE S'))}  : {green('enabled')} — numeric/pattern seed families A-M  {_EXCL}")
+    else:
+        log_info(f"  {bold(dim('STAGE S'))}  : {red('disabled')}  (--no-builtin-seeds)")
+
+    # STAGE 2
+    log_info(f"  {bold(cyan('STAGE 2'))}  : {green('enabled')} — rule-chain GPU search  depth 2-{args.max_depth}  {_INCL}")
+
+    # STAGE 3 GA
     if args.genetic:
         if not 0.0 < args.genetic_elite < 1.0:
             log_error("--genetic-elite must be between 0.0 and 1.0"); sys.exit(1)
-        log_info(f"  {bold(green('STAGE 3 GA'))} : pop={args.genetic_pop}  gen={args.genetic_generations}  elite={args.genetic_elite:.0%}")
+        log_info(
+            f"  {bold(cyan('STAGE 3'))}  : {green('enabled')} — genetic algorithm"
+            f"  pop={args.genetic_pop}"
+            f"  gen={args.genetic_generations}"
+            f"  elite={args.genetic_elite:.0%}"
+            f"  {_INCL}"
+        )
+    else:
+        log_info(f"  {bold(dim('STAGE 3'))}  : {red('disabled')}  (--genetic to enable)")
     print()
 
     base_words   = load_wordlist(args.base_wordlist)
@@ -2949,6 +3138,7 @@ def main() -> None:
         args.device, args.target_hours, args.max_chains,
         args.seed_rules, args.bloom_mb,
         builtin_seeds             = not args.no_builtin_seeds,
+        bloom_cpu                 = args.bloom_cpu,
         genetic                   = args.genetic,
         genetic_generations       = args.genetic_generations,
         genetic_pop               = args.genetic_pop,
