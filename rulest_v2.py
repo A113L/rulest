@@ -81,7 +81,7 @@ class KeyboardController:
             with self._lock:
                 if self._quit: return
                 self._paused = True
-            w = max(shutil.get_terminal_size((80,24)).columns-2,44)
+            w = shutil.get_terminal_size((80,24)).columns   # full width
             print(f"\n{yellow('─'*w)}")
             print(f"{yellow('│')} {bold('PAUSED')}  —  press {bold(green('r'))} resume  |  {bold(yellow('q'))} save & quit")
             print(f"{yellow('─'*w)}")
@@ -89,7 +89,7 @@ class KeyboardController:
             with self._lock:
                 if not self._paused: return
                 self._paused = False
-            w = max(shutil.get_terminal_size((80,24)).columns-2,44)
+            w = shutil.get_terminal_size((80,24)).columns
             print(f"\n{green('─'*w)}")
             print(f"{green('│')} {bold('RESUMED')}")
             print(f"{green('─'*w)}\n")
@@ -99,7 +99,7 @@ class KeyboardController:
                 self._quit = True
                 self._paused = False
             if not already:
-                w = max(shutil.get_terminal_size((80,24)).columns-2,44)
+                w = shutil.get_terminal_size((80,24)).columns
                 print(f"\n{yellow('─'*w)}")
                 print(f"{yellow('│')} {bold(yellow('EARLY EXIT REQUESTED'))}  —  finishing current batch then saving …")
                 print(f"{yellow('─'*w)}\n")
@@ -157,7 +157,7 @@ def log_warn(msg): print(yellow(f"[WARN] {msg}"))
 def log_error(msg): print(red(f"[ERROR] {msg}"))
 
 def log_section(title):
-    w = max(shutil.get_terminal_size((80,24)).columns-2,44)
+    w = shutil.get_terminal_size((80,24)).columns   # full width
     bar = '─' * w
     print(f"\n{cyan(bar)}")
     print(f"{cyan('│')} {bold(title.upper())}")
@@ -183,8 +183,8 @@ def print_banner():
 def _print_controls():
     if not (sys.stdin.isatty() and (_HAS_TERMIOS or _HAS_MSVCRT)):
         return
-    w = max(shutil.get_terminal_size((80,24)).columns-2,44)
-    sep = dim('─' * (w-2))
+    w = shutil.get_terminal_size((80,24)).columns - 2   # leave 2 char margins for indentation
+    sep = dim('─' * w)
     print(f"  {sep}")
     print(f"  {bold('Controls')}  "
           f"{cyan(bold('[p]'))} pause processing   "
@@ -478,24 +478,52 @@ def minimize_by_signature(rule_counter, probe_words):
     else:
         return _minimize_mem(rule_counter, probe_words)
 
+def _compute_sig_worker(args):
+    """Top-level worker for mp.Pool — computes (sig, rule, count) tuple."""
+    rule, count, probe_words = args
+    sig = compute_rule_signature(rule, probe_words)
+    return sig, rule, count
+
 def _minimize_mem(rule_counter, probe_words):
     sig_map = defaultdict(list)
     rule_items = list(rule_counter.items())
+    n_total = len(rule_items)
     ncols = shutil.get_terminal_size((80,24)).columns
-    with tqdm(total=len(rule_items), desc=green("  Minimizing"), unit="rule", ncols=ncols,
-              bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}") as pbar:
-        n_groups = 0
-        t0 = time.time()
-        done = 0
-        for rule, gpu_count in rule_items:
-            sig = compute_rule_signature(rule, probe_words)
-            sig_map[sig].append((rule, gpu_count))
-            n_groups = len(sig_map)
-            done += 1
-            elapsed = time.time() - t0
-            spd = _fmt_speed(done / elapsed if elapsed>0 else 0, "rules")
-            pbar.set_postfix({"unique_sigs": cyan(str(n_groups)), "spd": green(spd)}, refresh=False)
-            pbar.update(1)
+    # Use multiprocessing for large rule sets; overhead isn't worth it below ~500 rules
+    n_workers = max(1, min(mp.cpu_count(), n_total // 200 + 1))
+    use_mp = n_total >= 500 and n_workers > 1
+    log_info(f"[MINIMIZE] Workers    : {bold(str(n_workers if use_mp else 1))}")
+    t0 = time.time()
+    if use_mp:
+        task_args = [(rule, count, probe_words) for rule, count in rule_items]
+        ctx = mp.get_context('fork' if hasattr(os, 'fork') else 'spawn')
+        with tqdm(total=n_total, desc=green("  Minimizing"), unit="rule", ncols=ncols,
+                  bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}") as pbar:
+            n_groups = 0
+            done = 0
+            with ctx.Pool(processes=n_workers) as pool:
+                for sig, rule, count in pool.imap_unordered(_compute_sig_worker, task_args, chunksize=64):
+                    sig_map[sig].append((rule, count))
+                    n_groups = len(sig_map)
+                    done += 1
+                    elapsed = time.time() - t0
+                    spd = _fmt_speed(done / elapsed if elapsed > 0 else 0, "rules")
+                    pbar.set_postfix({"unique_sigs": cyan(str(n_groups)), "spd": green(spd)}, refresh=False)
+                    pbar.update(1)
+    else:
+        with tqdm(total=n_total, desc=green("  Minimizing"), unit="rule", ncols=ncols,
+                  bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}") as pbar:
+            n_groups = 0
+            done = 0
+            for rule, gpu_count in rule_items:
+                sig = compute_rule_signature(rule, probe_words)
+                sig_map[sig].append((rule, gpu_count))
+                n_groups = len(sig_map)
+                done += 1
+                elapsed = time.time() - t0
+                spd = _fmt_speed(done / elapsed if elapsed > 0 else 0, "rules")
+                pbar.set_postfix({"unique_sigs": cyan(str(n_groups)), "spd": green(spd)}, refresh=False)
+                pbar.update(1)
     survivors = Counter()
     n_unsupported = 0
     for sig, group in sig_map.items():
@@ -948,7 +976,7 @@ def calculate_dynamic_parameters(base_count, target_count, device=None, target_h
             if 'NVIDIA' in name_up and mcu >= 38: lws = min(512, lws)
             # conservative estimate
             est = LOW_END_COMBOS_PER_SEC if mcu < LOW_END_COMPUTE_UNITS_THRESHOLD else BASELINE_COMBOS_PER_SEC
-            log_debug(f"GPU: CU={mcu}, VRAM~{vgb:.1f}GB, WGS={lws}, est={est//1_000_000}M/s")
+            log_info(f"[GPU]  CU={mcu}, VRAM~{vgb:.1f}GB, WGS={lws}, est={est//1_000_000}M/s")
         except:
             lws = 256; est = BASELINE_COMBOS_PER_SEC; mcu = 38; fv = 2<<30; vgb = 2.0
     else:
@@ -966,22 +994,29 @@ def calculate_dynamic_parameters(base_count, target_count, device=None, target_h
     if total_bits & (total_bits - 1):
         total_bits = 1 << total_bits.bit_length()
         eff_bloom = total_bits // (1024*1024*8)
-    SHARD_BITS = 1 << 32
+    SHARD_BITS = 1 << 32        # 512 MB per shard = 2^32 bits
     if not bloom_no_shard and total_bits > SHARD_BITS:
         num_shards = (total_bits + SHARD_BITS - 1) // SHARD_BITS
         shard_bits = SHARD_BITS
         bloom_bits = num_shards * SHARD_BITS
-        log_debug(f"[BLOOM] Sharding enabled: {eff_bloom}MB -> {num_shards} shards of 512MB, total {bloom_bits//(1024*1024*8)}MB")
+        log_info(f"[BLOOM] Sharding enabled: {eff_bloom}MB -> {num_shards} shards of 512MB, total {bloom_bits//(1024*1024*8)}MB")
     else:
         num_shards = 1
+        # Round shard_bits up to next power of 2 so the kernel can use a cheap
+        # bitmask (& (shard_bits-1)) instead of modulo.  For filters ≤512 MB
+        # this is already guaranteed by get_auto_bloom_mb, but user-supplied
+        # --bloom-mb values may not be powers of two.
+        if total_bits & (total_bits - 1):          # not already power of 2
+            total_bits = 1 << total_bits.bit_length()
+            eff_bloom  = total_bits // (1024 * 1024 * 8)
         shard_bits = total_bits
         bloom_bits = total_bits
-        log_debug(f"[BLOOM] Single shard (fast path), size {bloom_bits//(1024*1024*8)}MB")
+        log_info(f"[BLOOM] Single shard (fast path), size {bloom_bits//(1024*1024*8)}MB")
 
     if target_count > 0:
         fill = 1.0 - math.exp(-BLOOM_HASH_FUNCTIONS * target_count / bloom_bits)
         fpr = fill ** BLOOM_HASH_FUNCTIONS
-        log_debug(f"Bloom: {bloom_bits//8//1024//1024}MB, shards={num_shards}, fill={fill:.3%}, FPR={fpr:.6%}")
+        log_info(f"[BLOOM] {bloom_bits//8//1024//1024}MB, shards={num_shards}, fill={fill:.3%}, FPR={fpr:.6%}")
         if fpr > 0.01: log_warn(f"High FPR {fpr:.3%} — increase --bloom-mb")
 
     return {
@@ -1032,7 +1067,7 @@ class GPUCompatibleRulesGenerator:
         for n in digits:
             for sep in chars2: rules.add(f'3{n}{sep}')
         valid = [r for r in rules if self.validator.validate_rule_for_gpu(r) and 1<=len(r)<=MAX_RULE_LEN]
-        log_debug(f"Generated {len(valid):,} atomic rules")
+        log_info(f"Generated {len(valid):,} atomic rules")
         return valid
 
 # ----------------------------------------------------------------------
@@ -1496,7 +1531,7 @@ class GPUEngine:
     def generate_bloom_filter(self, target_words):
         total_bytes = self.params['BLOOM_NUM_SHARDS'] * self.params['BLOOM_SHARD_BYTES']
         bf = np.zeros(total_bytes, dtype=np.uint8)
-        log_debug(f"[BLOOM] CPU build: {total_bytes//1024//1024}MB, {len(target_words):,} words, {self.params['BLOOM_NUM_SHARDS']} shard(s)")
+        log_info(f"[BLOOM] CPU build: {total_bytes//1024//1024}MB, {len(target_words):,} words, {self.params['BLOOM_NUM_SHARDS']} shard(s)")
         shard_bits = self.params['BLOOM_SHARD_BITS']
         shard_bytes = self.params['BLOOM_SHARD_BYTES']
         ns = self.params['BLOOM_NUM_SHARDS']
@@ -1522,7 +1557,7 @@ class GPUEngine:
         if not self.context or not self.program or not self.kernel_bloom:
             log_debug("[BLOOM] GPU kernel not ready — fallback to CPU")
             return self.generate_bloom_filter(target_words)
-        log_debug(f"[BLOOM] GPU build: {total_bytes//1024//1024}MB, {nw} words, {ns} shards")
+        log_info(f"[BLOOM] GPU build: {total_bytes//1024//1024}MB, {nw} words, {ns} shards")
         mf = cl.mem_flags
         bufs = []
         try:
@@ -1905,6 +1940,13 @@ class GPUEngine:
         depths = []
         for c in chains:
             parts = c.split()
+            # Safety: truncate chains that exceed the compiled MAX_CHAIN_DEPTH.
+            # Without this, over-long chains produce more than maxd entries in
+            # seqs[], which shifts all subsequent chain offsets and causes the
+            # kernel to read garbage indices — silently dropping depth-10 chains
+            # when any longer chain appears earlier in the list.
+            if len(parts) > maxd:
+                parts = parts[:maxd]
             depths.append(len(parts))
             idxs = [self.rule_index.get(r, -1) for r in parts]
             while len(idxs) < maxd:
@@ -2585,7 +2627,7 @@ def main():
     log_info(f"[OUT]  Minimized rules written to: {bold(args.output)}")
 
     elapsed = time.time()-t_start
-    sep = '─' * max(shutil.get_terminal_size((80,24)).columns-2,44)
+    sep = '─' * shutil.get_terminal_size((80,24)).columns   # full width
     print()
     log_info(cyan(sep))
     log_info(f"  {bold('DONE')}  rulest finished in {bold(f'{elapsed:.1f}s')}")
