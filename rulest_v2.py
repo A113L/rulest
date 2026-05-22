@@ -2248,7 +2248,7 @@ class GeneticRuleEvolver:
 class GPUExtractor:
     def __init__(self, base_count, target_count, max_depth, device_spec=None,
                  target_hours=0.5, max_chains=None, seed_rules_file=None, bloom_mb=None,
-                 builtin_seeds=True, bloom_cpu=False, bloom_no_shard=False,
+                 builtin_seeds=True, bloom_no_shard=False,
                  genetic=False, genetic_generations=50, genetic_pop=200, genetic_elite=0.15,
                  token_strip=False, token_strip_min_stem=4, token_strip_max_prefix=4,
                  token_strip_max_suffix=4, token_strip_min_leet_amb=3,
@@ -2261,7 +2261,6 @@ class GPUExtractor:
         self.seed_rules_file = seed_rules_file
         self.bloom_mb = bloom_mb
         self.builtin_seeds = builtin_seeds
-        self.bloom_cpu = bloom_cpu
         self.bloom_no_shard = bloom_no_shard
         self.genetic = genetic
         self.genetic_generations = genetic_generations
@@ -2357,14 +2356,9 @@ class GPUExtractor:
         _p0_worker_base_set = set()
         _p0_worker_base_by_len = {}
 
-        GPU_BLOOM_MIN_WORDS = 2_000_000
-        use_gpu_bloom = (not self.bloom_cpu) and (len(target_words) >= GPU_BLOOM_MIN_WORDS)
-        log_info("[GPU]  Building bloom filter on GPU …" if use_gpu_bloom else "[GPU]  Building bloom filter on CPU …")
+        log_info("[GPU]  Building bloom filter on GPU …")
         if not self.gpu_engine.compile_kernel(): return all_counts
-        if use_gpu_bloom:
-            bloom_filter = self.gpu_engine.generate_bloom_filter_gpu(target_words)
-        else:
-            bloom_filter = self.gpu_engine.generate_bloom_filter(target_words)
+        bloom_filter = self.gpu_engine.generate_bloom_filter_gpu(target_words)
         self.gpu_engine.upload_bloom_filter(bloom_filter)
 
         log_section("STAGE 1 — Single Rule Search")
@@ -2495,7 +2489,6 @@ def main():
     ap.add_argument('--target-hours', type=float, default=0.5)
     ap.add_argument('--max-chains', type=int, default=0)
     ap.add_argument('--bloom-mb', type=int, default=0)
-    ap.add_argument('--bloom-cpu', action='store_true')
     ap.add_argument('--bloom-no-shard', action='store_true')
     ap.add_argument('--seed-rules', default=None)
     for i in range(2,11):
@@ -2531,9 +2524,8 @@ def main():
 
     log_info(f"  base      : {bold(args.base_wordlist)}")
     log_info(f"  target    : {bold(args.target_wordlist)}")
-    _bloom_note = yellow('[--bloom-cpu forced]') if args.bloom_cpu else dim('(auto: CPU <2M words, GPU ≥2M words)')
     shard_note = yellow('[sharding forced off]') if args.bloom_no_shard else dim('(auto: shard if >512MB)')
-    log_info(f"  depth     : {bold(str(args.max_depth))}  |  hours: {bold(str(args.target_hours))}  |  bloom: {bold(str(args.bloom_mb or 'auto'))}MB  {_bloom_note}  {shard_note}")
+    log_info(f"  depth     : {bold(str(args.max_depth))}  |  hours: {bold(str(args.target_hours))}  |  bloom: {bold(str(args.bloom_mb or 'auto'))}MB  {dim('(GPU-only)')}  {shard_note}")
     if args.seed_rules: log_info(f"  seeds     : {bold(args.seed_rules)}")
     print()
 
@@ -2571,7 +2563,7 @@ def main():
     extractor = GPUExtractor(
         len(base_words), len(target_words), args.max_depth, args.device,
         args.target_hours, args.max_chains, args.seed_rules, args.bloom_mb,
-        builtin_seeds=not args.no_builtin_seeds, bloom_cpu=args.bloom_cpu,
+        builtin_seeds=not args.no_builtin_seeds,
         bloom_no_shard=args.bloom_no_shard, genetic=args.genetic,
         genetic_generations=args.genetic_generations, genetic_pop=args.genetic_pop,
         genetic_elite=args.genetic_elite, token_strip=args.token_strip,
