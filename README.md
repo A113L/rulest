@@ -64,7 +64,7 @@ A complete redesign built around GPU efficiency, Hashcat compatibility, and inte
  
 **Key capabilities:**
 - ✅ Full **Hashcat GPU rule validation** (max 31 ops, correct argument types)
-- ✅ **Bloom filter with auto CPU/GPU selection** — for target wordlists ≥ 2 M words the filter is constructed entirely on-device using an OpenCL `atomic_or` kernel (`build_bloom_filter_gpu`), with the buffer kept in VRAM (no round-trip); smaller lists use CPU construction to avoid GPU P-state slowdown on extraction; `--bloom-cpu` forces CPU regardless; CPU fallback activates automatically on any GPU error
+- ✅ **GPU-only Bloom filter** — the filter is always constructed on-device using an OpenCL `atomic_or` kernel (`build_bloom_filter_gpu`), with the buffer kept in VRAM (no round-trip); CPU fallback activates automatically on any GPU error
 - ✅ **Phase 0 — Token-Strip Rule Extraction** (`--token-strip`): optional CPU pre-pass running **6 extraction modes** across every target word with full multiprocessing support (`--token-strip-workers`); decomposes passwords into base stem + rule chain using letter, digit, reverse, delete-edge, dup/fold, and insert (`iNX`) modes; single-rule discoveries feed Phase 1; multi-rule chains are injected into Phase S and Phase 2
 - ✅ **Four-phase extraction**: token-strip pre-pass (Phase 0) → single-rule sweep (Phase 1) → built-in seed pass (Phase S) → informed chain generation (Phase 2)
 - ✅ **Built-in seed families** (A–M): thirteen deterministically generated seed families covering numeric prefixes/suffixes, mixed prepend/append, transform+digit combos, date patterns, special-character append/prepend/transform/combo patterns, leet substitutions, double-transform chains, special-before-digit patterns, and leet+transform combos — run by default as a dedicated extraction pass, independent of `--max-depth` and the random-chain time budget; can be skipped with `--no-builtin-seeds`
@@ -108,7 +108,7 @@ Three root-cause bugs that caused Phase 3 to produce identical results with and 
 | **Built-in seed families** | ❌ Not implemented | ✅ Thirteen families (A–M): numeric prepend/append, mixed, transform+digit, date patterns, special-char append/prepend/transform/combo (F–I), leet substitutions (J), double-transform chains (K), special-before-digit (L), leet+transform (M); run by default as a dedicated pass independent of `--max-depth`; disable with `--no-builtin-seeds` |
 | **Token-strip pre-pass** | ❌ Not implemented | ✅ Phase 0 (`--token-strip`): **6 extraction modes** with multiprocessing; new flags: `--token-strip-workers`, `--token-strip-chunk-size` |
 | **Genetic algorithm** | ❌ Not implemented | ✅ Optional Phase 3 (`--genetic`): novelty-weighted evolutionary search (2× fitness bonus for chains not yet in known_rules) with dedicated time reservation (20 % of `--target-hours`, min 120 s) and stagnation-triggered population refresh; discovers deep-chain patterns that random Phase 2 sampling misses |
-| **Target lookup** | Python `set` (host RAM, per-result) | Bloom filter with auto CPU/GPU selection: GPU `atomic_or` kernel for ≥ 2 M word lists (buffer stays in VRAM, no round-trip); CPU build for smaller lists; `--bloom-cpu` override; 64–512 MB (VRAM-dependent), FNV-1a, 4 hash functions |
+| **Target lookup** | Python `set` (host RAM, per-result) | GPU-only Bloom filter: `atomic_or` kernel (`build_bloom_filter_gpu`), buffer stays in VRAM with no round-trip; CPU fallback on error; 64–512 MB (VRAM-dependent), FNV-1a, 4 hash functions |
 | **Chain state** | Temp `.tmp` files on disk per depth | In-memory, GPU buffer-based with proper release and `gc.collect()` |
 | **Memory management** | Halve batch on OOM, no VRAM awareness | Dynamic sizing based on actual free VRAM estimate + 55% usage safety factor |
 | **Hit counting** | ❌ Not implemented | ✅ Full `Counter`-based frequency tracking, sorted output |
@@ -191,7 +191,6 @@ usage: rulest_v2.py [options] base_wordlist target_wordlist
 | `--depth3-chains` | dynamic | Override chain generation limit for depth 3 |
 | `--depth4-chains` through `--depth10-chains` | dynamic | Per-depth overrides up to depth 10 |
 | `--bloom-mb` | dynamic | Override Bloom filter size (MB); 0 = auto-scale |
-| `--bloom-cpu` | off | Force Bloom filter construction on CPU regardless of target wordlist size. By default the filter is built on GPU when the target wordlist contains **≥ 2 000 000 words** (faster build via `atomic_or` kernel, buffer kept in VRAM with no round-trip) and on CPU otherwise (avoids GPU P-state ramp-up penalty that slows the first extraction batches). Use this flag if your GPU driver does not support `atomic_or` reliably or if you observe slower extraction after the GPU bloom build. |
 | `--allow-reject-rules` | off | Include rejection rules (normally excluded as GPU-incompatible) |
 | `--no-builtin-seeds` | off | Disable the built-in seed families (Phase S). By default Phase S always runs; pass this flag to skip it entirely and rely solely on Phase 1 atomic rules and Phase 2 random chains. Useful for faster runs or when supplying all seeds via `--seed-rules`. Skips all thirteen families (A–M): numeric, date-pattern, special-character, leet substitution, double-transform, special-before-digit, and leet+transform. |
 | `--debug` | off | Enable verbose output (sets `VERBOSE = True` at runtime) |
@@ -249,7 +248,7 @@ usage: rulest.py -w WORDLIST [-b BASE_WORDLIST] [-d CHAIN_DEPTH]
 │  │  │ Bloom Filter│    │  OpenCL Kernel        │ │  │
 │  │  │ (64–512 MB  │◀───│  ┌───────────────────┐│ │  │
 │  │  │  VRAM)      │    │  │build_bloom_filter ││ │  │
-│  │  │ built on GPU│    │  │  (atomic_or)      ││ │  │
+│  │  │ GPU-only    │    │  │  (atomic_or)      ││ │  │
 │  │  │ CPU fallback│    │  ├───────────────────┤│ │  │
 │  │  └─────────────┘    │  │find_single_rules  ││ │  │
 │  │                     │  ├───────────────────┤│ │  │
@@ -290,7 +289,7 @@ Validated single-rule discoveries are merged into Phase 1's atomic rule pool; mu
 See [Phase 0 — Token-Strip Rule Extraction](#-phase-0--token-strip-rule-extraction) for full details.
 
 **Phase 1 — Single Rule Sweep**
-All base words are processed against every GPU-compatible single rule in parallel. The Bloom filter is built on CPU or GPU depending on target wordlist size (≥ 2 M words → GPU `build_bloom_filter_gpu` kernel using `atomic_or`, buffer kept in VRAM with no round-trip; < 2 M words → CPU build; `--bloom-cpu` forces CPU). Near-zero-cost hit detection uses 4 independent FNV-1a hash functions per candidate. Results feed a `Counter` of rule → hit frequency.
+All base words are processed against every GPU-compatible single rule in parallel. The Bloom filter is always built on the GPU via the `build_bloom_filter_gpu` kernel using `atomic_or`, with the buffer kept in VRAM (no round-trip); a CPU fallback activates automatically on any GPU error. Near-zero-cost hit detection uses 4 independent FNV-1a hash functions per candidate. Results feed a `Counter` of rule → hit frequency.
  
 **Phase S — Built-in Seed Extraction**
 A dedicated extraction pass that runs the thirteen built-in seed families (A–M) through the GPU chain kernel. This phase runs by default, regardless of `--max-depth` and the random-chain time budget; it can be disabled with `--no-builtin-seeds`. Depth-1 seeds are skipped (already covered by Phase 1); all multi-rule seed chains at depths 2 and above are tested directly against the Bloom filter. The prebuilt seed families are then forwarded to Phase 2 as scaffolding atoms to avoid regeneration and double-counting. See [Built-in Seed Families (A–M)](#-built-in-seed-families) for a full description.
@@ -311,15 +310,11 @@ After all phases complete, every candidate rule is applied to the built-in probe
  
 ### Bloom Filter
 
-The Bloom filter is built either **on the GPU** or **on the CPU** depending on target wordlist size, with an explicit override available via `--bloom-cpu`.
-
-**Auto-selection rule:** GPU build is used when the target wordlist contains **≥ 2 000 000 words**; CPU build is used for smaller lists. The threshold reflects the empirical break-even point where GPU build time savings outweigh the extraction slowdown caused by the GPU's P-state ramp-up after the build completes.
+The Bloom filter is always built **on the GPU** using the `build_bloom_filter_gpu` OpenCL kernel, regardless of target wordlist size.
 
 **GPU path (`build_bloom_filter_gpu`):** A dedicated OpenCL kernel where each work-item processes one target word — computing the same two FNV-1a hashes (`0xDEADBEEF` / `0xCAFEBABE` seeds) used by the check path and atomically setting the corresponding bits with `atomic_or` on a flat `int32` buffer. Atomicity guarantees race-free writes from all concurrent work-items. After the kernel completes, a small 4 KB sample is read back as a sanity check; the full buffer stays in VRAM and is used directly as the bloom buffer, avoiding a GPU→CPU→GPU round-trip. The resulting buffer is byte-compatible with the `uint8` check path (little-endian bit layout is identical).
 
-**CPU path:** The filter is built in Python (NumPy) using the same two FNV-1a hash seeds, then uploaded to VRAM once via `cl.Buffer(COPY_HOST_PTR)`.
-
-If the GPU build fails for any reason (context not ready, allocation error, `queue.finish` timeout, driver not supporting `atomic_or`), `generate_bloom_filter_gpu` silently falls back to the CPU path so the run continues uninterrupted.
+**CPU fallback:** If the GPU build fails for any reason (context not ready, allocation error, `queue.finish` timeout, driver not supporting `atomic_or`), `generate_bloom_filter_gpu` silently falls back to a CPU path (Python/NumPy, same FNV-1a seeds) so the run continues uninterrupted.
 
 Filter size is selected automatically based on available VRAM:
 
@@ -863,7 +858,7 @@ These constants are defined at the top of `rulest_v2.py` and can be tuned for ad
 # Base           : rockyou.txt
 # Target         : target_plain.txt
 # Depth          : 1–3
-# Bloom          : 512 MB  (GPU-accelerated, CPU fallback)
+# Bloom          : 512 MB  (GPU-only, CPU fallback on error)
 # STAGE 0        : core + insert mode  GPU-verified candidates
 # STAGE 3 GA     : pop=200  gen=50  elite=15%
 #
@@ -1073,26 +1068,15 @@ python rulest_v2.py base.txt target.txt --max-depth 3 --target-hours 1.0 \
   -o no_phase_s.txt
 ```
  
-**Force CPU bloom filter (driver compatibility or small target list):**
+**Override bloom filter size (e.g. for a very large target wordlist):**
 ```bash
-# Use --bloom-cpu when:
-#   - Your GPU driver doesn't support atomic_or reliably
-#   - Target wordlist is < 2 M words (CPU is default below that threshold anyway)
-#   - You observe slower extraction speed after the automatic GPU bloom build
-python rulest_v2.py base.txt target.txt \
-  --bloom-cpu \
+# Bloom filter is always built on GPU (atomic_or kernel, buffer stays in VRAM).
+# If the GPU build fails, the script automatically falls back to CPU.
+# Use --bloom-mb to increase the filter size and reduce false-positive rate.
+python rulest_v2.py base.txt large_target.txt \
+  --bloom-mb 1024 \
   --max-depth 4 --target-hours 1.0 \
-  -o cpu_bloom.txt
-```
-
-**Benchmark CPU vs GPU bloom (only meaningful with large target wordlists ≥ 2 M words):**
-```bash
-# GPU bloom (default for ≥ 2 M words) — faster build, buffer stays in VRAM
-python rulest_v2.py base.txt large_target.txt --max-depth 3 --target-hours 1.0 -o gpu_bloom.txt
-
-# CPU bloom — slower build, faster extraction start
-python rulest_v2.py base.txt large_target.txt --max-depth 3 --target-hours 1.0 \
-  --bloom-cpu -o cpu_bloom.txt
+  -o large_bloom.txt
 ```
 
 **Benchmark Phase S contribution:**
