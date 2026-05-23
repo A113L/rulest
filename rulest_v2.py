@@ -1854,7 +1854,10 @@ class GPUEngine:
             log_info("[SEED]    No multi-depth seeds")
             return Counter()
         total = sum(len(v) for d,v in sbd.items() if d>=2)
-        log_info(f"[SEED]    Numeric seed pass: {total:,} chains across {sum(1 for d in sbd if d>=2)} depth(s)")
+        d_levels = sorted(d for d in sbd if d>=2)
+        depth_range_str = (f"d{d_levels[0]}–d{d_levels[-1]}" if len(d_levels) > 1
+                           else (f"d{d_levels[0]}" if d_levels else "none"))
+        log_info(f"[SEED]    Numeric seed pass: {total:,} chains across {len(d_levels)} depth level(s) ({depth_range_str})")
         counter = Counter()
         cbs = self.params['CHAINS_PER_BATCH']
         wsb = self.params['WORD_SUB_BATCH']
@@ -2341,7 +2344,17 @@ class GPUExtractor:
         self.params = calculate_dynamic_parameters(self.base_count, self.target_count, self.gpu_engine.device,
                                                    self.params['TARGET_SECONDS']/3600,
                                                    bloom_mb_override=self.bloom_mb, bloom_no_shard=self.bloom_no_shard)
-        self.params['MAX_CHAIN_DEPTH'] = self.max_depth
+        # Stage S (seed pass) searches date chains up to depth 9 independently of
+        # --max-depth (date8 base + 1 bracket op = 9 tokens).  The kernel and
+        # _compute_chain_seqs both use MAX_CHAIN_DEPTH as their stride/truncation
+        # limit, so we must compile with at least SEED_PASS_MAX_DEPTH when the
+        # built-in seed pass is enabled; otherwise depth-(N+1) date chains are
+        # silently truncated to N and the effective search depth is --max-depth - 1.
+        _SEED_PASS_MAX_DEPTH = 9
+        if self.builtin_seeds:
+            self.params['MAX_CHAIN_DEPTH'] = max(self.max_depth, _SEED_PASS_MAX_DEPTH)
+        else:
+            self.params['MAX_CHAIN_DEPTH'] = self.max_depth
         self.gpu_engine.params = self.params
 
         extra_seeds = [s for s in all_seeds if ' ' not in s.strip()]
@@ -2372,7 +2385,11 @@ class GPUExtractor:
         seed_hits = Counter()
         if self.builtin_seeds and not _kb.quit_requested:
             log_section("STAGE S — Seed Extraction (families A-M)")
-            sbd = self.gpu_engine.build_numeric_seed_families(max_depth=self.max_depth)
+            # Always generate seed families up to _SEED_PASS_MAX_DEPTH (9) so that
+            # Stage S is independent of --max-depth.  Previously this was capped at
+            # self.max_depth, causing depth-(max_depth+1) date chains (e.g. date8 +
+            # 1 bracket = depth 9) to be skipped when --max-depth < 9.
+            sbd = self.gpu_engine.build_numeric_seed_families(max_depth=_SEED_PASS_MAX_DEPTH)
             if ts_sbd:
                 n_injected = 0
                 for depth, chains in ts_sbd.items():
@@ -2389,6 +2406,12 @@ class GPUExtractor:
             else: log_info(f"[SEED]    {yellow('Skipped')} (--no-builtin-seeds)")
             sbd = {}
             ts = t1
+
+        # Restore MAX_CHAIN_DEPTH to the user-specified limit for Stage 2.
+        # Stage S bumped it to _SEED_PASS_MAX_DEPTH (9); Stage 2 must respect
+        # --max-depth so chain generation and seqs stride stay within bounds.
+        self.params['MAX_CHAIN_DEPTH'] = self.max_depth
+        self.gpu_engine.params = self.params
 
         if self.max_depth > 1 and not _kb.quit_requested:
             log_section("STAGE 2 — Rule Chain Search")
