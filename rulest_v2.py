@@ -2310,7 +2310,16 @@ class GPUExtractor:
             log_section("STAGE 0 — Token-Strip Rule Extraction (Core + Insert)")
             base_set_ts = set(base_words)
             log_info(f"[S0]    {len(target_words):,} target words  base {len(base_set_ts):,}  min-stem={self.token_strip_min_stem}  prefix={self.token_strip_max_prefix}  suffix={self.token_strip_max_suffix}  leet-amb={self.token_strip_min_leet_amb}")
-            ts_all = extract_token_strip_rules(target_words, base_set_ts, max_depth=self.max_depth,
+            # Stage 0 is independent of --max-depth: its natural chain depth is
+            # prefix_len + suffix_len (each affix char = one op) plus a few extra
+            # slots for leet/case transforms.  Capping at self.max_depth would
+            # silently discard valid deep chains (e.g. prefix=10, suffix=10 can
+            # yield chains of depth 20 which are longer than a typical --max-depth 6).
+            _s0_natural_depth = min(
+                self.token_strip_max_prefix + self.token_strip_max_suffix + 4,
+                MAX_HASHCAT_CHAIN
+            )
+            ts_all = extract_token_strip_rules(target_words, base_set_ts, max_depth=_s0_natural_depth,
                                                min_stem_len=self.token_strip_min_stem,
                                                max_prefix_len=self.token_strip_max_prefix,
                                                max_suffix_len=self.token_strip_max_suffix,
@@ -2322,11 +2331,13 @@ class GPUExtractor:
                 if d==1: ts_singles.append(r)
                 else:
                     ts_chains.append(r)
-                    if d <= self.max_depth:
-                        ts_sbd[d].add(r)
+                    ts_sbd[d].add(r)  # no depth gate: seed pass depth is computed dynamically
             _log_token_strip_stats(len(target_words), ts_all, inject_sbd=self.builtin_seeds)
-            if self.max_depth >= 2:
-                toggle = _generate_toggle_chain_seeds(self.max_depth)
+            # Toggle seeds: natural depth = up to 12 (T0..T11 + 1-2 leet ops).
+            # Independent of --max-depth for the same reason as Stage 0 proper.
+            _toggle_natural_depth = min(12, MAX_HASHCAT_CHAIN)
+            if _s0_natural_depth >= 2:
+                toggle = _generate_toggle_chain_seeds(_toggle_natural_depth)
                 for tc in toggle:
                     d = len(tc.split())
                     if d>=2:
@@ -2344,13 +2355,11 @@ class GPUExtractor:
         self.params = calculate_dynamic_parameters(self.base_count, self.target_count, self.gpu_engine.device,
                                                    self.params['TARGET_SECONDS']/3600,
                                                    bloom_mb_override=self.bloom_mb, bloom_no_shard=self.bloom_no_shard)
-        # Stage S (seed pass) searches date chains up to depth 9 independently of
-        # --max-depth (date8 base + 1 bracket op = 9 tokens).  The kernel and
-        # _compute_chain_seqs both use MAX_CHAIN_DEPTH as their stride/truncation
-        # limit, so we must compile with at least SEED_PASS_MAX_DEPTH when the
-        # built-in seed pass is enabled; otherwise depth-(N+1) date chains are
-        # silently truncated to N and the effective search depth is --max-depth - 1.
-        _SEED_PASS_MAX_DEPTH = 9
+        # Stage S depth cap: at least 9 (natural max of built-in date chains:
+        # date8 + 1 bracket op).  If Stage 0 produced chains deeper than 9
+        # (possible when --max-depth > 9), raise the cap to match so those
+        # chains are never silently truncated in _compute_chain_seqs.
+        _SEED_PASS_MAX_DEPTH = max(9, max(ts_sbd.keys(), default=0))
         if self.builtin_seeds:
             self.params['MAX_CHAIN_DEPTH'] = max(self.max_depth, _SEED_PASS_MAX_DEPTH)
         else:
@@ -2392,12 +2401,16 @@ class GPUExtractor:
             sbd = self.gpu_engine.build_numeric_seed_families(max_depth=_SEED_PASS_MAX_DEPTH)
             if ts_sbd:
                 n_injected = 0
+                n_ts_total = 0
                 for depth, chains in ts_sbd.items():
+                    n_ts_total += len(chains)
                     before = len(sbd.setdefault(depth, set()))
                     sbd[depth].update(chains)
                     n_injected += len(sbd[depth]) - before
+                n_dupes = n_ts_total - n_injected
+                dupe_str = f"  ({n_dupes:,} already in builtin families)" if n_dupes else ""
                 if n_injected:
-                    log_info(f"[SEED]    STAGE 0 injected {bold(cyan(str(n_injected)))} chain(s) into STAGE S sbd")
+                    log_info(f"[SEED]    STAGE 0 injected {bold(cyan(str(n_injected)))} chain(s) into STAGE S sbd{dupe_str}")
             seed_hits = self.gpu_engine.run_seed_extraction_pass(base_words, sbd, bloom_filter, rules_phase1)
             all_counts.update(seed_hits)
             ts = time.time()
