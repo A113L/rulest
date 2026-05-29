@@ -242,15 +242,49 @@ _p0_worker_base_set = set()
 _p0_worker_base_by_len = {}
 
 # ----------------------------------------------------------------------
-# Built-in probe set
+# Built-in probe set — 50 words, identical to minimizer.py v1.4 BUILTIN_PROBES.
+# Covers: all positions 0-35 (A-Z), all 95 printable ASCII chars, short/long
+# words, mixed-case, digit, special-char, and repeated-char patterns.
 # ----------------------------------------------------------------------
 BUILTIN_PROBES = [
-    "ab","abc","abcd","pass","root","test","admin","login",
-    "letmein","welcome","password","sunshine","football","baseball",
-    "princess","dragon12","qwertyuiop","iloveyou12","monkey12345",
-    "superman123","mustang2024","Password","AdminUser","MySecret",
-    "HelloWorld","pass123","admin2024","test1234","user9999",
-    "p@ssw0rd","s3cur1ty","master","leet","elite","access","aaaa","bbbb"
+    # very short — edge cases k K { } [ ]
+    "ab", "abc", "abcd",
+    # short alphanumeric (len 4-6)
+    "pass", "root", "test", "admin", "login",
+    # typical password base words (len 7-9)
+    "letmein", "welcome", "password", "sunshine",
+    "football", "baseball", "princess", "dragon12",
+    # longer words (len 10-11) — truncation / repeat ops
+    "qwertyuiop", "iloveyou12", "monkey12345", "superman123", "mustang2024",
+    # extended-length (len 12-36) — positions B(11) through Z(35)
+    # Without these, rules like 'B-'Z / TB-TZ / DB-DZ all look like no-ops.
+    "administrator1",
+    "iloveyouforever",
+    "qwertyuiopasdfgh",
+    "correcthorsebattery",
+    "averylongpassword1234",
+    "averylongpassword12345678",
+    "averylongpassword1234567890ab",
+    "averylongpassword1234567890abcdef",
+    "averylongpassword1234567890abcdefghi",  # len 36 — covers Z(35)
+    # alphabet coverage — all 95 printable ASCII code-points (0x20-0x7E)
+    # Ensures @X / sXY rules for any char are distinguishable from no-ops.
+    "abcdefghijklmnopqrstuvwxyz",        # all 26 lowercase
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ",        # all 26 uppercase
+    "!@#$%^&*()-_=+[]{}|;:,.<>?/~",     # 30 common punctuation chars
+    "a`b",   # backtick  (0x60)
+    'a"b',   # double-quote (0x22)
+    "a'b",   # single-quote (0x27)
+    "a\\b",  # backslash (0x5C)
+    "a b",   # space (0x20) — completes 95/95 printable ASCII
+    # mixed-case — l u c C t E T k K
+    "Password", "AdminUser", "MySecret", "HelloWorld",
+    # words with digits — s o @ T
+    "pass123", "admin2024", "test1234", "user9999",
+    # special chars — @ removal, s substitution
+    "p@ssw0rd", "s3cur1ty",
+    # repeated chars — q z Z
+    "aaaa", "bbbb",
 ]
 BUILTIN_PROBES = list(dict.fromkeys(BUILTIN_PROBES))
 
@@ -337,7 +371,11 @@ def _py_apply_single_rule(rule, word):
     if not rule: return word
     w = list(word.encode('latin-1'))
     cmd = rule[0]
-    def dg(c): return ord(c)-48 if '0'<=c<='9' else -1
+    def dg(c):
+        # Hashcat uses base-36 positions: 0-9 → 0-9, A-Z → 10-35
+        if '0' <= c <= '9': return ord(c) - 48
+        if 'A' <= c <= 'Z': return ord(c) - 55
+        return -1
     try:
         if cmd == ':': pass
         elif cmd == 'l': w = [c|0x20 if 65<=c<=90 else c for c in w]
@@ -371,76 +409,105 @@ def _py_apply_single_rule(rule, word):
             for c in w: out += [c,c]
             w = out
         elif cmd == 'E':
+            # Title-case: uppercase word-start letters, lowercase mid-word
+            # uppercase letters.  Hashcat uses only ASCII space (0x20) as the
+            # word separator — hyphen and underscore are NOT separators for E.
             out = []; cap = True
             for c in w:
-                out.append(c&~0x20 if cap and 97<=c<=122 else c)
-                cap = c in (32,45,95)
+                if cap and 97 <= c <= 122:
+                    out.append(c & ~0x20)   # word-start lowercase → uppercase
+                elif not cap and 65 <= c <= 90:
+                    out.append(c | 0x20)    # mid-word uppercase → lowercase
+                else:
+                    out.append(c)
+                cap = (c == 32)             # only space triggers capitalisation
             w = out
-        elif cmd == '^' and len(rule)==2: w = [ord(rule[1])] + w
-        elif cmd == '$' and len(rule)==2: w = w + [ord(rule[1])]
-        elif cmd == '@' and len(rule)==2:
+        elif cmd == '^' and len(rule)>=2: w = [ord(rule[1])] + w
+        elif cmd == '$' and len(rule)>=2: w = w + [ord(rule[1])]
+        elif cmd == '@' and len(rule)>=2:
             ch = ord(rule[1]); w = [c for c in w if c != ch]
-        elif cmd == 'p' and len(rule)==2:
+        elif cmd == 'p' and len(rule)>=2:
             n = dg(rule[1])
-            if n>0: orig = w[:]; [w.__iadd__(orig) for _ in range(n)]
-        elif cmd == 'T' and len(rule)==2:
+            if n>0:
+                orig = w[:]
+                for _ in range(n): w += orig
+        elif cmd == 'T' and len(rule)>=2:
             p = dg(rule[1])
             if 0<=p<len(w):
                 c = w[p]; w[p] = c|0x20 if 65<=c<=90 else (c&~0x20 if 97<=c<=122 else c)
-        elif cmd == 'D' and len(rule)==2:
+        elif cmd == 'D' and len(rule)>=2:
             p = dg(rule[1])
             if 0<=p<len(w): w.pop(p)
-        elif cmd == 'L' and len(rule)==2:
-            p = dg(rule[1]); w[p] = (w[p]<<1)&0xFF
-        elif cmd == 'R' and len(rule)==2:
-            p = dg(rule[1]); w[p] = (w[p]>>1)&0xFF
-        elif cmd == '+' and len(rule)==2:
-            p = dg(rule[1]); w[p] = (w[p]+1)&0xFF
-        elif cmd == '-' and len(rule)==2:
-            p = dg(rule[1]); w[p] = (w[p]-1)&0xFF
-        elif cmd in ('.',',') and len(rule)==2:
+        elif cmd == 'L' and len(rule)>=2:
+            p = dg(rule[1])
+            if 0<=p<len(w): w[p] = (w[p]<<1)&0xFF
+        elif cmd == 'R' and len(rule)>=2:
+            p = dg(rule[1])
+            if 0<=p<len(w): w[p] = (w[p]>>1)&0xFF
+        elif cmd == '+' and len(rule)>=2:
+            p = dg(rule[1])
+            if 0<=p<len(w): w[p] = (w[p]+1)&0xFF
+        elif cmd == '-' and len(rule)>=2:
+            p = dg(rule[1])
+            if 0<=p<len(w): w[p] = (w[p]-1)&0xFF
+        elif cmd in ('.',',') and len(rule)>=2:
             p = dg(rule[1]); delta = 1 if cmd=='.' else -1
-            w[p] = (w[p]+delta)&0xFF
-        elif cmd == "'" and len(rule)==2:
-            p = dg(rule[1]); w = w[:p+1]
-        elif cmd == 'z' and len(rule)==2:
-            n = dg(rule[1]); w = [w[0]]*n + w
-        elif cmd == 'Z' and len(rule)==2:
-            n = dg(rule[1]); w = w + [w[-1]]*n
-        elif cmd == 'y' and len(rule)==2:
-            n = dg(rule[1]); w = w[:n] + w
-        elif cmd == 'Y' and len(rule)==2:
-            n = dg(rule[1]); w = w + w[-n:]
-        elif cmd == 's' and len(rule)==3:
+            if 0<=p<len(w): w[p] = (w[p]+delta)&0xFF
+        elif cmd == "'" and len(rule)>=2:
+            # 'N — keep exactly the first N characters (w[:N])
+            p = dg(rule[1])
+            if 0<=p: w = w[:p]
+        elif cmd == 'z' and len(rule)>=2:
+            n = dg(rule[1])
+            if n>0 and w: w = [w[0]]*n + w
+        elif cmd == 'Z' and len(rule)>=2:
+            n = dg(rule[1])
+            if n>0 and w: w = w + [w[-1]]*n
+        elif cmd == 'y' and len(rule)>=2:
+            n = dg(rule[1])
+            if n>0: w = w[:n] + w
+        elif cmd == 'Y' and len(rule)>=2:
+            n = dg(rule[1])
+            if n>0 and len(w)>=n: w = w + w[-n:]
+        elif cmd == 's' and len(rule)>=3:
             a,b = ord(rule[1]), ord(rule[2])
             w = [b if c==a else c for c in w]
-        elif cmd == 'i' and len(rule)==3:
+        elif cmd == 'i' and len(rule)>=3:
             p,ch = dg(rule[1]), ord(rule[2])
             if 0<=p<=len(w): w.insert(p,ch)
-        elif cmd == 'o' and len(rule)==3:
-            p,ch = dg(rule[1]), ord(rule[2]); w[p] = ch
+        elif cmd == 'o' and len(rule)>=3:
+            p,ch = dg(rule[1]), ord(rule[2])
+            if 0<=p<len(w): w[p] = ch
         elif cmd == 'e' and len(rule)>=2:
+            # Title-case with custom separator
             sep = ord(rule[1]); out = []; cap = True
             for c in w:
-                out.append(c&~0x20 if cap and 97<=c<=122 else c)
+                if cap and 97<=c<=122:
+                    out.append(c & ~0x20)
+                elif not cap and 65<=c<=90:
+                    out.append(c | 0x20)
+                else:
+                    out.append(c)
                 cap = (c == sep)
             w = out
-        elif cmd == 'x' and len(rule)==3:
-            a,b = dg(rule[1]), dg(rule[2])
-            if a>b: a,b = b,a
-            w = w[a:b+1]
-        elif cmd == 'O' and len(rule)==3:
+        elif cmd == 'x' and len(rule)>=3:
+            # xNM — extract M characters starting at position N: w[N:N+M]
+            n, m = dg(rule[1]), dg(rule[2])
+            if n>=0 and m>=0: w = w[n:n+m]
+        elif cmd == 'O' and len(rule)>=3:
             p,m = dg(rule[1]), dg(rule[2])
             if 0<=p<len(w) and m>0: w = w[:p] + w[p+m:]
-        elif cmd == '*' and len(rule)==3:
+        elif cmd == '*' and len(rule)>=3:
             a,b = dg(rule[1]), dg(rule[2])
             if 0<=a<len(w) and 0<=b<len(w) and a!=b: w[a],w[b]=w[b],w[a]
-        elif cmd == '3' and len(rule)==3:
+        elif cmd == '3' and len(rule)>=3:
+            # 3NX — toggle after the Nth separator X (N is 0-based).
+            # cnt is incremented before the compare, so n=0 (first sep) needs cnt==1.
             n,sep = dg(rule[1]), ord(rule[2]); cnt=0
             for i,c in enumerate(w):
                 if c==sep:
                     cnt+=1
-                    if cnt==n and i+1<len(w):
+                    if cnt==n+1 and i+1<len(w):
                         ci = w[i+1]
                         w[i+1] = ci|0x20 if 65<=ci<=90 else (ci&~0x20 if 97<=ci<=122 else ci)
                         break
@@ -463,7 +530,10 @@ def compute_rule_signature(rule, probe_words):
     outputs = []
     for w in probe_words:
         out = py_apply_chain(rule, w)
-        if out is None: return ('__UNSUPPORTED__',)
+        if out is None:
+            # Unique sentinel per rule — prevents all unsupported rules from
+            # sharing one bucket (which would keep only 1 of e.g. 200 reject rules).
+            return ('__UNSUPPORTED__', rule)
         outputs.append(out)
     return tuple(outputs)
 
@@ -527,8 +597,8 @@ def _minimize_mem(rule_counter, probe_words):
     survivors = Counter()
     n_unsupported = 0
     for sig, group in sig_map.items():
-        if sig == ('__UNSUPPORTED__',):
-            n_unsupported = len(group)
+        if len(sig) >= 1 and sig[0] == '__UNSUPPORTED__':
+            n_unsupported += len(group)
         best_rule, best_count = min(group, key=lambda x: (-x[1], len(x[0].split()), x[0]))
         survivors[best_rule] = best_count
     _log_minimize_stats(len(rule_counter), survivors, len(sig_map), n_unsupported)
