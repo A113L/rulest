@@ -1245,7 +1245,8 @@ int apply(const unsigned char *rs, int rl,
             int cap = 1;
             for (int i = 0; i < *ol; i++) {{
                 if (cap && out[i] >= 'a' && out[i] <= 'z') out[i] -= 32;
-                cap = (out[i] == ' ' || out[i] == '-' || out[i] == '_');
+                else if (!cap && out[i] >= 'A' && out[i] <= 'Z') out[i] += 32;
+                cap = (out[i] == ' ');
             }} changed = 1;
         }} break;
         }}
@@ -1305,7 +1306,7 @@ int apply(const unsigned char *rs, int rl,
             }}
         }} else if (cmd == '\'' && p>='0' && p<='9') {{
             int pos = p-'0';
-            if (pos < *ol) {{ *ol = pos+1; changed = 1; }}
+            if (pos < *ol) {{ *ol = pos; changed = 1; }}
         }} else if (cmd == 'z' && p>='0' && p<='9') {{
             int n = p-'0';
             if (n>0 && *ol+n <= MAX_OUTPUT_LEN) {{
@@ -1355,10 +1356,10 @@ int apply(const unsigned char *rs, int rl,
             }} changed = 1;
         }} else if (cmd == 'x' && p1>='0' && p1<='9' && p2>='0' && p2<='9') {{
             int a = p1-'0', b = p2-'0';
-            if (a>b) {{ int t=a; a=b; b=t; }}
-            if (a < *ol) {{
+            if (a >= 0 && b >= 0 && a < *ol) {{
                 int nl = 0;
-                for (int i = a; i <= b && i < *ol; i++) out[nl++] = out[i];
+                int end = a + b;
+                for (int i = a; i < end && i < *ol; i++) out[nl++] = out[i];
                 *ol = nl; changed = 1;
             }}
         }} else if (cmd == 'O' && p1>='0' && p1<='9' && p2>='0' && p2<='9') {{
@@ -1575,9 +1576,20 @@ class GPUEngine:
 
     def _reset_gpu(self, error):
         log_warn(f"[GPU] Fatal kernel error: {error} — resetting context")
-        for attr in ('bloom_buf','program','kernel_single','kernel_chain','kernel_bloom','queue','context'):
+        # Only PyOpenCL buffer/queue objects have .release(); program and kernel objects do not.
+        for attr in ('bloom_buf', '_rules_buf', '_rules_offsets_buf', '_rules_lengths_buf'):
             obj = getattr(self, attr, None)
-            if obj: obj.release()
+            if obj is not None:
+                try: obj.release()
+                except Exception: pass
+            setattr(self, attr, None)
+        for attr in ('queue',):
+            obj = getattr(self, attr, None)
+            if obj is not None:
+                try: obj.finish()
+                except Exception: pass
+            setattr(self, attr, None)
+        for attr in ('program', 'kernel_single', 'kernel_chain', 'kernel_bloom', 'context'):
             setattr(self, attr, None)
         if self.device is None: return False
         try:
@@ -1666,6 +1678,8 @@ class GPUEngine:
         self.bloom_buf = cl.Buffer(self.context, cl.mem_flags.READ_ONLY|cl.mem_flags.COPY_HOST_PTR, hostbuf=bf)
 
     def _flatten(self, items):
+        if not items:
+            return (np.array([], dtype=np.uint8), np.array([], dtype=np.int32), np.array([], dtype=np.int32))
         enc = [x.encode('latin-1') for x in items]
         flat = b''.join(enc)
         offs = [0]; lens = [len(enc[0])]
@@ -2028,7 +2042,7 @@ class GPUEngine:
         return seqs, depths
 
     def _run_chain_kernel(self, words, chains, _precomputed=None):
-        if _precomputed:
+        if _precomputed is not None:
             seqs_np = np.array(_precomputed[0], dtype=np.int32)
             depths_np = np.array(_precomputed[1], dtype=np.int32)
         else:
@@ -2111,7 +2125,7 @@ class GeneticRuleEvolver:
         for cs, hits in raw_map.items():
             if hits<=0: continue
             sig = self._get_sig(cs)
-            if sig==('__UNSUPPORTED__',): continue
+            if len(sig) >= 2 and sig[0] == '__UNSUPPORTED__': continue
             if sig not in self._sig_to_best or hits>self._sig_to_best[sig][1]:
                 self._sig_to_best[sig] = (cs, hits)
                 new+=1
