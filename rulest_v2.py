@@ -566,7 +566,11 @@ def _minimize_mem(rule_counter, probe_words):
     t0 = time.time()
     if use_mp:
         task_args = [(rule, count, probe_words) for rule, count in rule_items]
-        ctx = mp.get_context('fork' if hasattr(os, 'fork') else 'spawn')
+        # Choose context: 'fork' only on Unix, 'spawn' on Windows
+        if hasattr(os, 'fork'):
+            ctx = mp.get_context('fork')
+        else:
+            ctx = mp.get_context('spawn')
         with tqdm(total=n_total, desc=green("  Minimizing"), unit="rule", ncols=ncols,
                   bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}") as pbar:
             n_groups = 0
@@ -2389,6 +2393,12 @@ class GPUExtractor:
         builtin_set = set(rules)
         all_seeds = self.load_seed_rules()
         n_s0_chains_to_stage2 = 0
+
+        # ------------------------------------------------------------
+        # FIX: initialize variables that might be used even when token_strip is False
+        # ------------------------------------------------------------
+        ts_extra_singles = []
+        # ts_chains, ts_sbd, n_s0_chains_to_stage2 already defined above
 
         if self.token_strip:
             log_section("STAGE 0 — Token-Strip Rule Extraction (Core + Insert)")
