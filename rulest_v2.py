@@ -73,7 +73,9 @@ class KeyboardController:
             time.sleep(0.15)
 
     @property
-    def quit_requested(self): return self._quit
+    def quit_requested(self):
+        with self._lock:
+            return self._quit
 
     def _handle(self, ch):
         ch = ch.lower()
@@ -81,7 +83,7 @@ class KeyboardController:
             with self._lock:
                 if self._quit: return
                 self._paused = True
-            w = shutil.get_terminal_size((80,24)).columns   # full width
+            w = shutil.get_terminal_size((80,24)).columns
             print(f"\n{yellow('─'*w)}")
             print(f"{yellow('│')} {bold('PAUSED')}  —  press {bold(green('r'))} resume  |  {bold(yellow('q'))} save & quit")
             print(f"{yellow('─'*w)}")
@@ -157,7 +159,7 @@ def log_warn(msg): print(yellow(f"[WARN] {msg}"))
 def log_error(msg): print(red(f"[ERROR] {msg}"))
 
 def log_section(title):
-    w = shutil.get_terminal_size((80,24)).columns   # full width
+    w = shutil.get_terminal_size((80,24)).columns
     bar = '─' * w
     print(f"\n{cyan(bar)}")
     print(f"{cyan('│')} {bold(title.upper())}")
@@ -183,7 +185,7 @@ def print_banner():
 def _print_controls():
     if not (sys.stdin.isatty() and (_HAS_TERMIOS or _HAS_MSVCRT)):
         return
-    w = shutil.get_terminal_size((80,24)).columns - 2   # leave 2 char margins for indentation
+    w = shutil.get_terminal_size((80,24)).columns - 2
     sep = dim('─' * w)
     print(f"  {sep}")
     print(f"  {bold('Controls')}  "
@@ -247,49 +249,22 @@ _p0_worker_base_by_len = {}
 # words, mixed-case, digit, special-char, and repeated-char patterns.
 # ----------------------------------------------------------------------
 BUILTIN_PROBES = [
-    # very short — edge cases k K { } [ ]
-    "ab", "abc", "abcd",
-    # short alphanumeric (len 4-6)
-    "pass", "root", "test", "admin", "login",
-    # typical password base words (len 7-9)
-    "letmein", "welcome", "password", "sunshine",
-    "football", "baseball", "princess", "dragon12",
-    # longer words (len 10-11) — truncation / repeat ops
-    "qwertyuiop", "iloveyou12", "monkey12345", "superman123", "mustang2024",
-    # extended-length (len 12-36) — positions B(11) through Z(35)
-    # Without these, rules like 'B-'Z / TB-TZ / DB-DZ all look like no-ops.
-    "administrator1",
-    "iloveyouforever",
-    "qwertyuiopasdfgh",
-    "correcthorsebattery",
-    "averylongpassword1234",
-    "averylongpassword12345678",
-    "averylongpassword1234567890ab",
-    "averylongpassword1234567890abcdef",
-    "averylongpassword1234567890abcdefghi",  # len 36 — covers Z(35)
-    # alphabet coverage — all 95 printable ASCII code-points (0x20-0x7E)
-    # Ensures @X / sXY rules for any char are distinguishable from no-ops.
-    "abcdefghijklmnopqrstuvwxyz",        # all 26 lowercase
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZ",        # all 26 uppercase
-    "!@#$%^&*()-_=+[]{}|;:,.<>?/~",     # 30 common punctuation chars
-    "a`b",   # backtick  (0x60)
-    'a"b',   # double-quote (0x22)
-    "a'b",   # single-quote (0x27)
-    "a\\b",  # backslash (0x5C)
-    "a b",   # space (0x20) — completes 95/95 printable ASCII
-    # mixed-case — l u c C t E T k K
-    "Password", "AdminUser", "MySecret", "HelloWorld",
-    # words with digits — s o @ T
-    "pass123", "admin2024", "test1234", "user9999",
-    # special chars — @ removal, s substitution
-    "p@ssw0rd", "s3cur1ty",
-    # repeated chars — q z Z
-    "aaaa", "bbbb",
+    "ab", "abc", "abcd", "pass", "root", "test", "admin", "login",
+    "letmein", "welcome", "password", "sunshine", "football", "baseball",
+    "princess", "dragon12", "qwertyuiop", "iloveyou12", "monkey12345",
+    "superman123", "mustang2024", "administrator1", "iloveyouforever",
+    "qwertyuiopasdfgh", "correcthorsebattery", "averylongpassword1234",
+    "averylongpassword12345678", "averylongpassword1234567890ab",
+    "averylongpassword1234567890abcdef", "averylongpassword1234567890abcdefghi",
+    "abcdefghijklmnopqrstuvwxyz", "ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+    "!@#$%^&*()-_=+[]{}|;:,.<>?/~", "a`b", 'a"b', "a'b", "a\\b", "a b",
+    "Password", "AdminUser", "MySecret", "HelloWorld", "pass123", "admin2024",
+    "test1234", "user9999", "p@ssw0rd", "s3cur1ty", "aaaa", "bbbb",
 ]
 BUILTIN_PROBES = list(dict.fromkeys(BUILTIN_PROBES))
 
 # ----------------------------------------------------------------------
-# Rule validator (unchanged)
+# Rule validator
 # ----------------------------------------------------------------------
 def should_exclude_rule(rule):
     if ALLOW_REJECT_RULES: return False
@@ -365,14 +340,13 @@ def fnv1a_32(data, seed=FNV1A_SEED1):
     return h
 
 # ----------------------------------------------------------------------
-# Python rule applicator (unchanged)
+# Python rule applicator
 # ----------------------------------------------------------------------
 def _py_apply_single_rule(rule, word):
     if not rule: return word
     w = list(word.encode('latin-1'))
     cmd = rule[0]
     def dg(c):
-        # Hashcat uses base-36 positions: 0-9 → 0-9, A-Z → 10-35
         if '0' <= c <= '9': return ord(c) - 48
         if 'A' <= c <= 'Z': return ord(c) - 55
         return -1
@@ -409,18 +383,15 @@ def _py_apply_single_rule(rule, word):
             for c in w: out += [c,c]
             w = out
         elif cmd == 'E':
-            # Title-case: uppercase word-start letters, lowercase mid-word
-            # uppercase letters.  Hashcat uses only ASCII space (0x20) as the
-            # word separator — hyphen and underscore are NOT separators for E.
             out = []; cap = True
             for c in w:
                 if cap and 97 <= c <= 122:
-                    out.append(c & ~0x20)   # word-start lowercase → uppercase
+                    out.append(c & ~0x20)
                 elif not cap and 65 <= c <= 90:
-                    out.append(c | 0x20)    # mid-word uppercase → lowercase
+                    out.append(c | 0x20)
                 else:
                     out.append(c)
-                cap = (c == 32)             # only space triggers capitalisation
+                cap = (c == 32)
             w = out
         elif cmd == '^' and len(rule)>=2: w = [ord(rule[1])] + w
         elif cmd == '$' and len(rule)>=2: w = w + [ord(rule[1])]
@@ -454,7 +425,6 @@ def _py_apply_single_rule(rule, word):
             p = dg(rule[1]); delta = 1 if cmd=='.' else -1
             if 0<=p<len(w): w[p] = (w[p]+delta)&0xFF
         elif cmd == "'" and len(rule)>=2:
-            # 'N — keep exactly the first N characters (w[:N])
             p = dg(rule[1])
             if 0<=p: w = w[:p]
         elif cmd == 'z' and len(rule)>=2:
@@ -479,7 +449,6 @@ def _py_apply_single_rule(rule, word):
             p,ch = dg(rule[1]), ord(rule[2])
             if 0<=p<len(w): w[p] = ch
         elif cmd == 'e' and len(rule)>=2:
-            # Title-case with custom separator
             sep = ord(rule[1]); out = []; cap = True
             for c in w:
                 if cap and 97<=c<=122:
@@ -491,7 +460,6 @@ def _py_apply_single_rule(rule, word):
                 cap = (c == sep)
             w = out
         elif cmd == 'x' and len(rule)>=3:
-            # xNM — extract M characters starting at position N: w[N:N+M]
             n, m = dg(rule[1]), dg(rule[2])
             if n>=0 and m>=0: w = w[n:n+m]
         elif cmd == 'O' and len(rule)>=3:
@@ -501,8 +469,6 @@ def _py_apply_single_rule(rule, word):
             a,b = dg(rule[1]), dg(rule[2])
             if 0<=a<len(w) and 0<=b<len(w) and a!=b: w[a],w[b]=w[b],w[a]
         elif cmd == '3' and len(rule)>=3:
-            # 3NX — toggle after the Nth separator X (N is 0-based).
-            # cnt is incremented before the compare, so n=0 (first sep) needs cnt==1.
             n,sep = dg(rule[1]), ord(rule[2]); cnt=0
             for i,c in enumerate(w):
                 if c==sep:
@@ -524,18 +490,34 @@ def py_apply_chain(chain, word):
     return cur
 
 # ----------------------------------------------------------------------
-# Signature minimisation (unchanged)
+# Signature minimisation — using SHA1 hash of outputs
 # ----------------------------------------------------------------------
-def compute_rule_signature(rule, probe_words):
+
+# Module-level globals used by the multiprocessing worker so it is
+# picklable (local/closure functions cannot be pickled on spawn/forkserver).
+_minimize_worker_probe_words: list = []
+
+def _minimize_worker_init(probe_words):
+    """Pool initializer — stores probe words in each worker process."""
+    global _minimize_worker_probe_words
+    _minimize_worker_probe_words = probe_words
+
+def _minimize_worker_sig(rule_count):
+    """Top-level (picklable) worker: compute signature for one (rule, count) pair."""
+    rule, count = rule_count
+    sig = compute_rule_signature_hash(rule, _minimize_worker_probe_words)
+    return sig, rule, count
+
+
+def compute_rule_signature_hash(rule, probe_words):
     outputs = []
     for w in probe_words:
         out = py_apply_chain(rule, w)
         if out is None:
-            # Unique sentinel per rule — prevents all unsupported rules from
-            # sharing one bucket (which would keep only 1 of e.g. 200 reject rules).
-            return ('__UNSUPPORTED__', rule)
+            return hashlib.sha1(f"__UNSUPPORTED__::{rule}".encode()).hexdigest()
         outputs.append(out)
-    return tuple(outputs)
+    combined = '\x00'.join(outputs).encode('utf-8', errors='replace')
+    return hashlib.sha1(combined).hexdigest()
 
 def minimize_by_signature(rule_counter, probe_words):
     if not rule_counter: return Counter()
@@ -548,64 +530,55 @@ def minimize_by_signature(rule_counter, probe_words):
     else:
         return _minimize_mem(rule_counter, probe_words)
 
-def _compute_sig_worker(args):
-    """Top-level worker for mp.Pool — computes (sig, rule, count) tuple."""
-    rule, count, probe_words = args
-    sig = compute_rule_signature(rule, probe_words)
-    return sig, rule, count
-
 def _minimize_mem(rule_counter, probe_words):
     sig_map = defaultdict(list)
     rule_items = list(rule_counter.items())
     n_total = len(rule_items)
     ncols = shutil.get_terminal_size((80,24)).columns
-    # Use multiprocessing for large rule sets; overhead isn't worth it below ~500 rules
     n_workers = max(1, min(mp.cpu_count(), n_total // 200 + 1))
     use_mp = n_total >= 500 and n_workers > 1
     log_info(f"[MINIMIZE] Workers    : {bold(str(n_workers if use_mp else 1))}")
     t0 = time.time()
     if use_mp:
-        task_args = [(rule, count, probe_words) for rule, count in rule_items]
-        # Choose context: 'fork' only on Unix, 'spawn' on Windows
         if hasattr(os, 'fork'):
             ctx = mp.get_context('fork')
         else:
             ctx = mp.get_context('spawn')
         with tqdm(total=n_total, desc=green("  Minimizing"), unit="rule", ncols=ncols,
                   bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}") as pbar:
-            n_groups = 0
-            done = 0
-            with ctx.Pool(processes=n_workers) as pool:
-                for sig, rule, count in pool.imap_unordered(_compute_sig_worker, task_args, chunksize=64):
+            with ctx.Pool(processes=n_workers,
+                          initializer=_minimize_worker_init,
+                          initargs=(probe_words,)) as pool:
+                for sig, rule, count in pool.imap_unordered(_minimize_worker_sig, rule_items, chunksize=64):
                     sig_map[sig].append((rule, count))
-                    n_groups = len(sig_map)
-                    done += 1
-                    elapsed = time.time() - t0
-                    spd = _fmt_speed(done / elapsed if elapsed > 0 else 0, "rules")
-                    pbar.set_postfix({"unique_sigs": cyan(str(n_groups)), "spd": green(spd)}, refresh=False)
                     pbar.update(1)
+                    elapsed = time.time() - t0
+                    spd = _fmt_speed(pbar.n / elapsed if elapsed>0 else 0, "rules")
+                    pbar.set_postfix({"unique_sigs": cyan(str(len(sig_map))), "spd": green(spd)}, refresh=False)
     else:
         with tqdm(total=n_total, desc=green("  Minimizing"), unit="rule", ncols=ncols,
                   bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}") as pbar:
-            n_groups = 0
-            done = 0
-            for rule, gpu_count in rule_items:
-                sig = compute_rule_signature(rule, probe_words)
-                sig_map[sig].append((rule, gpu_count))
-                n_groups = len(sig_map)
-                done += 1
-                elapsed = time.time() - t0
-                spd = _fmt_speed(done / elapsed if elapsed > 0 else 0, "rules")
-                pbar.set_postfix({"unique_sigs": cyan(str(n_groups)), "spd": green(spd)}, refresh=False)
+            for rule, count in rule_items:
+                sig = compute_rule_signature_hash(rule, probe_words)
+                sig_map[sig].append((rule, count))
                 pbar.update(1)
+                elapsed = time.time() - t0
+                spd = _fmt_speed(pbar.n / elapsed if elapsed>0 else 0, "rules")
+                pbar.set_postfix({"unique_sigs": cyan(str(len(sig_map))), "spd": green(spd)}, refresh=False)
     survivors = Counter()
     n_unsupported = 0
     for sig, group in sig_map.items():
-        if len(sig) >= 1 and sig[0] == '__UNSUPPORTED__':
+        if sig.startswith('__UNSUPPORTED__'):
             n_unsupported += len(group)
         best_rule, best_count = min(group, key=lambda x: (-x[1], len(x[0].split()), x[0]))
         survivors[best_rule] = best_count
-    _log_minimize_stats(len(rule_counter), survivors, len(sig_map), n_unsupported)
+    removed = n_total - len(survivors)
+    log_info(f"[MINIMIZE] {green('Done')}")
+    log_info(f"           Unique signatures : {bold(cyan(str(len(sig_map)))):>12s}")
+    log_info(f"           Rules kept        : {bold(green(str(len(survivors)))):>12s}")
+    log_info(f"           Rules removed     : {bold(red(str(removed))):>12s}  ({removed/max(1,n_total):.1%})")
+    if n_unsupported:
+        log_info(f"           Unsupported (kept 1 each group) : {bold(str(n_unsupported))}")
     return survivors
 
 def _minimize_disk(rule_counter, probe_words):
@@ -649,11 +622,9 @@ def _minimize_disk(rule_counter, probe_words):
             t0 = time.time()
             done = 0
             for rule, count in rule_items:
-                sig = compute_rule_signature(rule, probe_words)
-                sig_str = '\x00'.join(sig)
-                sig_hash = hashlib.sha1(sig_str.encode('latin-1','replace')).hexdigest()
+                sig = compute_rule_signature_hash(rule, probe_words)
                 depth = len(rule.split())
-                batch.append((sig_hash, rule, count, depth))
+                batch.append((sig, rule, count, depth))
                 if len(batch) >= MINIMIZE_DISK_BATCH_SIZE:
                     conn.executemany(_UPSERT, batch); conn.commit()
                     done += len(batch)
@@ -669,20 +640,15 @@ def _minimize_disk(rule_counter, probe_words):
         for rule_str, cnt in conn.execute('SELECT rule, count FROM sig_best'):
             survivors[rule_str] = cnt
         conn.close()
-        _log_minimize_stats(n_total, survivors, len(survivors), 0)
+        removed = n_total - len(survivors)
+        log_info(f"[MINIMIZE] {green('Done')}")
+        log_info(f"           Unique signatures : {bold(cyan(str(len(survivors)))):>12s}")
+        log_info(f"           Rules kept        : {bold(green(str(len(survivors)))):>12s}")
+        log_info(f"           Rules removed     : {bold(red(str(removed))):>12s}  ({removed/max(1,n_total):.1%})")
         return survivors
     finally:
         try: os.unlink(tmp_path)
         except: pass
-
-def _log_minimize_stats(n_input, survivors, n_groups, n_unsupported):
-    removed = n_input - len(survivors)
-    log_info(f"[MINIMIZE] {green('Done')}")
-    log_info(f"           Unique signatures : {bold(cyan(str(n_groups))):>12s}")
-    log_info(f"           Rules kept        : {bold(green(str(len(survivors)))):>12s}")
-    log_info(f"           Rules removed     : {bold(red(str(removed))):>12s}  ({removed/max(1,n_input):.1%})")
-    if n_unsupported:
-        log_info(f"           Unsupported (kept 1 each group) : {bold(str(n_unsupported))}")
 
 # ----------------------------------------------------------------------
 # Stage 0 – Token‑strip rule extraction (core + insert)
@@ -848,7 +814,7 @@ def _worker_init_p0(base_set=None, base_by_len=None):
 
 def _process_chunk_p0(args):
     words, max_depth, min_len, max_amb, max_pre, max_suf = args
-    base_set = _p0_worker_base_set
+    base_set = _p0_worker_base_set.copy()  # defensive copy — safe under fork, no-op cost under spawn
     base_by_len = _p0_worker_base_by_len
     found = set()
     for w in words:
@@ -910,13 +876,11 @@ def extract_token_strip_rules(target_words, base_set, max_depth=0, min_stem_len=
     base_by_len = defaultdict(set)
     for w in base_set: base_by_len[len(w)].add(w)
     base_by_len = dict(base_by_len)
-    # Automatic disk fallback for huge target lists (>150 MB)
     total_bytes = sum(len(w) for w in target_words)
     DISK_THRESHOLD_BYTES = 150 * 1024 * 1024
     if total_bytes > DISK_THRESHOLD_BYTES:
         log_warn(f"[S0] Target wordlist size {total_bytes/1e6:.0f}MB > {DISK_THRESHOLD_BYTES/1e6:.0f}MB — using single worker & disk buffer")
         n_workers = 1
-    # -------------------------------
     global _p0_worker_base_set, _p0_worker_base_by_len
     _p0_worker_base_set = base_set
     _p0_worker_base_by_len = base_by_len
@@ -1048,7 +1012,6 @@ def calculate_dynamic_parameters(base_count, target_count, device=None, target_h
             name_up = device.get_info(cl.device_info.NAME).upper()
             lws = max(s for s in POSSIBLE_WORK_GROUP_SIZES if s <= mwgs)
             if 'NVIDIA' in name_up and mcu >= 38: lws = min(512, lws)
-            # conservative estimate
             est = LOW_END_COMBOS_PER_SEC if mcu < LOW_END_COMPUTE_UNITS_THRESHOLD else BASELINE_COMBOS_PER_SEC
             log_info(f"[GPU]  CU={mcu}, VRAM~{vgb:.1f}GB, WGS={lws}, est={est//1_000_000}M/s")
         except:
@@ -1064,11 +1027,10 @@ def calculate_dynamic_parameters(base_count, target_count, device=None, target_h
         eff_bloom = get_auto_bloom_mb(vgb)
 
     total_bits = eff_bloom * 1024 * 1024 * 8
-    # Ensure power of two for fast masking
     if total_bits & (total_bits - 1):
         total_bits = 1 << total_bits.bit_length()
         eff_bloom = total_bits // (1024*1024*8)
-    SHARD_BITS = 1 << 32        # 512 MB per shard = 2^32 bits
+    SHARD_BITS = 1 << 32
     if not bloom_no_shard and total_bits > SHARD_BITS:
         num_shards = (total_bits + SHARD_BITS - 1) // SHARD_BITS
         shard_bits = SHARD_BITS
@@ -1076,11 +1038,7 @@ def calculate_dynamic_parameters(base_count, target_count, device=None, target_h
         log_info(f"[BLOOM] Sharding enabled: {eff_bloom}MB -> {num_shards} shards of 512MB, total {bloom_bits//(1024*1024*8)}MB")
     else:
         num_shards = 1
-        # Round shard_bits up to next power of 2 so the kernel can use a cheap
-        # bitmask (& (shard_bits-1)) instead of modulo.  For filters ≤512 MB
-        # this is already guaranteed by get_auto_bloom_mb, but user-supplied
-        # --bloom-mb values may not be powers of two.
-        if total_bits & (total_bits - 1):          # not already power of 2
+        if total_bits & (total_bits - 1):
             total_bits = 1 << total_bits.bit_length()
             eff_bloom  = total_bits // (1024 * 1024 * 8)
         shard_bits = total_bits
@@ -1145,7 +1103,7 @@ class GPUCompatibleRulesGenerator:
         return valid
 
 # ----------------------------------------------------------------------
-# OpenCL kernel with fast bitmask & sharding support
+# OpenCL kernel template (unchanged – full version)
 # ----------------------------------------------------------------------
 GPU_KERNEL_TEMPLATE = r"""
 #pragma OPENCL EXTENSION cl_khr_global_int32_base_atomics : enable
@@ -1184,7 +1142,6 @@ int bloom(__global const uchar *bf, const unsigned char *w, int len) {{
     return 1;
 }}
 
-/* apply rule (unchanged) */
 int apply(const unsigned char *rs, int rl,
           const unsigned char *in, int il,
           unsigned char *out, int *ol) {{
@@ -1480,11 +1437,11 @@ __kernel void build_bloom_filter_gpu(
 }}
 """
 
-# ----------------------------------------------------------------------
-# GPU Engine (with optional sharding and fast bloom)
-# ----------------------------------------------------------------------
 _BLOOM_ALREADY_ON_GPU = object()
 
+# ----------------------------------------------------------------------
+# GPU Engine (with sharding, fast bloom, and fixed depth handling)
+# ----------------------------------------------------------------------
 class GPUEngine:
     def __init__(self, params):
         self.params = params
@@ -1507,6 +1464,7 @@ class GPUEngine:
         self._rules_lengths_buf = None
         self._rules_buf_key = None
         self._bloom_recovery_fn = None
+        self._compiled_depth = None   # track compiled MAX_CHAIN_DEPTH
 
     def get_free_vram(self): return estimate_free_vram(self.device)
     def get_max_allocation(self): return get_max_allocation(self.device)
@@ -1519,9 +1477,10 @@ class GPUEngine:
         fv = self._cached_free_vram or self.get_free_vram()
         ma = self._cached_max_alloc or self.get_max_allocation()
         avail = min(fv, ma) - 5*1024**2
-        return min(max(avail,0)//MAX_CHAIN_STRING_LEN,
-                   self.params['MAX_SAFE_RESULTS_PER_BATCH'],
-                   words_count*chains_count, 5000) or 1
+        # Ensure at least 1 slot
+        return max(1, min(avail//MAX_CHAIN_STRING_LEN,
+                          self.params['MAX_SAFE_RESULTS_PER_BATCH'],
+                          words_count*chains_count, 5000))
 
     def initialize_gpu(self, device_spec):
         try:
@@ -1539,10 +1498,15 @@ class GPUEngine:
             return True
         except Exception as e: log_error(f"GPU init failed: {e}"); return False
 
-    def compile_kernel(self):
-        if self.program:
-            log_debug("kernel already compiled")
+    def compile_kernel(self, force=False):
+        current_depth = self.params.get('MAX_CHAIN_DEPTH', 2)
+        if not force and self.program is not None and self._compiled_depth == current_depth:
+            log_debug("kernel already compiled with same depth")
             return self.program
+        if self.program:
+            log_info(f"[GPU]  Recompiling kernel for depth {current_depth} (was {self._compiled_depth})")
+        else:
+            log_info("[GPU]  Compiling kernel ...")
         try:
             src = GPU_KERNEL_TEMPLATE.format(
                 BLOOM_FILTER_SIZE=self.params['BLOOM_FILTER_SIZE'],
@@ -1550,60 +1514,59 @@ class GPUEngine:
                 BLOOM_SHARD_BITS=self.params['BLOOM_SHARD_BITS'],
                 BLOOM_SHARD_BYTES=self.params['BLOOM_SHARD_BYTES'],
                 MAX_SAFE_RESULTS_PER_BATCH=self.params['MAX_SAFE_RESULTS_PER_BATCH'],
-                MAX_CHAIN_DEPTH=self.params['MAX_CHAIN_DEPTH'],
+                MAX_CHAIN_DEPTH=current_depth,
                 MAX_CHAIN_STRING_LEN=MAX_CHAIN_STRING_LEN,
                 MAX_WORD_LEN=MAX_WORD_LEN,
                 MAX_RULE_LEN=MAX_RULE_LEN,
                 MAX_OUTPUT_LEN=MAX_OUTPUT_LEN,
                 BLOOM_HASH_FUNCTIONS=BLOOM_HASH_FUNCTIONS,
             )
-            result = []
-            def _build():
-                try:
-                    prog = cl.Program(self.context, src); prog.build()
-                    result.append(prog)
-                except Exception as e: result.append(e)
-            t = threading.Thread(target=_build, daemon=True); t.start()
-            print("[GPU]  Compiling kernel ", end='', flush=True)
-            while t.is_alive():
-                t.join(timeout=10)
-                if t.is_alive(): print('.', end='', flush=True)
-            print(" done", flush=True)
-            if isinstance(result[0], Exception): raise result[0]
-            prog = result[0]
+            prog = cl.Program(self.context, src)
+            prog.build()
             self.program = prog
             self.kernel_single = prog.find_single_rules_gpu
             self.kernel_chain = prog.find_rule_chains_gpu
             self.kernel_bloom = prog.build_bloom_filter_gpu
+            self._compiled_depth = current_depth
+            log_info("[GPU]  Kernel compiled successfully")
             return prog
-        except Exception as e: log_error(f"Kernel compile failed: {e}"); return None
+        except Exception as e:
+            log_error(f"Kernel compile failed: {e}")
+            return None
 
     def _reset_gpu(self, error):
         log_warn(f"[GPU] Fatal kernel error: {error} — resetting context")
-        # Only PyOpenCL buffer/queue objects have .release(); program and kernel objects do not.
-        for attr in ('bloom_buf', '_rules_buf', '_rules_offsets_buf', '_rules_lengths_buf'):
-            obj = getattr(self, attr, None)
-            if obj is not None:
-                try: obj.release()
-                except Exception: pass
-            setattr(self, attr, None)
-        for attr in ('queue',):
-            obj = getattr(self, attr, None)
-            if obj is not None:
-                try: obj.finish()
-                except Exception: pass
-            setattr(self, attr, None)
-        for attr in ('program', 'kernel_single', 'kernel_chain', 'kernel_bloom', 'context'):
-            setattr(self, attr, None)
-        if self.device is None: return False
+        # Release all buffers
+        for buf in [self.bloom_buf, self._rules_buf, self._rules_offsets_buf, self._rules_lengths_buf]:
+            if buf is not None:
+                try: buf.release()
+                except: pass
+        if self.queue is not None:
+            try: self.queue.finish()
+            except: pass
+        # Clear state
+        self.bloom_buf = self._rules_buf = self._rules_offsets_buf = self._rules_lengths_buf = None
+        self.program = self.kernel_single = self.kernel_chain = self.kernel_bloom = None
+        self.context = None
+        self.queue = None
+        self.gpu_rules = []
+        self.rule_index = {}
+        self._rules_buf_key = None
+        # Recreate
         try:
             self.context = cl.Context([self.device])
             self.queue = cl.CommandQueue(self.context)
-            if not self.compile_kernel(): return False
-            if self._bloom_recovery_fn: self.upload_bloom_filter(self._bloom_recovery_fn())
-            elif self.bloom_np is not None: self.upload_bloom_filter(self.bloom_np)
+            if not self.compile_kernel(force=True):
+                return False
+            if self._bloom_recovery_fn:
+                bf = self._bloom_recovery_fn()
+                self.upload_bloom_filter(bf)
+            elif self.bloom_np is not None:
+                self.upload_bloom_filter(self.bloom_np)
             return True
-        except Exception as exc: log_error(f"Reset failed: {exc}"); return False
+        except Exception as exc:
+            log_error(f"Reset failed: {exc}")
+            return False
 
     def _safe_queue_finish(self):
         if self.queue is None: return False
@@ -1659,10 +1622,11 @@ class GPUEngine:
             self.kernel_bloom.set_args(words_buf, offsets_buf, lengths_buf, np.int32(nw), bf_buf)
             cl.enqueue_nd_range_kernel(self.queue, self.kernel_bloom, (gs,), (self.local_work_size,))
             if not self._safe_queue_finish(): raise RuntimeError("queue finish timeout")
-            sample = np.empty(min(1024, bf_int32_size), dtype=np.int32)
+            # Verify at least 256 bytes of the bloom filter – if all zero, fallback
+            sample = np.empty(min(2048, bf_int32_size), dtype=np.int32)
             cl.enqueue_copy(self.queue, sample, bf_buf)
-            if np.count_nonzero(sample) == 0 and nw>0:
-                log_warn("[BLOOM] GPU build all-zero -> fallback")
+            if np.count_nonzero(sample) == 0 and nw > 0:
+                log_warn("[BLOOM] GPU build all-zero -> fallback to CPU")
                 raise RuntimeError("all-zero")
             if self.bloom_buf: self.bloom_buf.release()
             self.bloom_buf = bf_buf
@@ -1716,6 +1680,7 @@ class GPUEngine:
     def process_all_words_single_rule(self, base_words, rules, bloom_filter):
         self.upload_bloom_filter(bloom_filter)
         if not self.compile_kernel(): return Counter()
+        # Refresh GPU rules list
         self.gpu_rules = HashcatRuleValidator.validate_rules_for_gpu(rules)
         self.rule_index = {r:i for i,r in enumerate(self.gpu_rules)}
         counter = Counter()
@@ -1771,7 +1736,10 @@ class GPUEngine:
                     if r: out.append(r)
             return out
         except Exception as e:
-            log_warn(f"Single kernel error: {e}"); self._reset_gpu(e); return []
+            log_warn(f"Single kernel error: {e}")
+            if not self._reset_gpu(e):
+                log_error("GPU reset failed - aborting batch")
+            return []
         finally:
             for b in bufs: b.release()
 
@@ -1793,7 +1761,6 @@ class GPUEngine:
         return gen
 
     def build_numeric_seed_families(self, max_depth):
-        # same as in original (full version present in final code)
         digits = '0123456789'
         sbd = defaultdict(set)
         # A
@@ -2029,20 +1996,19 @@ class GPUEngine:
         maxd = self.params['MAX_CHAIN_DEPTH']
         seqs = []
         depths = []
+        truncated = 0
         for c in chains:
             parts = c.split()
-            # Safety: truncate chains that exceed the compiled MAX_CHAIN_DEPTH.
-            # Without this, over-long chains produce more than maxd entries in
-            # seqs[], which shifts all subsequent chain offsets and causes the
-            # kernel to read garbage indices — silently dropping depth-10 chains
-            # when any longer chain appears earlier in the list.
             if len(parts) > maxd:
+                truncated += 1
                 parts = parts[:maxd]
             depths.append(len(parts))
             idxs = [self.rule_index.get(r, -1) for r in parts]
             while len(idxs) < maxd:
                 idxs.append(-1)
             seqs.extend(idxs)
+        if truncated:
+            log_warn(f"[GPU] {truncated} chain(s) truncated to max depth {maxd}")
         return seqs, depths
 
     def _run_chain_kernel(self, words, chains, _precomputed=None):
@@ -2087,7 +2053,7 @@ class GPUEngine:
             for b in bufs: b.release()
 
 # ----------------------------------------------------------------------
-# Genetic Algorithm Rule Evolver (unchanged, with speed indicator)
+# Genetic Algorithm Rule Evolver (with signature cache limit)
 # ----------------------------------------------------------------------
 class GeneticRuleEvolver:
     def __init__(self, gpu_engine, base_words, rule_pool, max_depth,
@@ -2109,19 +2075,15 @@ class GeneticRuleEvolver:
         self.seed_chains_sorted = [r for r,_ in sorted(self.seed_hits.items(), key=lambda kv:-kv[1])] if self.seed_hits else []
         self.known_rules = known_rules or set()
         self._sig_cache = {}
+        self._sig_cache_max = 50000
         self._sig_to_best = {}
-
-    def _random_chain(self, depth=0):
-        if depth<=0: depth = random.randint(2, self.max_depth)
-        return [random.choice(self.rule_pool) for _ in range(depth)]
-
-    def _clamp(self, tokens):
-        if len(tokens)<2: tokens += self._random_chain(2-len(tokens))
-        return tokens[:self.max_depth]
 
     def _get_sig(self, chain_str):
         if chain_str not in self._sig_cache:
-            self._sig_cache[chain_str] = compute_rule_signature(chain_str, BUILTIN_PROBES)
+            if len(self._sig_cache) > self._sig_cache_max:
+                for k in list(self._sig_cache.keys())[:self._sig_cache_max//10]:
+                    del self._sig_cache[k]
+            self._sig_cache[chain_str] = compute_rule_signature_hash(chain_str, BUILTIN_PROBES)
         return self._sig_cache[chain_str]
 
     def _update_sig_registry(self, raw_map):
@@ -2129,7 +2091,7 @@ class GeneticRuleEvolver:
         for cs, hits in raw_map.items():
             if hits<=0: continue
             sig = self._get_sig(cs)
-            if len(sig) >= 2 and sig[0] == '__UNSUPPORTED__': continue
+            if sig.startswith('__UNSUPPORTED__'): continue
             if sig not in self._sig_to_best or hits>self._sig_to_best[sig][1]:
                 self._sig_to_best[sig] = (cs, hits)
                 new+=1
@@ -2198,25 +2160,13 @@ class GeneticRuleEvolver:
             pop.append(self._random_chain(d))
         return pop[:self.pop_size]
 
-    def evaluate_population(self, population):
-        cs = [' '.join(tok) for tok in population]
-        valid = [c for c in cs if HashcatRuleValidator.validate_rule_for_gpu(c)]
-        raw = {c:0 for c in cs}
-        if not valid: return raw
-        wsb = self.gpu_engine.params.get('WORD_SUB_BATCH',20000)
-        cbs = self.gpu_engine.params.get('CHAINS_PER_BATCH',2000)
-        batch_hits = Counter()
-        for ci in range(0, len(valid), cbs):
-            cb = valid[ci:ci+cbs]
-            seqs, depths = self.gpu_engine._compute_chain_seqs(cb)
-            for wi in range(0, len(self.base_words), wsb):
-                wb = self.base_words[wi:wi+wsb]
-                if wb:
-                    found = self.gpu_engine._run_chain_kernel(wb, cb, (seqs, depths))
-                    if found: batch_hits.update(found)
-            self.gpu_engine._safe_queue_finish()
-        raw.update(batch_hits)
-        return raw
+    def _random_chain(self, depth=0):
+        if depth<=0: depth = random.randint(2, self.max_depth)
+        return [random.choice(self.rule_pool) for _ in range(depth)]
+
+    def _clamp(self, tokens):
+        if len(tokens)<2: tokens += self._random_chain(2-len(tokens))
+        return tokens[:self.max_depth]
 
     def _tournament_select(self, fitness):
         k = min(self.tournament_k, len(fitness))
@@ -2248,6 +2198,26 @@ class GeneticRuleEvolver:
             idx = random.randrange(len(tokens))
             tokens[idx] = random.choice(self.rule_pool)
         return tokens
+
+    def evaluate_population(self, population):
+        cs = [' '.join(tok) for tok in population]
+        valid = [c for c in cs if HashcatRuleValidator.validate_rule_for_gpu(c)]
+        raw = {c:0 for c in cs}
+        if not valid: return raw
+        wsb = self.gpu_engine.params.get('WORD_SUB_BATCH',20000)
+        cbs = self.gpu_engine.params.get('CHAINS_PER_BATCH',2000)
+        batch_hits = Counter()
+        for ci in range(0, len(valid), cbs):
+            cb = valid[ci:ci+cbs]
+            seqs, depths = self.gpu_engine._compute_chain_seqs(cb)
+            for wi in range(0, len(self.base_words), wsb):
+                wb = self.base_words[wi:wi+wsb]
+                if wb:
+                    found = self.gpu_engine._run_chain_kernel(wb, cb, (seqs, depths))
+                    if found: batch_hits.update(found)
+            self.gpu_engine._safe_queue_finish()
+        raw.update(batch_hits)
+        return raw
 
     def evolve(self, hot_rules, generations, time_budget):
         if not self.rule_pool: log_warn("[S3] empty rule pool"); return Counter()
@@ -2334,7 +2304,7 @@ class GeneticRuleEvolver:
         return all_new
 
 # ----------------------------------------------------------------------
-# Main GPU Extractor
+# Main GPU Extractor (with depth fixes)
 # ----------------------------------------------------------------------
 class GPUExtractor:
     def __init__(self, base_count, target_count, max_depth, device_spec=None,
@@ -2346,7 +2316,7 @@ class GPUExtractor:
                  token_strip_workers=0, token_strip_chunk_size=0):
         self.base_count = base_count
         self.target_count = target_count
-        self.max_depth = max_depth
+        self.user_max_depth = max_depth
         self.device_spec = device_spec
         self.max_chains = max_chains
         self.seed_rules_file = seed_rules_file
@@ -2366,7 +2336,7 @@ class GPUExtractor:
         self.token_strip_chunk_size = token_strip_chunk_size
         self.params = calculate_dynamic_parameters(base_count, target_count, None, target_hours,
                                                    bloom_mb_override=bloom_mb, bloom_no_shard=bloom_no_shard)
-        self.params['MAX_CHAIN_DEPTH'] = max_depth
+        self.params['MAX_CHAIN_DEPTH'] = self.user_max_depth
         self.rules_gen = GPUCompatibleRulesGenerator()
         self.gpu_engine = None
         self.validator = HashcatRuleValidator()
@@ -2393,27 +2363,14 @@ class GPUExtractor:
         builtin_set = set(rules)
         all_seeds = self.load_seed_rules()
         n_s0_chains_to_stage2 = 0
-
-        # ------------------------------------------------------------
-        # FIX: initialize variables that might be used even when token_strip is False
-        # ------------------------------------------------------------
-        ts_extra_singles = []
-        # ts_chains, ts_sbd, n_s0_chains_to_stage2 already defined above
+        ts_extra_singles = []  # defined early to avoid UnboundLocalError
 
         if self.token_strip:
             log_section("STAGE 0 — Token-Strip Rule Extraction (Core + Insert)")
             base_set_ts = set(base_words)
             log_info(f"[S0]    {len(target_words):,} target words  base {len(base_set_ts):,}  min-stem={self.token_strip_min_stem}  prefix={self.token_strip_max_prefix}  suffix={self.token_strip_max_suffix}  leet-amb={self.token_strip_min_leet_amb}")
-            # Stage 0 is independent of --max-depth: its natural chain depth is
-            # prefix_len + suffix_len (each affix char = one op) plus a few extra
-            # slots for leet/case transforms.  Capping at self.max_depth would
-            # silently discard valid deep chains (e.g. prefix=10, suffix=10 can
-            # yield chains of depth 20 which are longer than a typical --max-depth 6).
-            _s0_natural_depth = min(
-                self.token_strip_max_prefix + self.token_strip_max_suffix + 4,
-                MAX_HASHCAT_CHAIN
-            )
-            ts_all = extract_token_strip_rules(target_words, base_set_ts, max_depth=_s0_natural_depth,
+            s0_max_depth = min(self.user_max_depth, MAX_HASHCAT_CHAIN)
+            ts_all = extract_token_strip_rules(target_words, base_set_ts, max_depth=s0_max_depth,
                                                min_stem_len=self.token_strip_min_stem,
                                                max_prefix_len=self.token_strip_max_prefix,
                                                max_suffix_len=self.token_strip_max_suffix,
@@ -2424,17 +2381,18 @@ class GPUExtractor:
                 d = len(r.split())
                 if d==1: ts_singles.append(r)
                 else:
-                    ts_chains.append(r)
-                    ts_sbd[d].add(r)  # no depth gate: seed pass depth is computed dynamically
+                    if d <= self.user_max_depth:
+                        ts_chains.append(r)
+                        ts_sbd[d].add(r)
+                    else:
+                        log_debug(f"[S0] Dropping chain depth {d} > user max depth {self.user_max_depth}: {r}")
             _log_token_strip_stats(len(target_words), ts_all, inject_sbd=self.builtin_seeds)
-            # Toggle seeds: natural depth = up to 12 (T0..T11 + 1-2 leet ops).
-            # Independent of --max-depth for the same reason as Stage 0 proper.
-            _toggle_natural_depth = min(12, MAX_HASHCAT_CHAIN)
-            if _s0_natural_depth >= 2:
-                toggle = _generate_toggle_chain_seeds(_toggle_natural_depth)
+            if self.user_max_depth >= 2:
+                toggle_max_depth = min(12, self.user_max_depth)
+                toggle = _generate_toggle_chain_seeds(toggle_max_depth)
                 for tc in toggle:
                     d = len(tc.split())
-                    if d>=2:
+                    if d>=2 and d <= self.user_max_depth:
                         ts_chains.append(tc)
                         ts_sbd.setdefault(d,set()).add(tc)
                         n_s0_chains_to_stage2 += 1
@@ -2449,24 +2407,17 @@ class GPUExtractor:
         self.params = calculate_dynamic_parameters(self.base_count, self.target_count, self.gpu_engine.device,
                                                    self.params['TARGET_SECONDS']/3600,
                                                    bloom_mb_override=self.bloom_mb, bloom_no_shard=self.bloom_no_shard)
-        # Stage S depth cap: at least 9 (natural max of built-in date chains:
-        # date8 + 1 bracket op).  If Stage 0 produced chains deeper than 9
-        # (possible when --max-depth > 9), raise the cap to match so those
-        # chains are never silently truncated in _compute_chain_seqs.
-        _SEED_PASS_MAX_DEPTH = max(9, max(ts_sbd.keys(), default=0))
-        if self.builtin_seeds:
-            self.params['MAX_CHAIN_DEPTH'] = max(self.max_depth, _SEED_PASS_MAX_DEPTH)
-        else:
-            self.params['MAX_CHAIN_DEPTH'] = self.max_depth
+        seed_pass_depth = max(9, self.user_max_depth)
+        self.params['MAX_CHAIN_DEPTH'] = seed_pass_depth
         self.gpu_engine.params = self.params
 
         extra_seeds = [s for s in all_seeds if ' ' not in s.strip()]
         extra_valid = [s for s in extra_seeds if s not in builtin_set]
         rules_phase1 = rules + ts_extra_singles + extra_valid
-        seed_chains = [s for s in all_seeds if ' ' in s.strip()]
+        seed_chains = [s for s in all_seeds if ' ' in s.strip() and len(s.split()) <= self.user_max_depth]
 
         if extra_valid: log_info(f"[SEED] {len(extra_valid)} seed single-rule(s) added to STAGE 1")
-        if seed_chains and self.max_depth<2: log_warn(f"[SEED] {len(seed_chains)} chain seed(s) ignored — requires --max-depth >= 2")
+        if seed_chains and self.user_max_depth<2: log_warn(f"[SEED] {len(seed_chains)} chain seed(s) ignored — requires --max-depth >= 2")
 
         global _p0_worker_base_set, _p0_worker_base_by_len
         _p0_worker_base_set = set()
@@ -2488,11 +2439,7 @@ class GPUExtractor:
         seed_hits = Counter()
         if self.builtin_seeds and not _kb.quit_requested:
             log_section("STAGE S — Seed Extraction (families A-M)")
-            # Always generate seed families up to _SEED_PASS_MAX_DEPTH (9) so that
-            # Stage S is independent of --max-depth.  Previously this was capped at
-            # self.max_depth, causing depth-(max_depth+1) date chains (e.g. date8 +
-            # 1 bracket = depth 9) to be skipped when --max-depth < 9.
-            sbd = self.gpu_engine.build_numeric_seed_families(max_depth=_SEED_PASS_MAX_DEPTH)
+            sbd = self.gpu_engine.build_numeric_seed_families(max_depth=seed_pass_depth)
             if ts_sbd:
                 n_injected = 0
                 n_ts_total = 0
@@ -2514,17 +2461,16 @@ class GPUExtractor:
             sbd = {}
             ts = t1
 
-        # Restore MAX_CHAIN_DEPTH to the user-specified limit for Stage 2.
-        # Stage S bumped it to _SEED_PASS_MAX_DEPTH (9); Stage 2 must respect
-        # --max-depth so chain generation and seqs stride stay within bounds.
-        self.params['MAX_CHAIN_DEPTH'] = self.max_depth
+        self.params['MAX_CHAIN_DEPTH'] = self.user_max_depth
         self.gpu_engine.params = self.params
+        if not self.gpu_engine.compile_kernel(force=True):
+            log_warn("Failed to recompile kernel for Stage 2 depth")
 
-        if self.max_depth > 1 and not _kb.quit_requested:
+        if self.user_max_depth > 1 and not _kb.quit_requested:
             log_section("STAGE 2 — Rule Chain Search")
             log_info(f"[S2]    {bold(cyan(str(n_s0_chains_to_stage2)))} rules from STAGE 0 injected into chain search")
 
-            if self.genetic and self.max_depth >= 2:
+            if self.genetic and self.user_max_depth >= 2:
                 _min_ga = 120.0
                 _ga_frac = 0.20
                 reserved_ga = max(_min_ga, self.params['TARGET_SECONDS'] * _ga_frac)
@@ -2532,7 +2478,7 @@ class GPUExtractor:
                 reserved_ga = 0.0
             remaining = max(0, self.params['TARGET_SECONDS'] - (t1-t0) - reserved_ga)
             budget = remaining * self.params['EST_COMBOS_PER_SEC'] * TIME_SAFETY_FACTOR
-            depths = list(range(2, self.max_depth+1))
+            depths = list(range(2, self.user_max_depth+1))
             depth_budgets = {d: int(budget/len(depths)/(len(base_words)*d)) for d in depths} if budget>0 and base_words and depths else {d:0 for d in depths}
             MIN_CHAINS = 5_000
             depth_budgets = {d: max(v, MIN_CHAINS) for d,v in depth_budgets.items()}
@@ -2548,19 +2494,19 @@ class GPUExtractor:
                     depth_budgets = {d: int(v*scale) for d,v in depth_budgets.items()}
             for d, bgt in depth_budgets.items():
                 self.params[f'CHAIN_GEN_LIMIT_{d}'] = bgt
-            log_info(f"[S2]    depth 2-{self.max_depth} | " + " | ".join(f"d{d}:{v:,}" for d,v in depth_budgets.items()))
-            chains = self.gpu_engine.process_all_words_chain_rules(base_words, rules_phase1, self.max_depth,
+            log_info(f"[S2]    depth 2-{self.user_max_depth} | " + " | ".join(f"d{d}:{v:,}" for d,v in depth_budgets.items()))
+            chains = self.gpu_engine.process_all_words_chain_rules(base_words, rules_phase1, self.user_max_depth,
                                                                    bloom_filter, single, seed_chains=seed_chains,
                                                                    prebuilt_sbd=sbd)
             all_counts.update(chains)
 
-        if self.genetic and self.max_depth >= 2 and not _kb.quit_requested:
+        if self.genetic and self.user_max_depth >= 2 and not _kb.quit_requested:
             log_section("STAGE 3 — Genetic Algorithm Rule Evolution")
             rule_pool = HashcatRuleValidator.validate_rules_for_gpu(rules_phase1)
             hot_rules = [r for r,_ in sorted(single.items(), key=lambda kv:-kv[1])]
             t_now = time.time()
             remaining = max(0.0, self.params['TARGET_SECONDS'] - (t_now - t0))
-            if self.genetic and self.max_depth >= 2:
+            if self.genetic and self.user_max_depth >= 2:
                 _min_ga = 120.0
                 _ga_frac = 0.20
                 reserved_ga = max(_min_ga, self.params['TARGET_SECONDS'] * _ga_frac)
@@ -2572,7 +2518,7 @@ class GPUExtractor:
             else:
                 log_info(f"[S3]    Budget: {bold(f'{ga_budget:.0f}s')}")
             known_set = set(all_counts.keys())
-            evolver = GeneticRuleEvolver(self.gpu_engine, base_words, rule_pool, self.max_depth,
+            evolver = GeneticRuleEvolver(self.gpu_engine, base_words, rule_pool, self.user_max_depth,
                                          pop_size=self.genetic_pop, elite_frac=self.genetic_elite,
                                          seed_hits=seed_hits, known_rules=known_set)
             ga_hits = evolver.evolve(hot_rules, self.genetic_generations, ga_budget)
@@ -2749,7 +2695,7 @@ def main():
     log_info(f"[OUT]  Minimized rules written to: {bold(args.output)}")
 
     elapsed = time.time()-t_start
-    sep = '─' * shutil.get_terminal_size((80,24)).columns   # full width
+    sep = '─' * shutil.get_terminal_size((80,24)).columns
     print()
     log_info(cyan(sep))
     log_info(f"  {bold('DONE')}  rulest finished in {bold(f'{elapsed:.1f}s')}")
@@ -2767,4 +2713,5 @@ def main():
     print()
 
 if __name__ == '__main__':
+    mp.set_start_method('spawn', force=True)  # Must be here, NOT at module top-level; workers re-import the module and would crash if this ran again
     main()
