@@ -569,7 +569,7 @@ def _minimize_mem(rule_counter, probe_words):
     n_unsupported = 0
     for sig, group in sig_map.items():
         if sig.startswith('__UNSUPPORTED__'):
-            n_unsupported += len(group)
+            n_unsupported += len(group) - 1  # count duplicates removed, not total kept
         best_rule, best_count = min(group, key=lambda x: (-x[1], len(x[0].split()), x[0]))
         survivors[best_rule] = best_count
     removed = n_total - len(survivors)
@@ -639,11 +639,12 @@ def _minimize_disk(rule_counter, probe_words):
         survivors = Counter()
         for rule_str, cnt in conn.execute('SELECT rule, count FROM sig_best'):
             survivors[rule_str] = cnt
+        n_unique_sigs = len(survivors)
         conn.close()
-        removed = n_total - len(survivors)
+        removed = n_total - n_unique_sigs
         log_info(f"[MINIMIZE] {green('Done')}")
-        log_info(f"           Unique signatures : {bold(cyan(str(len(survivors)))):>12s}")
-        log_info(f"           Rules kept        : {bold(green(str(len(survivors)))):>12s}")
+        log_info(f"           Unique signatures : {bold(cyan(str(n_unique_sigs))):>12s}")
+        log_info(f"           Rules kept        : {bold(green(str(n_unique_sigs))):>12s}")
         log_info(f"           Rules removed     : {bold(red(str(removed))):>12s}  ({removed/max(1,n_total):.1%})")
         return survivors
     finally:
@@ -802,7 +803,9 @@ def _extract_insert_mode(word, base_set, max_depth, min_len, max_amb, base_by_le
                 cand = word[:i]+word[i+1:j]+word[j+1:]
                 if len(cand) < min_len: continue
                 if cand in base_set:
-                    chain = f"i{i}{word[i]} i{j}{word[j]}"
+                    # After inserting word[i] at position i, the string grows by 1,
+                    # so the second insert position must be j+1 (not j) to land correctly.
+                    chain = f"i{i}{word[i]} i{j+1}{word[j]}"
                     if HashcatRuleValidator.validate_rule_for_gpu(chain) and py_apply_chain(chain, cand)==word:
                         found.add(chain)
     return found
@@ -1313,6 +1316,7 @@ int apply(const unsigned char *rs, int rl,
             int cap = 1;
             for (int i = 0; i < *ol; i++) {{
                 if (cap && out[i] >= 'a' && out[i] <= 'z') out[i] -= 32;
+                else if (!cap && out[i] >= 'A' && out[i] <= 'Z') out[i] += 32;
                 cap = (out[i] == p1);
             }} changed = 1;
         }} else if (cmd == 'x' && p1>='0' && p1<='9' && p2>='0' && p2<='9') {{
@@ -1666,7 +1670,8 @@ class GPUEngine:
         return dict(words_flat=wf, word_offsets=wo, word_lengths=wl, num_words=len(words), num_rules=len(self.gpu_rules))
 
     def _get_rules_buffers(self, mf):
-        key = id(self.gpu_rules)
+        # Use a tuple of rules as key — immune to Python id() reuse after list reassignment
+        key = tuple(self.gpu_rules)
         if self._rules_buf_key != key:
             for attr in ('_rules_buf','_rules_offsets_buf','_rules_lengths_buf'):
                 if getattr(self, attr): getattr(self, attr).release()
@@ -1746,9 +1751,13 @@ class GPUEngine:
     def _gen_random_chains(self, depth, count, valid, hot, existing, new_set):
         gen = set(); max_att = count * MAX_ATTEMPTS_MULTIPLIER
         hot_budget = int(count * HOT_RULE_RATIO) if hot else 0
-        for budget, use_hot in [(hot_budget, True), (count-hot_budget, False)]:
+        # Each pass targets an *absolute* size for gen, not a relative delta.
+        # Original code used (count-hot_budget) as the cold target, meaning cold
+        # pass exited immediately once len(gen) exceeded that threshold — which it
+        # always did after the hot pass when HOT_RULE_RATIO >= 0.5.
+        for target, use_hot in [(hot_budget, True), (count, False)]:
             att = 0
-            while len(gen) < budget and att < max_att:
+            while len(gen) < target and att < max_att:
                 att += 1
                 if use_hot and hot:
                     hp = random.randint(0, depth-1)
