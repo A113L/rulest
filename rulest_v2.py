@@ -291,7 +291,7 @@ class HashcatRuleValidator:
                 cnt+=1; pos+=1
                 if pos<n and isd(rule_str[pos]): pos+=1
                 continue
-            if c in (':','l','u','c','C','t','r','d','f','a','q','k','K','E','{','}','[',']'):
+            if c in (':','l','u','c','C','t','r','d','f','q','k','K','E','{','}','[',']'):
                 pos+=1; cnt+=1; continue
             if c in ('T','D','L','R','+','-','.',',',"'",'y','Y'):
                 pos+=1
@@ -417,10 +417,10 @@ def _py_apply_single_rule(rule, word):
             if 0<=p<len(w): w[p] = (w[p]>>1)&0xFF
         elif cmd == '+' and len(rule)>=2:
             p = dg(rule[1])
-            if 0<=p<len(w): w[p] = (w[p]+1)&0xFF
+            if 0<=p<len(w) and w[p] < 255: w[p] = w[p]+1
         elif cmd == '-' and len(rule)>=2:
             p = dg(rule[1])
-            if 0<=p<len(w): w[p] = (w[p]-1)&0xFF
+            if 0<=p<len(w) and w[p] > 0: w[p] = w[p]-1
         elif cmd in ('.',',') and len(rule)>=2:
             p = dg(rule[1]); delta = 1 if cmd=='.' else -1
             if 0<=p<len(w): w[p] = (w[p]+delta)&0xFF
@@ -435,7 +435,7 @@ def _py_apply_single_rule(rule, word):
             if n>0 and w: w = w + [w[-1]]*n
         elif cmd == 'y' and len(rule)>=2:
             n = dg(rule[1])
-            if n>0: w = w[:n] + w
+            if n>0: w = w + w[:n]
         elif cmd == 'Y' and len(rule)>=2:
             n = dg(rule[1])
             if n>0 and len(w)>=n: w = w + w[-n:]
@@ -461,7 +461,7 @@ def _py_apply_single_rule(rule, word):
             w = out
         elif cmd == 'x' and len(rule)>=3:
             n, m = dg(rule[1]), dg(rule[2])
-            if n>=0 and m>=0: w = w[n:n+m]
+            if n>=0 and m>=0 and n<len(w): w = w[n:n+m]
         elif cmd == 'O' and len(rule)>=3:
             p,m = dg(rule[1]), dg(rule[2])
             if 0<=p<len(w) and m>0: w = w[:p] + w[p+m:]
@@ -473,7 +473,7 @@ def _py_apply_single_rule(rule, word):
             for i,c in enumerate(w):
                 if c==sep:
                     cnt+=1
-                    if cnt==n+1 and i+1<len(w):
+                    if cnt==n and i+1<len(w):
                         ci = w[i+1]
                         w[i+1] = ci|0x20 if 65<=ci<=90 else (ci&~0x20 if 97<=ci<=122 else ci)
                         break
@@ -514,7 +514,10 @@ def compute_rule_signature_hash(rule, probe_words):
     for w in probe_words:
         out = py_apply_chain(rule, w)
         if out is None:
-            return hashlib.sha1(f"__UNSUPPORTED__::{rule}".encode()).hexdigest()
+            # Return the sentinel string directly so callers can detect it with
+            # sig.startswith('__UNSUPPORTED__').  Previously this returned a SHA1
+            # digest of the sentinel, making the check unreachable.
+            return f"__UNSUPPORTED__::{rule}"
         outputs.append(out)
     combined = '\x00'.join(outputs).encode('utf-8', errors='replace')
     return hashlib.sha1(combined).hexdigest()
@@ -609,6 +612,7 @@ def _minimize_disk(rule_counter, probe_words):
                 depth = CASE
                     WHEN excluded.count > sig_best.count THEN excluded.depth
                     WHEN excluded.count = sig_best.count AND excluded.depth < sig_best.depth THEN excluded.depth
+                    WHEN excluded.count = sig_best.count AND excluded.depth = sig_best.depth AND excluded.rule < sig_best.rule THEN excluded.depth
                     ELSE sig_best.depth
                 END
         '''
@@ -655,10 +659,12 @@ def _minimize_disk(rule_counter, probe_words):
 # Stage 0 – Token‑strip rule extraction (core + insert)
 # ----------------------------------------------------------------------
 def _hashcat_title_case(s):
+    """Mirror hashcat's 'E' rule: capitalize the first letter of each space-separated word."""
     res = list(s); cap = True
     for i,c in enumerate(res):
         if cap and 'a'<=c<='z': res[i]=c.upper(); cap=False
-        if c in (' ','-','_'): cap=True
+        elif not cap and 'A'<=c<='Z': res[i]=c.lower()
+        if c == ' ': cap=True
     return ''.join(res)
 
 def _infer_case_rules(cased_stem):
@@ -668,7 +674,7 @@ def _infer_case_rules(cased_stem):
     if cased_stem == lower.upper(): cand.append(['u'])
     if len(cased_stem)>=1 and cased_stem[0].isupper() and cased_stem[1:].islower(): cand.append(['c'])
     if len(cased_stem)>=1 and cased_stem[0].islower() and cased_stem[1:].isupper(): cand.append(['C'])
-    toggled = ''.join(c.lower() if c.isupper() else c.upper() for c in lower)
+    toggled = ''.join(c.lower() if c.isupper() else c.upper() for c in cased_stem)
     if cased_stem == toggled: cand.append(['t'])
     if cased_stem == _hashcat_title_case(lower): cand.append(['E'])
     if not cand:
@@ -1550,6 +1556,7 @@ class GPUEngine:
             except: pass
         # Clear state
         self.bloom_buf = self._rules_buf = self._rules_offsets_buf = self._rules_lengths_buf = None
+        self._rules_buf_key = None  # force re-upload of rules after reset
         self.program = self.kernel_single = self.kernel_chain = self.kernel_bloom = None
         self.context = None
         self.queue = None
@@ -1575,11 +1582,16 @@ class GPUEngine:
     def _safe_queue_finish(self):
         if self.queue is None: return False
         res = []
-        def fin(): res.append(self.queue.finish())
+        def fin():
+            try:
+                self.queue.finish()
+                res.append(True)
+            except Exception:
+                res.append(False)
         t = threading.Thread(target=fin, daemon=True); t.start()
         t.join(timeout=90)
         if t.is_alive(): return False
-        return True
+        return bool(res) and res[0]
 
     def generate_bloom_filter(self, target_words):
         total_bytes = self.params['BLOOM_NUM_SHARDS'] * self.params['BLOOM_SHARD_BYTES']
@@ -1622,6 +1634,7 @@ class GPUEngine:
             bf_int32_size = (total_bytes + 3)//4
             bf_init = np.zeros(bf_int32_size, dtype=np.int32)
             bf_buf = cl.Buffer(self.context, mf.READ_WRITE|mf.COPY_HOST_PTR, hostbuf=bf_init)
+            bufs.append(bf_buf)  # register for cleanup on exception; removed below on success
             gs = ((nw + self.local_work_size - 1) // self.local_work_size) * self.local_work_size
             self.kernel_bloom.set_args(words_buf, offsets_buf, lengths_buf, np.int32(nw), bf_buf)
             cl.enqueue_nd_range_kernel(self.queue, self.kernel_bloom, (gs,), (self.local_work_size,))
@@ -1633,6 +1646,7 @@ class GPUEngine:
                 log_warn("[BLOOM] GPU build all-zero -> fallback to CPU")
                 raise RuntimeError("all-zero")
             if self.bloom_buf: self.bloom_buf.release()
+            bufs.remove(bf_buf)  # hand ownership to self.bloom_buf; don't release in finally
             self.bloom_buf = bf_buf
             self.bloom_np = None
             self._bloom_recovery_fn = lambda: self.generate_bloom_filter(target_words)
@@ -2521,7 +2535,7 @@ class GPUExtractor:
                 reserved_ga = max(_min_ga, self.params['TARGET_SECONDS'] * _ga_frac)
             else:
                 reserved_ga = 0.0
-            ga_budget = max(remaining, reserved_ga)
+            ga_budget = remaining + reserved_ga
             if ga_budget < 5.0:
                 log_warn(f"[S3]    Only {ga_budget:.1f}s available — consider raising --target-hours")
             else:
