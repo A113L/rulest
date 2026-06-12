@@ -435,7 +435,7 @@ def _py_apply_single_rule(rule, word):
             if n>0 and w: w = w + [w[-1]]*n
         elif cmd == 'y' and len(rule)>=2:
             n = dg(rule[1])
-            if n>0: w = w + w[:n]
+            if n>0: w = w[:n] + w
         elif cmd == 'Y' and len(rule)>=2:
             n = dg(rule[1])
             if n>0 and len(w)>=n: w = w + w[-n:]
@@ -473,7 +473,7 @@ def _py_apply_single_rule(rule, word):
             for i,c in enumerate(w):
                 if c==sep:
                     cnt+=1
-                    if cnt==n and i+1<len(w):
+                    if cnt==n+1 and i+1<len(w):
                         ci = w[i+1]
                         w[i+1] = ci|0x20 if 65<=ci<=90 else (ci&~0x20 if 97<=ci<=122 else ci)
                         break
