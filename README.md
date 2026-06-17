@@ -1113,4 +1113,5 @@ MIT
 ## Credits
 
 @Shooter3k for testing script on Windows OS
+
 https://github.com/synacktiv/rulesfinder
