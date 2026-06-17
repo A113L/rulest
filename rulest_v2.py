@@ -1487,10 +1487,11 @@ class GPUEngine:
         fv = self._cached_free_vram or self.get_free_vram()
         ma = self._cached_max_alloc or self.get_max_allocation()
         avail = min(fv, ma) - 5*1024**2
-        # Ensure at least 1 slot
+        # Must match the kernel constant MAX_CHAINS_TO_FIND = MAX_SAFE_RESULTS_PER_BATCH;
+        # do NOT cap below that value or the kernel will write past the end of fo.
         return max(1, min(avail//MAX_CHAIN_STRING_LEN,
                           self.params['MAX_SAFE_RESULTS_PER_BATCH'],
-                          words_count*chains_count, 5000))
+                          words_count*chains_count))
 
     def initialize_gpu(self, device_spec):
         try:
@@ -1563,21 +1564,25 @@ class GPUEngine:
         self.gpu_rules = []
         self.rule_index = {}
         self._rules_buf_key = None
-        # Recreate
-        try:
-            self.context = cl.Context([self.device])
-            self.queue = cl.CommandQueue(self.context)
-            if not self.compile_kernel(force=True):
-                return False
-            if self._bloom_recovery_fn:
-                bf = self._bloom_recovery_fn()
-                self.upload_bloom_filter(bf)
-            elif self.bloom_np is not None:
-                self.upload_bloom_filter(self.bloom_np)
-            return True
-        except Exception as exc:
-            log_error(f"Reset failed: {exc}")
-            return False
+        # Recreate — NVIDIA OpenCL on Windows needs ~1-2 s to exit TDR/error state
+        for attempt in range(3):
+            try:
+                time.sleep(1.5)
+                self.context = cl.Context([self.device])
+                self.queue = cl.CommandQueue(self.context)
+                if not self.compile_kernel(force=True):
+                    return False
+                if self._bloom_recovery_fn:
+                    bf = self._bloom_recovery_fn()
+                    self.upload_bloom_filter(bf)
+                elif self.bloom_np is not None:
+                    self.upload_bloom_filter(self.bloom_np)
+                return True
+            except Exception as exc:
+                log_error(f"Reset failed (attempt {attempt+1}/3): {exc}")
+                self.context = None
+                self.queue = None
+        return False
 
     def _safe_queue_finish(self):
         if self.queue is None: return False
@@ -1729,6 +1734,8 @@ class GPUEngine:
         return counter
 
     def _run_single_kernel(self, bd):
+        if not self.context or not self.queue or not self.kernel_single:
+            return []
         mf = cl.mem_flags; bufs = []
         try:
             def B(arr, f=mf.READ_ONLY):
@@ -1744,7 +1751,9 @@ class GPUEngine:
             self.kernel_single.set_args(bb, bbo, bbl, rb, rbo, rbl, self.bloom_buf,
                                         np.int32(bd['num_words']), np.int32(bd['num_rules']), fo, fc)
             cl.enqueue_nd_range_kernel(self.queue, self.kernel_single, (gs,), (self.local_work_size,))
-            if not self._safe_queue_finish(): return []
+            if not self._safe_queue_finish():
+                self._reset_gpu(RuntimeError("queue.finish() timed out or failed"))
+                return []
             cnt = np.zeros(1, dtype=np.int32); cl.enqueue_copy(self.queue, cnt, fc)
             n = min(cnt[0], outs); out = []
             if n>0:
@@ -1760,7 +1769,9 @@ class GPUEngine:
                 log_error("GPU reset failed - aborting batch")
             return []
         finally:
-            for b in bufs: b.release()
+            for b in bufs:
+                try: b.release()
+                except: pass
 
     def _gen_random_chains(self, depth, count, valid, hot, existing, new_set):
         gen = set(); max_att = count * MAX_ATTEMPTS_MULTIPLIER
@@ -2035,6 +2046,8 @@ class GPUEngine:
         return seqs, depths
 
     def _run_chain_kernel(self, words, chains, _precomputed=None):
+        if not self.context or not self.queue or not self.kernel_chain:
+            return []
         if _precomputed is not None:
             seqs_np = np.array(_precomputed[0], dtype=np.int32)
             depths_np = np.array(_precomputed[1], dtype=np.int32)
@@ -2060,7 +2073,9 @@ class GPUEngine:
                                        np.int32(len(words)), np.int32(len(chains)),
                                        np.int32(self.params['MAX_CHAIN_DEPTH']), fo, fc)
             cl.enqueue_nd_range_kernel(self.queue, self.kernel_chain, (gs,), (self.local_work_size,))
-            if not self._safe_queue_finish(): return []
+            if not self._safe_queue_finish():
+                self._reset_gpu(RuntimeError("queue.finish() timed out or failed"))
+                return []
             cnt = np.zeros(1, dtype=np.int32); cl.enqueue_copy(self.queue, cnt, fc)
             n = min(cnt[0], outs); out = []
             if n>0:
@@ -2073,7 +2088,9 @@ class GPUEngine:
         except Exception as e:
             log_warn(f"Chain kernel error: {e}"); self._reset_gpu(e); return []
         finally:
-            for b in bufs: b.release()
+            for b in bufs:
+                try: b.release()
+                except: pass
 
 # ----------------------------------------------------------------------
 # Genetic Algorithm Rule Evolver (with signature cache limit)
