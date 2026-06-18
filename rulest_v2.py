@@ -213,6 +213,13 @@ BASE_WORDS_PER_BATCH = 5000
 BASE_CHAINS_PER_BATCH = 2000
 BASE_WORD_SUB_BATCH = 20000
 BASE_MAX_SAFE_RESULTS = 25000
+# Hard ceiling on MAX_SAFE_RESULTS_PER_BATCH. Lowering this shrinks the GPU
+# output buffer allocated every batch (faster alloc/free churn), and — unlike
+# capping the buffer size alone — it lowers the kernel's compiled
+# MAX_CHAINS_TO_FIND bound by the same amount, so the two can never diverge.
+# Tradeoff: if a single batch finds more matches than this cap, the excess
+# are silently skipped by the kernel's bounds check (lost, not corrupted).
+MAX_SAFE_RESULTS_CAP = 5000
 HOT_RULE_RATIO = 0.6
 MAX_ATTEMPTS_MULTIPLIER = 5
 TIME_SAFETY_FACTOR = 0.9
@@ -1068,7 +1075,7 @@ def calculate_dynamic_parameters(base_count, target_count, device=None, target_h
         'WORDS_PER_BATCH': max(1000, int(BASE_WORDS_PER_BATCH * vram_scale)),
         'CHAINS_PER_BATCH': max(500, int(BASE_CHAINS_PER_BATCH * vram_scale)),
         'WORD_SUB_BATCH': max(5000, int(BASE_WORD_SUB_BATCH * vram_scale)),
-        'MAX_SAFE_RESULTS_PER_BATCH': max(5000, int(BASE_MAX_SAFE_RESULTS * vram_scale)),
+        'MAX_SAFE_RESULTS_PER_BATCH': min(MAX_SAFE_RESULTS_CAP, max(5000, int(BASE_MAX_SAFE_RESULTS * vram_scale))),
         'MAX_CHAINS_TO_FIND': 2**31-1,
         'LOCAL_WORK_SIZE': lws,
         'OPTIMAL_GLOBAL_MULTIPLIER': mcu * OPTIMAL_GLOBAL_MULTIPLIER_BASE,
