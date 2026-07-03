@@ -26,6 +26,7 @@ import gc
 import datetime
 import multiprocessing as mp
 import threading
+import functools
 import shutil
 
 # ================== GLOBAL FLAGS ===================
@@ -114,10 +115,10 @@ class KeyboardController:
             while self._active:
                 if _select.select([sys.stdin],[],[],0.15)[0]:
                     self._handle(sys.stdin.read(1))
-        except: pass
+        except Exception: pass
         finally:
             try: _termios.tcsetattr(fd, _termios.TCSADRAIN, old)
-            except: pass
+            except Exception: pass
 
     def _reader_msvcrt(self):
         while self._active:
@@ -201,7 +202,8 @@ def _print_controls():
 MAX_WORD_LEN = 256
 MAX_RULE_LEN = 16
 MAX_OUTPUT_LEN = 512
-MAX_CHAIN_STRING_LEN = 128
+MAX_CHAIN_STRING_LEN = 128  # 512 kills GPU occupancy (cb[] is a per-thread private array in the chain kernel);
+                            # 128 is already truncation-safe (see bounds checks in find_rule_chains_gpu)
 MAX_HASHCAT_CHAIN = 31
 VRAM_USAGE_FACTOR = 0.55
 BLOOM_HASH_FUNCTIONS = 4
@@ -281,58 +283,64 @@ def should_exclude_rule(rule):
     if len(rule)==3 and rule[0] in ('?','=','v'): return True
     return False
 
+def _is_digit_char(c): return '0' <= c <= '9'
+
+@functools.lru_cache(maxsize=200000)
+def _validate_rule_for_gpu_impl(rule_str):
+    if should_exclude_rule(rule_str): return False
+    pos = cnt = 0
+    n = len(rule_str)
+    isd = _is_digit_char
+    while pos < n:
+        c = rule_str[pos]
+        if c == ' ': pos+=1; continue
+        if c in ('p','z','Z'):
+            cnt+=1; pos+=1
+            if pos<n and isd(rule_str[pos]): pos+=1
+            continue
+        if c in (':','l','u','c','C','t','r','d','f','q','k','K','E','{','}','[',']'):
+            pos+=1; cnt+=1; continue
+        if c in ('T','D','L','R','+','-','.',',',"'",'y','Y'):
+            pos+=1
+            if pos>=n or not isd(rule_str[pos]): return False
+            pos+=1; cnt+=1; continue
+        if c in ('i','o','3'):
+            pos+=1
+            if pos>=n or not isd(rule_str[pos]): return False
+            pos+=1
+            if pos>=n: return False
+            pos+=1; cnt+=1; continue
+        if c in ('x','*','O'):
+            pos+=1
+            if pos>=n or not isd(rule_str[pos]): return False
+            pos+=1
+            if pos>=n or not isd(rule_str[pos]): return False
+            pos+=1; cnt+=1; continue
+        if c == 's':
+            pos+=1
+            if pos+1>=n: return False
+            pos+=2; cnt+=1; continue
+        if c in ('@','e','$','^'):
+            pos+=1
+            if pos>=n: return False
+            pos+=1; cnt+=1; continue
+        return False
+    return cnt <= MAX_GPU_RULES
+
 class HashcatRuleValidator:
     MAX_GPU_RULES = MAX_GPU_RULES
     @staticmethod
     def is_digit(c): return '0' <= c <= '9'
     @staticmethod
     def validate_rule_for_gpu(rule_str):
-        if should_exclude_rule(rule_str): return False
-        pos = cnt = 0
-        n = len(rule_str)
-        isd = HashcatRuleValidator.is_digit
-        while pos < n:
-            c = rule_str[pos]
-            if c == ' ': pos+=1; continue
-            if c in ('p','z','Z'):
-                cnt+=1; pos+=1
-                if pos<n and isd(rule_str[pos]): pos+=1
-                continue
-            if c in (':','l','u','c','C','t','r','d','f','q','k','K','E','{','}','[',']'):
-                pos+=1; cnt+=1; continue
-            if c in ('T','D','L','R','+','-','.',',',"'",'y','Y'):
-                pos+=1
-                if pos>=n or not isd(rule_str[pos]): return False
-                pos+=1; cnt+=1; continue
-            if c in ('i','o','3'):
-                pos+=1
-                if pos>=n or not isd(rule_str[pos]): return False
-                pos+=1
-                if pos>=n: return False
-                pos+=1; cnt+=1; continue
-            if c in ('x','*','O'):
-                pos+=1
-                if pos>=n or not isd(rule_str[pos]): return False
-                pos+=1
-                if pos>=n or not isd(rule_str[pos]): return False
-                pos+=1; cnt+=1; continue
-            if c == 's':
-                pos+=1
-                if pos+1>=n: return False
-                pos+=2; cnt+=1; continue
-            if c in ('@','e','$','^'):
-                pos+=1
-                if pos>=n: return False
-                pos+=1; cnt+=1; continue
-            return False
-        return cnt <= MAX_GPU_RULES
+        return _validate_rule_for_gpu_impl(rule_str)
 
     @staticmethod
     def validate_rules_for_gpu(rules):
         valid = []
         for r in rules:
             r = r.strip('\n\r')
-            if r and HashcatRuleValidator.validate_rule_for_gpu(r):
+            if r and _validate_rule_for_gpu_impl(r):
                 valid.append(r)
         return valid
 
@@ -349,14 +357,17 @@ def fnv1a_32(data, seed=FNV1A_SEED1):
 # ----------------------------------------------------------------------
 # Python rule applicator
 # ----------------------------------------------------------------------
+@functools.lru_cache(maxsize=256)
+def _dg(c):
+    if '0' <= c <= '9': return ord(c) - 48
+    if 'A' <= c <= 'Z': return ord(c) - 55
+    return -1
+
 def _py_apply_single_rule(rule, word):
     if not rule: return word
     w = list(word.encode('latin-1'))
     cmd = rule[0]
-    def dg(c):
-        if '0' <= c <= '9': return ord(c) - 48
-        if 'A' <= c <= 'Z': return ord(c) - 55
-        return -1
+    # use module-level cached _dg
     try:
         if cmd == ':': pass
         elif cmd == 'l': w = [c|0x20 if 65<=c<=90 else c for c in w]
@@ -405,55 +416,55 @@ def _py_apply_single_rule(rule, word):
         elif cmd == '@' and len(rule)>=2:
             ch = ord(rule[1]); w = [c for c in w if c != ch]
         elif cmd == 'p' and len(rule)>=2:
-            n = dg(rule[1])
+            n = _dg(rule[1])
             if n>0:
                 orig = w[:]
                 for _ in range(n): w += orig
         elif cmd == 'T' and len(rule)>=2:
-            p = dg(rule[1])
+            p = _dg(rule[1])
             if 0<=p<len(w):
                 c = w[p]; w[p] = c|0x20 if 65<=c<=90 else (c&~0x20 if 97<=c<=122 else c)
         elif cmd == 'D' and len(rule)>=2:
-            p = dg(rule[1])
+            p = _dg(rule[1])
             if 0<=p<len(w): w.pop(p)
         elif cmd == 'L' and len(rule)>=2:
-            p = dg(rule[1])
+            p = _dg(rule[1])
             if 0<=p<len(w): w[p] = (w[p]<<1)&0xFF
         elif cmd == 'R' and len(rule)>=2:
-            p = dg(rule[1])
+            p = _dg(rule[1])
             if 0<=p<len(w): w[p] = (w[p]>>1)&0xFF
         elif cmd == '+' and len(rule)>=2:
-            p = dg(rule[1])
+            p = _dg(rule[1])
             if 0<=p<len(w) and w[p] < 255: w[p] = w[p]+1
         elif cmd == '-' and len(rule)>=2:
-            p = dg(rule[1])
+            p = _dg(rule[1])
             if 0<=p<len(w) and w[p] > 0: w[p] = w[p]-1
         elif cmd in ('.',',') and len(rule)>=2:
-            p = dg(rule[1]); delta = 1 if cmd=='.' else -1
+            p = _dg(rule[1]); delta = 1 if cmd=='.' else -1
             if 0<=p<len(w): w[p] = (w[p]+delta)&0xFF
         elif cmd == "'" and len(rule)>=2:
-            p = dg(rule[1])
+            p = _dg(rule[1])
             if 0<=p: w = w[:p]
         elif cmd == 'z' and len(rule)>=2:
-            n = dg(rule[1])
+            n = _dg(rule[1])
             if n>0 and w: w = [w[0]]*n + w
         elif cmd == 'Z' and len(rule)>=2:
-            n = dg(rule[1])
+            n = _dg(rule[1])
             if n>0 and w: w = w + [w[-1]]*n
         elif cmd == 'y' and len(rule)>=2:
-            n = dg(rule[1])
+            n = _dg(rule[1])
             if n>0: w = w[:n] + w
         elif cmd == 'Y' and len(rule)>=2:
-            n = dg(rule[1])
+            n = _dg(rule[1])
             if n>0 and len(w)>=n: w = w + w[-n:]
         elif cmd == 's' and len(rule)>=3:
             a,b = ord(rule[1]), ord(rule[2])
             w = [b if c==a else c for c in w]
         elif cmd == 'i' and len(rule)>=3:
-            p,ch = dg(rule[1]), ord(rule[2])
+            p,ch = _dg(rule[1]), ord(rule[2])
             if 0<=p<=len(w): w.insert(p,ch)
         elif cmd == 'o' and len(rule)>=3:
-            p,ch = dg(rule[1]), ord(rule[2])
+            p,ch = _dg(rule[1]), ord(rule[2])
             if 0<=p<len(w): w[p] = ch
         elif cmd == 'e' and len(rule)>=2:
             sep = ord(rule[1]); out = []; cap = True
@@ -467,16 +478,16 @@ def _py_apply_single_rule(rule, word):
                 cap = (c == sep)
             w = out
         elif cmd == 'x' and len(rule)>=3:
-            n, m = dg(rule[1]), dg(rule[2])
+            n, m = _dg(rule[1]), _dg(rule[2])
             if n>=0 and m>=0 and n<len(w): w = w[n:n+m]
         elif cmd == 'O' and len(rule)>=3:
-            p,m = dg(rule[1]), dg(rule[2])
+            p,m = _dg(rule[1]), _dg(rule[2])
             if 0<=p<len(w) and m>0: w = w[:p] + w[p+m:]
         elif cmd == '*' and len(rule)>=3:
-            a,b = dg(rule[1]), dg(rule[2])
+            a,b = _dg(rule[1]), _dg(rule[2])
             if 0<=a<len(w) and 0<=b<len(w) and a!=b: w[a],w[b]=w[b],w[a]
         elif cmd == '3' and len(rule)>=3:
-            n,sep = dg(rule[1]), ord(rule[2]); cnt=0
+            n,sep = _dg(rule[1]), ord(rule[2]); cnt=0
             for i,c in enumerate(w):
                 if c==sep:
                     cnt+=1
@@ -660,7 +671,7 @@ def _minimize_disk(rule_counter, probe_words):
         return survivors
     finally:
         try: os.unlink(tmp_path)
-        except: pass
+        except Exception: pass
 
 # ----------------------------------------------------------------------
 # Stage 0 – Token‑strip rule extraction (core + insert)
@@ -830,7 +841,7 @@ def _worker_init_p0(base_set=None, base_by_len=None):
 
 def _process_chunk_p0(args):
     words, max_depth, min_len, max_amb, max_pre, max_suf = args
-    base_set = _p0_worker_base_set.copy()  # defensive copy — safe under fork, no-op cost under spawn
+    base_set = _p0_worker_base_set  # read-only, no copy needed
     base_by_len = _p0_worker_base_by_len
     found = set()
     for w in words:
@@ -957,7 +968,7 @@ def get_all_devices():
         for dtype in (cl.device_type.GPU, cl.device_type.CPU):
             try:
                 for d in plat.get_devices(dtype): devs.append((plat,d))
-            except: pass
+            except Exception: pass
     return devs
 
 def list_devices():
@@ -965,7 +976,13 @@ def list_devices():
     if not devs: log_error("No OpenCL devices."); sys.exit(1)
     log_info(f"\n{blue('Available OpenCL devices:')}")
     for i,(p,d) in enumerate(devs):
-        t = cl.device_type.to_string(d.get_info(cl.device_info.TYPE))
+        try:
+            t = cl.device_type.to_string(d.get_info(cl.device_info.TYPE))
+        except Exception:
+            dtype = d.get_info(cl.device_info.TYPE)
+            if dtype == cl.device_type.GPU: t = "GPU"
+            elif dtype == cl.device_type.CPU: t = "CPU"
+            else: t = "OTHER"
         log_info(f"  {cyan(str(i)+':')} {d.get_info(cl.device_info.NAME)} ({t}) — {p.name}")
     print()
 
@@ -987,7 +1004,7 @@ def get_best_gpu_device():
     best = None; best_score = -1
     for p in cl.get_platforms():
         try: devs = p.get_devices(cl.device_type.GPU)
-        except: continue
+        except Exception: continue
         for d in devs:
             name = d.get_info(cl.device_info.NAME).upper()
             score = (10 if 'NVIDIA' in name or 'AMD' in name else 0)
@@ -997,7 +1014,7 @@ def get_best_gpu_device():
     if best is None:
         for p in cl.get_platforms():
             try: return p.get_devices(cl.device_type.GPU)[0]
-            except: pass
+            except Exception: pass
     if best is None: raise RuntimeError("No GPU found")
     return best
 
@@ -1355,7 +1372,7 @@ int apply(const unsigned char *rs, int rl,
             }}
         }} else if (cmd == '3' && p1>='0' && p1<='9') {{
             int n = p1-'0', cnt = 0, found = -1;
-            for (int i = 0; i < *ol; i++) if (out[i] == p2 && ++cnt == n) {{ found = i; break; }}
+            for (int i = 0; i < *ol; i++) if (out[i] == p2 && ++cnt == n + 1) {{ found = i; break; }}
             if (found != -1 && found+1 < *ol) {{
                 if (out[found+1] >= 'a' && out[found+1] <= 'z') out[found+1] -= 32;
                 else if (out[found+1] >= 'A' && out[found+1] <= 'Z') out[found+1] += 32;
@@ -1482,6 +1499,7 @@ class GPUEngine:
         self._rules_buf_key = None
         self._bloom_recovery_fn = None
         self._compiled_depth = None   # track compiled MAX_CHAIN_DEPTH
+        self._base_words_precomputed = None  # (wf, wo, wl)
 
     def get_free_vram(self): return estimate_free_vram(self.device)
     def get_max_allocation(self): return get_max_allocation(self.device)
@@ -1558,10 +1576,10 @@ class GPUEngine:
         for buf in [self.bloom_buf, self._rules_buf, self._rules_offsets_buf, self._rules_lengths_buf]:
             if buf is not None:
                 try: buf.release()
-                except: pass
+                except Exception: pass
         if self.queue is not None:
             try: self.queue.finish()
-            except: pass
+            except Exception: pass
         # Clear state
         self.bloom_buf = self._rules_buf = self._rules_offsets_buf = self._rules_lengths_buf = None
         self._rules_buf_key = None  # force re-upload of rules after reset
@@ -1708,6 +1726,27 @@ class GPUEngine:
             self._rules_buf_key = key
         return self._rules_buf, self._rules_offsets_buf, self._rules_lengths_buf
 
+    def set_base_words(self, words):
+        self._base_words_precomputed = self._flatten(words)
+
+    def get_word_batch_data(self, start, end):
+        if self._base_words_precomputed is None:
+            raise RuntimeError("Base words not precomputed — call set_base_words() first")
+        full_wf, full_wo, full_wl = self._base_words_precomputed
+        if start >= end or start >= len(full_wo):
+            return dict(words_flat=np.array([], dtype=np.uint8),
+                        word_offsets=np.array([], dtype=np.int32),
+                        word_lengths=np.array([], dtype=np.int32),
+                        num_words=0, num_rules=len(self.gpu_rules))
+        end = min(end, len(full_wo))
+        base_off = int(full_wo[start])
+        end_off = int(full_wo[end-1]) + int(full_wl[end-1])
+        wf = full_wf[base_off:end_off]
+        wo = full_wo[start:end] - base_off
+        wl = full_wl[start:end]
+        return dict(words_flat=wf, word_offsets=wo, word_lengths=wl,
+                    num_words=end-start, num_rules=len(self.gpu_rules))
+
     def process_all_words_single_rule(self, base_words, rules, bloom_filter):
         self.upload_bloom_filter(bloom_filter)
         if not self.compile_kernel(): return Counter()
@@ -1778,7 +1817,7 @@ class GPUEngine:
         finally:
             for b in bufs:
                 try: b.release()
-                except: pass
+                except Exception: pass
 
     def _gen_random_chains(self, depth, count, valid, hot, existing, new_set):
         gen = set(); max_att = count * MAX_ATTEMPTS_MULTIPLIER
@@ -1961,6 +2000,7 @@ class GPUEngine:
         ncols = shutil.get_terminal_size((80,24)).columns
         t0 = time.time()
         total_combos = 0
+        self.set_base_words(base_words)
         with tqdm(total=n_batches, desc=green("  SEED PASS "), unit="batch", ncols=ncols,
                   bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}") as pbar:
             for ci in range(0, len(multi), cbs):
@@ -1968,10 +2008,19 @@ class GPUEngine:
                 cb = multi[ci:ci+cbs]
                 seqs, depths = self._compute_chain_seqs(cb)
                 for wi in range(0, len(base_words), wsb):
-                    wb = base_words[wi:wi+wsb]
-                    if wb:
-                        found = self._run_chain_kernel(wb, cb, (seqs, depths))
-                        if found: counter.update(found)
+                    end = min(wi+wsb, len(base_words))
+                    bd = self.get_word_batch_data(wi, end)
+                    if bd['num_words'] == 0: continue
+                    found = self._run_chain_kernel(bd, cb, (seqs, depths))
+                    if found is None:
+                        self._consecutive_errors += 1
+                        if self._consecutive_errors >= self._MAX_CONSECUTIVE_ERRORS:
+                            log_error("Too many consecutive GPU errors, aborting SEED PASS")
+                            break
+                    elif found:
+                        self._consecutive_errors = 0
+                        counter.update(found)
+                if self._consecutive_errors >= self._MAX_CONSECUTIVE_ERRORS: break
                 total_combos += len(cb) * len(base_words)
                 elapsed = time.time()-t0
                 spd = _fmt_speed(total_combos / elapsed if elapsed>0 else 0)
@@ -2053,6 +2102,12 @@ class GPUEngine:
         return seqs, depths
 
     def _run_chain_kernel(self, words, chains, _precomputed=None):
+        # `words` may be either a raw list of word strings, or an already-flattened
+        # batch dict as returned by get_word_batch_data()/prepare_words_data() —
+        # accept both so callers can pre-flatten once (SEED PASS) and avoid re-flattening
+        # every sub-batch, without silently corrupting the word count (that was the bug:
+        # passing a dict straight to prepare_words_data() iterated over its *keys* as
+        # if they were words, and len(dict) was used as the word count).
         if not self.context or not self.queue or not self.kernel_chain:
             return []
         if _precomputed is not None:
@@ -2062,7 +2117,13 @@ class GPUEngine:
             seqs, depths = self._compute_chain_seqs(chains)
             seqs_np = np.array(seqs, dtype=np.int32)
             depths_np = np.array(depths, dtype=np.int32)
-        bd = self.prepare_words_data(words)
+        if isinstance(words, dict):
+            bd = words
+        else:
+            bd = self.prepare_words_data(words)
+        n_words = bd['num_words']
+        if n_words == 0 or not chains:
+            return []
         mf = cl.mem_flags; bufs = []
         try:
             def B(arr, f=mf.READ_ONLY):
@@ -2070,19 +2131,19 @@ class GPUEngine:
             bb = B(bd['words_flat']); bbo = B(bd['word_offsets']); bbl = B(bd['word_lengths'])
             rb, rbo, rbl = self._get_rules_buffers(mf)
             csb = B(seqs_np); cdb = B(depths_np)
-            outs = self.safe_output_buffer_size(len(words), len(chains))
+            outs = self.safe_output_buffer_size(n_words, len(chains))
             fo = cl.Buffer(self.context, mf.WRITE_ONLY, outs*MAX_CHAIN_STRING_LEN); bufs.append(fo)
             fc = cl.Buffer(self.context, mf.READ_WRITE, 4); bufs.append(fc)
             cl.enqueue_copy(self.queue, fc, np.array([0], dtype=np.int32))
-            tot = len(words)*len(chains)
+            tot = n_words*len(chains)
             gs = ((tot+self.local_work_size-1)//self.local_work_size)*self.local_work_size
             self.kernel_chain.set_args(bb, bbo, bbl, rb, rbo, rbl, csb, cdb, self.bloom_buf,
-                                       np.int32(len(words)), np.int32(len(chains)),
+                                       np.int32(n_words), np.int32(len(chains)),
                                        np.int32(self.params['MAX_CHAIN_DEPTH']), fo, fc)
             cl.enqueue_nd_range_kernel(self.queue, self.kernel_chain, (gs,), (self.local_work_size,))
             if not self._safe_queue_finish():
                 self._reset_gpu(RuntimeError("queue.finish() timed out or failed"))
-                return []
+                return None
             cnt = np.zeros(1, dtype=np.int32); cl.enqueue_copy(self.queue, cnt, fc)
             n = min(cnt[0], outs); out = []
             if n>0:
@@ -2093,11 +2154,11 @@ class GPUEngine:
                     if r: out.append(r)
             return out
         except Exception as e:
-            log_warn(f"Chain kernel error: {e}"); self._reset_gpu(e); return []
+            log_warn(f"Chain kernel error: {e}"); self._reset_gpu(e); return None
         finally:
             for b in bufs:
                 try: b.release()
-                except: pass
+                except Exception: pass
 
 # ----------------------------------------------------------------------
 # Genetic Algorithm Rule Evolver (with signature cache limit)
@@ -2454,13 +2515,14 @@ class GPUExtractor:
         self.params = calculate_dynamic_parameters(self.base_count, self.target_count, self.gpu_engine.device,
                                                    self.params['TARGET_SECONDS']/3600,
                                                    bloom_mb_override=self.bloom_mb, bloom_no_shard=self.bloom_no_shard)
-        seed_pass_depth = max(9, self.user_max_depth)
+        seed_pass_depth = max(9, self.user_max_depth)  # seed pass explores numeric/year patterns that need
+                                                        # depth >=9 regardless of the user's general --max-depth
         self.params['MAX_CHAIN_DEPTH'] = seed_pass_depth
         self.gpu_engine.params = self.params
 
         extra_seeds = [s for s in all_seeds if ' ' not in s.strip()]
         extra_valid = [s for s in extra_seeds if s not in builtin_set]
-        rules_phase1 = rules + ts_extra_singles + extra_valid
+        rules_phase1 = list(dict.fromkeys(rules + ts_extra_singles + extra_valid))
         seed_chains = [s for s in all_seeds if ' ' in s.strip() and len(s.split()) <= self.user_max_depth]
 
         if extra_valid: log_info(f"[SEED] {len(extra_valid)} seed single-rule(s) added to STAGE 1")
@@ -2470,6 +2532,9 @@ class GPUExtractor:
         _p0_worker_base_set = set()
         _p0_worker_base_by_len = {}
 
+        if not base_words or not target_words:
+            log_warn("Empty wordlist(s), aborting extraction")
+            return Counter()
         log_info("[GPU]  Building bloom filter on GPU …")
         if not self.gpu_engine.compile_kernel(): return all_counts
         bloom_filter = self.gpu_engine.generate_bloom_filter_gpu(target_words)
@@ -2526,7 +2591,10 @@ class GPUExtractor:
             remaining = max(0, self.params['TARGET_SECONDS'] - (t1-t0) - reserved_ga)
             budget = remaining * self.params['EST_COMBOS_PER_SEC'] * TIME_SAFETY_FACTOR
             depths = list(range(2, self.user_max_depth+1))
-            depth_budgets = {d: int(budget/len(depths)/(len(base_words)*d)) for d in depths} if budget>0 and base_words and depths else {d:0 for d in depths}
+            if budget>0 and base_words and depths:
+                depth_budgets = {d: max(0, int(budget/len(depths)/(len(base_words)*d))) for d in depths}
+            else:
+                depth_budgets = {d:0 for d in depths}
             MIN_CHAINS = 5_000
             depth_budgets = {d: max(v, MIN_CHAINS) for d,v in depth_budgets.items()}
             for d in depths:
@@ -2584,12 +2652,12 @@ class GPUExtractor:
 def load_wordlist(filename):
     words = set()
     try:
-        with open(filename,'r',encoding='latin-1',errors='ignore') as f:
-            ncols = shutil.get_terminal_size((80,24)).columns
-            for line in tqdm(f, desc=green("  Loading  "), unit="line", ncols=ncols,
-                             leave=False, bar_format="{l_bar}{bar}| {n_fmt} [{elapsed}] {postfix}"):
-                w = line.strip()
-                if w and len(w)<=MAX_WORD_LEN: words.add(w)
+        with open(filename, 'rb') as f:
+            data = f.read()
+        for line in data.split(b'\n'):
+            w = line.decode('latin-1', errors='ignore').strip()
+            if w and len(w) <= MAX_WORD_LEN:
+                words.add(w)
     except FileNotFoundError:
         log_error(f"File not found: {filename}"); sys.exit(1)
     res = list(words)
@@ -2760,5 +2828,8 @@ def main():
     print()
 
 if __name__ == '__main__':
-    mp.set_start_method('spawn', force=True)  # Must be here, NOT at module top-level; workers re-import the module and would crash if this ran again
+    try:
+        mp.set_start_method('spawn', force=True)
+    except Exception:
+        pass
     main()
