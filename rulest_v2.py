@@ -579,8 +579,7 @@ def _minimize_mem(rule_counter, probe_words):
     n_unsupported = 0
     for sig, group in sig_map.items():
         if sig.startswith('__UNSUPPORTED__'):
-            n_unsupported += len(group)  # count all unsupported rules dropped
-            continue  # exclude unsupported rules entirely — they fail on GPU
+            n_unsupported += len(group) - 1  # count duplicates removed, not total kept
         best_rule, best_count = min(group, key=lambda x: (-x[1], len(x[0].split()), x[0]))
         survivors[best_rule] = best_count
     removed = n_total - len(survivors)
@@ -1076,7 +1075,7 @@ def calculate_dynamic_parameters(base_count, target_count, device=None, target_h
         'WORDS_PER_BATCH': max(1000, int(BASE_WORDS_PER_BATCH * vram_scale)),
         'CHAINS_PER_BATCH': max(500, int(BASE_CHAINS_PER_BATCH * vram_scale)),
         'WORD_SUB_BATCH': max(5000, int(BASE_WORD_SUB_BATCH * vram_scale)),
-        'MAX_SAFE_RESULTS_PER_BATCH': min(MAX_SAFE_RESULTS_CAP, max(1000, int(BASE_MAX_SAFE_RESULTS * vram_scale))),
+        'MAX_SAFE_RESULTS_PER_BATCH': min(MAX_SAFE_RESULTS_CAP, max(5000, int(BASE_MAX_SAFE_RESULTS * vram_scale))),
         'MAX_CHAINS_TO_FIND': 2**31-1,
         'LOCAL_WORK_SIZE': lws,
         'OPTIMAL_GLOBAL_MULTIPLIER': mcu * OPTIMAL_GLOBAL_MULTIPLIER_BASE,
@@ -1495,12 +1494,11 @@ class GPUEngine:
         fv = self._cached_free_vram or self.get_free_vram()
         ma = self._cached_max_alloc or self.get_max_allocation()
         avail = min(fv, ma) - 5*1024**2
-        # The kernel constant MAX_CHAINS_TO_FIND equals MAX_SAFE_RESULTS_PER_BATCH.
-        # The output buffer MUST be at least that large or the kernel will write past
-        # the end of fo (buffer overrun). Never return fewer than MAX_SAFE_RESULTS_PER_BATCH.
-        min_required = self.params['MAX_SAFE_RESULTS_PER_BATCH']
-        return max(min_required, min(avail // MAX_CHAIN_STRING_LEN,
-                                     words_count * chains_count))
+        # Must match the kernel constant MAX_CHAINS_TO_FIND = MAX_SAFE_RESULTS_PER_BATCH;
+        # do NOT cap below that value or the kernel will write past the end of fo.
+        return max(1, min(avail//MAX_CHAIN_STRING_LEN,
+                          self.params['MAX_SAFE_RESULTS_PER_BATCH'],
+                          words_count*chains_count))
 
     def initialize_gpu(self, device_spec):
         try:
@@ -1572,6 +1570,7 @@ class GPUEngine:
         self.queue = None
         self.gpu_rules = []
         self.rule_index = {}
+        self._rules_buf_key = None
         # Recreate — NVIDIA OpenCL on Windows needs ~1-2 s to exit TDR/error state
         for attempt in range(3):
             try:
@@ -1726,20 +1725,16 @@ class GPUEngine:
                 batch = base_words[i:i+bs]
                 if batch:
                     found = self._run_single_kernel(self.prepare_words_data(batch))
-                    if self.queue is None:
-                        # GPU failure — _run_single_kernel already attempted reset
+                    if found:
+                        self._consecutive_errors = 0
+                        counter.update(found)
+                    elif self.queue is None:
                         self._consecutive_errors += 1
                         if self._consecutive_errors >= self._MAX_CONSECUTIVE_ERRORS: break
-                    else:
-                        self._consecutive_errors = 0
-                        if found:
-                            counter.update(found)
                     words_done += len(batch)
                     elapsed = time.time()-t0
                     combos = words_done * nr
-                    words_per_sec = words_done / elapsed if elapsed > 0 else 0
-                    combos_per_sec = combos / elapsed if elapsed > 0 else 0
-                    spd = f"{_fmt_speed(words_per_sec, 'words')}  ({_fmt_speed(combos_per_sec)})"
+                    spd = _fmt_speed(combos / elapsed if elapsed>0 else 0)
                     pbar.set_postfix({"rules": cyan(str(len(counter))), "spd": green(spd)}, refresh=False)
                 pbar.update(len(batch))
         log_info(f"[S1]    {bold(green(str(len(counter))))} unique rules passed bloom filter")
@@ -2465,18 +2460,11 @@ class GPUExtractor:
 
         extra_seeds = [s for s in all_seeds if ' ' not in s.strip()]
         extra_valid = [s for s in extra_seeds if s not in builtin_set]
+        rules_phase1 = rules + ts_extra_singles + extra_valid
         seed_chains = [s for s in all_seeds if ' ' in s.strip() and len(s.split()) <= self.user_max_depth]
 
         if extra_valid: log_info(f"[SEED] {len(extra_valid)} seed single-rule(s) added to STAGE 1")
         if seed_chains and self.user_max_depth<2: log_warn(f"[SEED] {len(seed_chains)} chain seed(s) ignored — requires --max-depth >= 2")
-        # Deduplicate rules_phase1 while preserving order (builtin rules first)
-        _seen = set(rules)
-        _dedup = []
-        for r in ts_extra_singles + extra_valid:
-            if r not in _seen:
-                _seen.add(r)
-                _dedup.append(r)
-        rules_phase1 = rules + _dedup
 
         global _p0_worker_base_set, _p0_worker_base_by_len
         _p0_worker_base_set = set()
