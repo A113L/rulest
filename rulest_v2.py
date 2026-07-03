@@ -231,6 +231,10 @@ FNV1A_OFFSET_BASIS = 2166136261
 FNV1A_SEED1 = 0xDEADBEEF
 FNV1A_SEED2 = 0xCAFEBABE
 MAX_GPU_RULES = 255
+# Hashcat position encoding: '0'-'9' -> 0-9, 'A'-'Z' -> 10-35 (base36). Used by all
+# single-position rule functions (T,D,L,R,+,-,.,,,',z,Z,y,Y,p...) so words longer
+# than 9 chars can still be targeted at any position.
+POSITION_CHARS = string.digits + string.ascii_uppercase
 _UNSUPPORTED_SENTINEL = object()
 MINIMIZE_DISK_THRESHOLD = 500_000
 MINIMIZE_DISK_BATCH_SIZE = 10_000
@@ -284,6 +288,7 @@ def should_exclude_rule(rule):
     return False
 
 def _is_digit_char(c): return '0' <= c <= '9'
+def _is_pos_char(c): return ('0' <= c <= '9') or ('A' <= c <= 'Z')
 
 @functools.lru_cache(maxsize=200000)
 def _validate_rule_for_gpu_impl(rule_str):
@@ -291,18 +296,19 @@ def _validate_rule_for_gpu_impl(rule_str):
     pos = cnt = 0
     n = len(rule_str)
     isd = _is_digit_char
+    isp = _is_pos_char
     while pos < n:
         c = rule_str[pos]
         if c == ' ': pos+=1; continue
         if c in ('p','z','Z'):
             cnt+=1; pos+=1
-            if pos<n and isd(rule_str[pos]): pos+=1
+            if pos<n and isp(rule_str[pos]): pos+=1
             continue
         if c in (':','l','u','c','C','t','r','d','f','q','k','K','E','{','}','[',']'):
             pos+=1; cnt+=1; continue
         if c in ('T','D','L','R','+','-','.',',',"'",'y','Y'):
             pos+=1
-            if pos>=n or not isd(rule_str[pos]): return False
+            if pos>=n or not isp(rule_str[pos]): return False
             pos+=1; cnt+=1; continue
         if c in ('i','o','3'):
             pos+=1
@@ -331,6 +337,8 @@ class HashcatRuleValidator:
     MAX_GPU_RULES = MAX_GPU_RULES
     @staticmethod
     def is_digit(c): return '0' <= c <= '9'
+    @staticmethod
+    def is_pos_char(c): return ('0' <= c <= '9') or ('A' <= c <= 'Z')
     @staticmethod
     def validate_rule_for_gpu(rule_str):
         return _validate_rule_for_gpu_impl(rule_str)
@@ -1112,8 +1120,8 @@ class GPUCompatibleRulesGenerator:
         digits = '0123456789'
         rules.update(['l','u','c','C','t','r','d','f','q','E','{','}','[',']','k','K',':'])
         for cmd in ('T','D','L','R','+','-','.',',',"'",'z','Z','y','Y'):
-            for p in digits: rules.add(f'{cmd}{p}')
-        for p in digits: rules.add(f'p{p}')
+            for p in POSITION_CHARS: rules.add(f'{cmd}{p}')
+        for p in POSITION_CHARS: rules.add(f'p{p}')
         for cmd in ('x','*','O'):
             for p1 in digits:
                 for p2 in digits: rules.add(f'{cmd}{p1}{p2}')
@@ -1173,6 +1181,13 @@ int bloom(__global const uchar *bf, const unsigned char *w, int len) {{
         }}
     }}
     return 1;
+}}
+
+// Decodes hashcat's position/count encoding: '0'-'9' -> 0-9, 'A'-'Z' -> 10-35, else -1.
+inline int dpos(unsigned char c) {{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'A' && c <= 'Z') return c - 'A' + 10;
+    return -1;
 }}
 
 int apply(const unsigned char *rs, int rl,
@@ -1246,6 +1261,7 @@ int apply(const unsigned char *rs, int rl,
         }}
     }} else if (rl == 2) {{
         unsigned char p = rs[1];
+        int pv = dpos(p);
         if (cmd == '^') {{
             if (*ol+1 <= MAX_OUTPUT_LEN) {{
                 for (int i = *ol; i > 0; i--) out[i] = out[i-1];
@@ -1259,8 +1275,8 @@ int apply(const unsigned char *rs, int rl,
             int nl = 0;
             for (int i = 0; i < *ol; i++) if (out[i] != p) out[nl++] = out[i];
             *ol = nl; changed = 1;
-        }} else if (cmd == 'p') {{
-            int n = p - '0';
+        }} else if (cmd == 'p' && pv >= 0) {{
+            int n = pv;
             if (n > 0 && *ol*(n+1) <= MAX_OUTPUT_LEN) {{
                 int o = *ol;
                 for (int r = 0; r < n; r++) {{
@@ -1268,62 +1284,62 @@ int apply(const unsigned char *rs, int rl,
                     *ol += o;
                 }} changed = 1;
             }}
-        }} else if (cmd == 'T' && p>='0' && p<='9') {{
-            int pos = p-'0';
+        }} else if (cmd == 'T' && pv >= 0) {{
+            int pos = pv;
             if (pos < *ol) {{
                 if (out[pos] >= 'a' && out[pos] <= 'z') out[pos] -= 32;
                 else if (out[pos] >= 'A' && out[pos] <= 'Z') out[pos] += 32;
                 changed = 1;
             }}
-        }} else if (cmd == 'D' && p>='0' && p<='9') {{
-            int pos = p-'0';
+        }} else if (cmd == 'D' && pv >= 0) {{
+            int pos = pv;
             if (pos < *ol) {{
                 for (int i = pos; i < *ol-1; i++) out[i] = out[i+1];
                 (*ol)--; changed = 1;
             }}
-        }} else if (cmd == 'L' && p>='0' && p<='9') {{
-            int pos = p-'0';
+        }} else if (cmd == 'L' && pv >= 0) {{
+            int pos = pv;
             if (pos < *ol) {{ out[pos] <<= 1; changed = 1; }}
-        }} else if (cmd == 'R' && p>='0' && p<='9') {{
-            int pos = p-'0';
+        }} else if (cmd == 'R' && pv >= 0) {{
+            int pos = pv;
             if (pos < *ol) {{ out[pos] >>= 1; changed = 1; }}
-        }} else if (cmd == '+' && p>='0' && p<='9') {{
-            int pos = p-'0';
+        }} else if (cmd == '+' && pv >= 0) {{
+            int pos = pv;
             if (pos < *ol && out[pos] < 255) {{ out[pos]++; changed = 1; }}
-        }} else if (cmd == '-' && p>='0' && p<='9') {{
-            int pos = p-'0';
+        }} else if (cmd == '-' && pv >= 0) {{
+            int pos = pv;
             if (pos < *ol && out[pos] > 0) {{ out[pos]--; changed = 1; }}
-        }} else if ((cmd == '.' || cmd == ',') && p>='0' && p<='9') {{
-            int pos = p-'0';
+        }} else if ((cmd == '.' || cmd == ',') && pv >= 0) {{
+            int pos = pv;
             if (pos < *ol) {{
                 out[pos] += (cmd == '.') ? 1 : -1; changed = 1;
             }}
-        }} else if (cmd == '\'' && p>='0' && p<='9') {{
-            int pos = p-'0';
+        }} else if (cmd == '\'' && pv >= 0) {{
+            int pos = pv;
             if (pos < *ol) {{ *ol = pos; changed = 1; }}
-        }} else if (cmd == 'z' && p>='0' && p<='9') {{
-            int n = p-'0';
+        }} else if (cmd == 'z' && pv >= 0) {{
+            int n = pv;
             if (n>0 && *ol+n <= MAX_OUTPUT_LEN) {{
                 unsigned char f = out[0];
                 for (int i = *ol+n-1; i >= n; i--) out[i] = out[i-n];
                 for (int i = 0; i < n; i++) out[i] = f;
                 *ol += n; changed = 1;
             }}
-        }} else if (cmd == 'Z' && p>='0' && p<='9') {{
-            int n = p-'0';
+        }} else if (cmd == 'Z' && pv >= 0) {{
+            int n = pv;
             if (n>0 && *ol+n <= MAX_OUTPUT_LEN) {{
                 unsigned char l = out[*ol-1];
                 for (int i = 0; i < n; i++) out[*ol+i] = l;
                 *ol += n; changed = 1;
             }}
-        }} else if (cmd == 'y' && p>='0' && p<='9') {{
-            int n = p-'0';
+        }} else if (cmd == 'y' && pv >= 0) {{
+            int n = pv;
             if (n>0 && *ol+n <= MAX_OUTPUT_LEN) {{
                 for (int i = 0; i < n; i++) out[*ol+i] = out[i];
                 *ol += n; changed = 1;
             }}
-        }} else if (cmd == 'Y' && p>='0' && p<='9') {{
-            int n = p-'0';
+        }} else if (cmd == 'Y' && pv >= 0) {{
+            int n = pv;
             if (n>0 && *ol+n <= MAX_OUTPUT_LEN) {{
                 for (int i = 0; i < n; i++) out[*ol+i] = out[*ol-n+i];
                 *ol += n; changed = 1;
