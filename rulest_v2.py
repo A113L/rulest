@@ -1445,7 +1445,7 @@ __kernel void find_rule_chains_gpu(
     __global const unsigned char *rs, __global const int *ro, __global const int *rl,
     __global const int *cseq, __global const int *cdep,
     __global const uchar *bf, const int nw, const int nc, const int mcd,
-    __global char *found, __global volatile int *cnt)
+    __global char *found, __global volatile int *cnt, __global int *foundw)
 {{
     int gid = get_global_id(0);
     if (gid >= nw * nc) return;
@@ -1472,6 +1472,7 @@ __kernel void find_rule_chains_gpu(
             __global char *p = found + idx * MAX_CHAIN_STRING_LEN;
             for (int i = 0; i < cp && i < MAX_CHAIN_STRING_LEN-1; i++) p[i] = cb[i];
             p[cp] = '\0';
+            foundw[idx] = wi;
         }}
     }}
 }}
@@ -2133,7 +2134,7 @@ class GPUEngine:
             log_warn(f"[GPU] {truncated} chain(s) truncated to max depth {maxd}")
         return seqs, depths
 
-    def _run_chain_kernel(self, words, chains, _precomputed=None):
+    def _run_chain_kernel(self, words, chains, _precomputed=None, return_word_idx=False):
         # `words` may be either a raw list of word strings, or an already-flattened
         # batch dict as returned by get_word_batch_data()/prepare_words_data() —
         # accept both so callers can pre-flatten once (SEED PASS) and avoid re-flattening
@@ -2166,24 +2167,38 @@ class GPUEngine:
             outs = self.safe_output_buffer_size(n_words, len(chains))
             fo = cl.Buffer(self.context, mf.WRITE_ONLY, outs*MAX_CHAIN_STRING_LEN); bufs.append(fo)
             fc = cl.Buffer(self.context, mf.READ_WRITE, 4); bufs.append(fc)
+            # foundw: parallel per-hit word-index buffer. Always allocated/passed since it's
+            # now part of the compiled kernel's fixed signature; only decoded when the caller
+            # (Stage 3 GA marginal-coverage fitness) actually needs per-word hit identity.
+            fw = cl.Buffer(self.context, mf.WRITE_ONLY, outs*4); bufs.append(fw)
             cl.enqueue_copy(self.queue, fc, np.array([0], dtype=np.int32))
             tot = n_words*len(chains)
             gs = ((tot+self.local_work_size-1)//self.local_work_size)*self.local_work_size
             self.kernel_chain.set_args(bb, bbo, bbl, rb, rbo, rbl, csb, cdb, self.bloom_buf,
                                        np.int32(n_words), np.int32(len(chains)),
-                                       np.int32(self.params['MAX_CHAIN_DEPTH']), fo, fc)
+                                       np.int32(self.params['MAX_CHAIN_DEPTH']), fo, fc, fw)
             cl.enqueue_nd_range_kernel(self.queue, self.kernel_chain, (gs,), (self.local_work_size,))
             if not self._safe_queue_finish():
                 self._reset_gpu(RuntimeError("queue.finish() timed out or failed"))
                 return None
             cnt = np.zeros(1, dtype=np.int32); cl.enqueue_copy(self.queue, cnt, fc)
-            n = min(cnt[0], outs); out = []
-            if n>0:
-                data = np.zeros(n*MAX_CHAIN_STRING_LEN, dtype=np.uint8)
-                cl.enqueue_copy(self.queue, data, fo)
+            n = min(cnt[0], outs)
+            if n<=0:
+                return []
+            data = np.zeros(n*MAX_CHAIN_STRING_LEN, dtype=np.uint8)
+            cl.enqueue_copy(self.queue, data, fo)
+            if return_word_idx:
+                widx = np.zeros(n, dtype=np.int32)
+                cl.enqueue_copy(self.queue, widx, fw)
+                out = []
                 for i in range(n):
                     r = bytes(data[i*MAX_CHAIN_STRING_LEN:(i+1)*MAX_CHAIN_STRING_LEN]).split(b'\0')[0].decode('latin-1', errors='ignore')
-                    if r: out.append(r)
+                    if r: out.append((int(widx[i]), r))
+                return out
+            out = []
+            for i in range(n):
+                r = bytes(data[i*MAX_CHAIN_STRING_LEN:(i+1)*MAX_CHAIN_STRING_LEN]).split(b'\0')[0].decode('latin-1', errors='ignore')
+                if r: out.append(r)
             return out
         except Exception as e:
             log_warn(f"Chain kernel error: {e}"); self._reset_gpu(e); return None
@@ -2340,24 +2355,27 @@ class GeneticRuleEvolver:
         return tokens
 
     def evaluate_population(self, population):
+        """Returns {chain_str: set(global_word_index)} — the set of base_words indices
+        each chain successfully hit. Tracking word identity (not just a hit count) is
+        what makes marginal-coverage-gain fitness possible in evolve()."""
         cs = [' '.join(tok) for tok in population]
         valid = [c for c in cs if HashcatRuleValidator.validate_rule_for_gpu(c)]
-        raw = {c:0 for c in cs}
-        if not valid: return raw
+        hit_words = {c: set() for c in cs}
+        if not valid: return hit_words
         wsb = self.gpu_engine.params.get('WORD_SUB_BATCH',20000)
         cbs = self.gpu_engine.params.get('CHAINS_PER_BATCH',2000)
-        batch_hits = Counter()
         for ci in range(0, len(valid), cbs):
             cb = valid[ci:ci+cbs]
             seqs, depths = self.gpu_engine._compute_chain_seqs(cb)
             for wi in range(0, len(self.base_words), wsb):
                 wb = self.base_words[wi:wi+wsb]
                 if wb:
-                    found = self.gpu_engine._run_chain_kernel(wb, cb, (seqs, depths))
-                    if found: batch_hits.update(found)
+                    found = self.gpu_engine._run_chain_kernel(wb, cb, (seqs, depths), return_word_idx=True)
+                    if found:
+                        for local_idx, rule_str in found:
+                            hit_words[rule_str].add(wi + local_idx)
             self.gpu_engine._safe_queue_finish()
-        raw.update(batch_hits)
-        return raw
+        return hit_words
 
     def evolve(self, hot_rules, generations, time_budget):
         if not self.rule_pool: log_warn("[S3] empty rule pool"); return Counter()
@@ -2379,12 +2397,38 @@ class GeneticRuleEvolver:
                 last_gen=gen
                 if _kb.quit_requested: break
                 if time.time()-start >= time_budget: break
-                raw = self.evaluate_population(pop)
+                hit_words = self.evaluate_population(pop)
+                raw = {c: len(s) for c, s in hit_words.items()}
                 self._update_sig_registry(raw)
                 for cs, hits in raw.items():
                     if hits>0 and HashcatRuleValidator.validate_rule_for_gpu(cs):
                         if hits > all_new[cs]: all_new[cs]=hits
-                fitness = sorted([(tuple(ind), raw.get(' '.join(ind),0)*(2 if ' '.join(ind) not in self.known_rules else 1)) for ind in pop], key=lambda x:-x[1])
+
+                # --- Marginal coverage gain (submodular greedy) ---
+                # Process individuals in descending order of raw hit count and credit each
+                # one only for the base_words it covers that no higher-priority individual
+                # in this generation already covered. This is what "efficiency" means in
+                # the concentrator/Pareto sense: a chain that duplicates coverage already
+                # provided by a better individual contributes ~0 fitness, regardless of its
+                # own raw hit count, so the population stops rewarding near-duplicates.
+                order = sorted(pop, key=lambda ind: -len(hit_words.get(' '.join(ind), ())))
+                covered = set()
+                marginal = {}
+                for ind in order:
+                    cs_i = ' '.join(ind)
+                    s = hit_words.get(cs_i, set())
+                    gain = len(s - covered)
+                    marginal[cs_i] = gain
+                    covered |= s
+
+                # Novelty bonus now checks functional-signature membership (_sig_is_covered)
+                # instead of an exact string match against known_rules. A syntactically
+                # different chain that is functionally identical (on BUILTIN_PROBES) to an
+                # already-known rule no longer gets rewarded as if it were novel.
+                fitness = sorted(
+                    [(tuple(ind), marginal.get(' '.join(ind), 0) * (1 if self._sig_is_covered(' '.join(ind)) else 2))
+                     for ind in pop],
+                    key=lambda x: -x[1])
                 best = fitness[0][1] if fitness else 0
                 total_combos += len(pop) * len(self.base_words)
                 elapsed = time.time()-t0
