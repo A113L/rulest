@@ -26,6 +26,22 @@ import gc
 import datetime
 import multiprocessing as mp
 import threading
+
+# Windows' WaitForMultipleObjects (used internally by multiprocessing.Pool on
+# win32) can only wait on at most 63 handles at once. With many CPU cores
+# (e.g. 128 logical processors) a Pool sized to mp.cpu_count() raises:
+#   ValueError: need at most 63 handles, got a sequence of length N
+# This does not happen on POSIX (fork-based) systems, only on Windows/spawn.
+# Cap the worker count there so Pool never exceeds the OS limit.
+_WIN_MAX_POOL_WORKERS = 60  # stay safely under the 63-handle ceiling
+
+def safe_worker_count(n_workers):
+    """Clamp a requested worker/process count to a value that Windows'
+    multiprocessing.Pool can actually handle."""
+    n_workers = max(1, int(n_workers))
+    if os.name == 'nt':
+        n_workers = min(n_workers, _WIN_MAX_POOL_WORKERS)
+    return n_workers
 import functools
 import shutil
 
@@ -564,7 +580,7 @@ def _minimize_mem(rule_counter, probe_words):
     rule_items = list(rule_counter.items())
     n_total = len(rule_items)
     ncols = shutil.get_terminal_size((80,24)).columns
-    n_workers = max(1, min(mp.cpu_count(), n_total // 200 + 1))
+    n_workers = safe_worker_count(min(mp.cpu_count(), n_total // 200 + 1))
     use_mp = n_total >= 500 and n_workers > 1
     log_info(f"[MINIMIZE] Workers    : {bold(str(n_workers if use_mp else 1))}")
     t0 = time.time()
@@ -905,7 +921,7 @@ def extract_token_strip_rules(target_words, base_set, max_depth=0, min_stem_len=
                               max_prefix_len=4, max_suffix_len=4, max_leet_ambiguity=3,
                               workers=0, chunk_size=0):
     if max_depth<=0: max_depth=MAX_HASHCAT_CHAIN
-    n_workers = workers or mp.cpu_count()
+    n_workers = safe_worker_count(workers or mp.cpu_count())
     n_words = len(target_words)
     if chunk_size<=0: chunk_size = max(500, n_words//(n_workers*4)+1)
     base_by_len = defaultdict(set)
@@ -2741,7 +2757,7 @@ def main():
 
     if args.token_strip:
         _inj = green('→ STAGE S sbd → STAGE 2') if not args.no_builtin_seeds else yellow('→ STAGE 1 only → STAGE 2')
-        log_info(f"  {bold(cyan('STAGE 0'))}  : {green('enabled')} — CPU exact-match (core+insert)  min-stem={args.token_strip_min_stem}  prefix={args.token_strip_max_prefix}  suffix={args.token_strip_max_suffix}  leet-amb={args.token_strip_min_leet_amb}  workers={args.token_strip_workers or mp.cpu_count()}  {_inj}  {_EXCL}")
+        log_info(f"  {bold(cyan('STAGE 0'))}  : {green('enabled')} — CPU exact-match (core+insert)  min-stem={args.token_strip_min_stem}  prefix={args.token_strip_max_prefix}  suffix={args.token_strip_max_suffix}  leet-amb={args.token_strip_min_leet_amb}  workers={safe_worker_count(args.token_strip_workers or mp.cpu_count())}  {_inj}  {_EXCL}")
     else:
         log_info(f"  {bold(dim('STAGE 0'))}  : {red('disabled')}")
 
