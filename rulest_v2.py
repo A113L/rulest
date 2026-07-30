@@ -43,6 +43,7 @@ def safe_worker_count(n_workers):
         n_workers = min(n_workers, _WIN_MAX_POOL_WORKERS)
     return n_workers
 import functools
+import concurrent.futures
 import shutil
 
 # ================== GLOBAL FLAGS ===================
@@ -1008,10 +1009,24 @@ def list_devices():
             elif dtype == cl.device_type.CPU: t = "CPU"
             else: t = "OTHER"
         log_info(f"  {cyan(str(i)+':')} {d.get_info(cl.device_info.NAME)} ({t}) — {p.name}")
+    gpu_count = len(get_all_gpu_only_devices())
+    if gpu_count > 1:
+        log_info(f"\n  {dim('Tip:')} use {cyan('--device all')} to run on all {gpu_count} GPU(s) in parallel, "
+                 f"or {cyan('--device 0,1')} to pick specific GPUs")
     print()
+
+def get_all_gpu_only_devices():
+    devs = []
+    for p in cl.get_platforms():
+        try:
+            for d in p.get_devices(cl.device_type.GPU):
+                devs.append(d)
+        except Exception: pass
+    return devs
 
 def get_device_by_spec(spec):
     if spec is None: return get_best_gpu_device()
+    spec = spec.strip()
     devs = get_all_devices()
     if not devs: raise RuntimeError("No OpenCL devices")
     if spec.isdigit():
@@ -1506,6 +1521,11 @@ __kernel void build_bloom_filter_gpu(
 
 _BLOOM_ALREADY_ON_GPU = object()
 
+class _KernelBuildTimeout(Exception):
+    """Raised by GPUEngine._safe_build_program when the OpenCL driver's
+    build() call doesn't return within the watchdog timeout."""
+    pass
+
 # ----------------------------------------------------------------------
 # GPU Engine (with sharding, fast bloom, and fixed depth handling)
 # ----------------------------------------------------------------------
@@ -1526,6 +1546,11 @@ class GPUEngine:
         self._MAX_CONSECUTIVE_ERRORS = 5
         self._cached_free_vram = None
         self._cached_max_alloc = None
+        self.disabled = False  # set True if a kernel build hangs/times out — this
+                                # device's driver may be stuck holding an internal
+                                # lock, so we stop issuing further work to it rather
+                                # than risk every subsequent call blocking forever.
+        self._program_cache = {}  # MAX_CHAIN_DEPTH -> (program, kernel_single, kernel_chain, kernel_bloom)
         self._rules_buf = None
         self._rules_offsets_buf = None
         self._rules_lengths_buf = None
@@ -1572,6 +1597,18 @@ class GPUEngine:
         if not force and self.program is not None and self._compiled_depth == current_depth:
             log_debug("kernel already compiled with same depth")
             return self.program
+        # Reuse a previously-built program for this exact depth if we have
+        # one cached. The pipeline flips MAX_CHAIN_DEPTH back and forth
+        # (e.g. Stage2 depth -> Seed-pass depth -> back to Stage2 depth), so
+        # this avoids re-triggering a slow/flaky driver compile — a real fix
+        # for the "hang after seed pass" case, since the Stage 2 recompile is
+        # very often just reusing what was already built at pipeline start.
+        cached = self._program_cache.get(current_depth)
+        if cached is not None:
+            self.program, self.kernel_single, self.kernel_chain, self.kernel_bloom = cached
+            self._compiled_depth = current_depth
+            log_info(f"[GPU]  Reusing cached kernel for depth {current_depth} (skipping rebuild)")
+            return self.program
         if self.program:
             log_info(f"[GPU]  Recompiling kernel for depth {current_depth} (was {self._compiled_depth})")
         else:
@@ -1590,18 +1627,76 @@ class GPUEngine:
                 MAX_OUTPUT_LEN=MAX_OUTPUT_LEN,
                 BLOOM_HASH_FUNCTIONS=BLOOM_HASH_FUNCTIONS,
             )
-            prog = cl.Program(self.context, src)
-            prog.build()
-            self.program = prog
-            self.kernel_single = prog.find_single_rules_gpu
-            self.kernel_chain = prog.find_rule_chains_gpu
-            self.kernel_bloom = prog.build_bloom_filter_gpu
-            self._compiled_depth = current_depth
-            log_info("[GPU]  Kernel compiled successfully")
-            return prog
         except Exception as e:
             log_error(f"Kernel compile failed: {e}")
             return None
+
+        dev_name = self.device.name.strip() if self.device else "device"
+        prog = None
+        try:
+            prog = self._safe_build_program(src, timeout=180)
+        except _KernelBuildTimeout:
+            # Many Intel NEO / iGPU driver hangs are caused by the optimizer
+            # choking on a particular kernel rather than the device being
+            # truly broken. Give it one real second chance on a brand-new
+            # context (the old one may still have a build stuck inside it)
+            # with the optimizer disabled — this is a well-known practical
+            # workaround for exactly this class of hang.
+            log_warn(f"[GPU]  Build stalled on {dev_name} — retrying once on a fresh context "
+                     f"with the optimizer disabled (-cl-opt-disable)")
+            if self._recreate_context():
+                try:
+                    prog = self._safe_build_program(src, timeout=120, build_options=['-cl-opt-disable'])
+                except _KernelBuildTimeout:
+                    prog = None
+                except Exception as e:
+                    log_error(f"[GPU]  Retry build failed on {dev_name}: {e}")
+                    prog = None
+            else:
+                prog = None
+        except Exception as e:
+            log_error(f"Kernel compile failed: {e}")
+            return None
+
+        if prog is None:
+            log_error(f"[GPU]  Disabling {dev_name} after repeated build failure/hang")
+            self.disabled = True
+            self.context = None
+            self.queue = None
+            self.program = self.kernel_single = self.kernel_chain = self.kernel_bloom = None
+            return None
+
+        self.program = prog
+        self.kernel_single = prog.find_single_rules_gpu
+        self.kernel_chain = prog.find_rule_chains_gpu
+        self.kernel_bloom = prog.build_bloom_filter_gpu
+        self._compiled_depth = current_depth
+        self._program_cache[current_depth] = (prog, self.kernel_single, self.kernel_chain, self.kernel_bloom)
+        log_info("[GPU]  Kernel compiled successfully")
+        return prog
+
+    def _recreate_context(self):
+        """Create a fresh OpenCL context/queue on the same device, abandoning
+        a previous one that may still have a build stuck inside it. Clears
+        buffer/kernel state tied to the old context since it's no longer
+        valid to use."""
+        try:
+            self.context = cl.Context([self.device])
+            self.queue = cl.CommandQueue(self.context)
+            for buf in [self.bloom_buf, self._rules_buf, self._rules_offsets_buf, self._rules_lengths_buf]:
+                if buf is not None:
+                    try: buf.release()
+                    except Exception: pass
+            self.bloom_buf = self._rules_buf = self._rules_offsets_buf = self._rules_lengths_buf = None
+            self._rules_buf_key = None
+            self.gpu_rules = []
+            self.rule_index = {}
+            self.program = self.kernel_single = self.kernel_chain = self.kernel_bloom = None
+            self._program_cache = {}  # programs from the old context are invalid
+            return True
+        except Exception as e:
+            log_error(f"[GPU]  Failed to create fresh context for retry: {e}")
+            return False
 
     def _reset_gpu(self, error):
         log_warn(f"[GPU] Fatal kernel error: {error} — resetting context")
@@ -1617,6 +1712,7 @@ class GPUEngine:
         self.bloom_buf = self._rules_buf = self._rules_offsets_buf = self._rules_lengths_buf = None
         self._rules_buf_key = None  # force re-upload of rules after reset
         self.program = self.kernel_single = self.kernel_chain = self.kernel_bloom = None
+        self._program_cache = {}  # programs from the old context are invalid
         self.context = None
         self.queue = None
         self.gpu_rules = []
@@ -1656,6 +1752,32 @@ class GPUEngine:
         if t.is_alive(): return False
         return bool(res) and res[0]
 
+    def _safe_build_program(self, src, timeout=180, build_options=None):
+        """Build an OpenCL program on a watchdog thread so a driver-level
+        compile hang (seen on some multi-GPU / laptop-hybrid setups) can't
+        freeze the whole run forever. Mirrors _safe_queue_finish's pattern:
+        if the build thread is still alive after `timeout` seconds, we give
+        up on it (the thread is left as a daemon and abandoned — OpenCL
+        offers no safe way to cancel an in-flight build) and return None so
+        the caller can fail gracefully instead of hanging at "100%"."""
+        prog = cl.Program(self.context, src)
+        result = {}
+        def do_build():
+            try:
+                prog.build(options=build_options or [])
+                result['ok'] = True
+            except Exception as e:
+                result['ok'] = False
+                result['err'] = e
+        t = threading.Thread(target=do_build, daemon=True)
+        t.start()
+        t.join(timeout=timeout)
+        if t.is_alive():
+            raise _KernelBuildTimeout(f"build did not return within {timeout}s")
+        if not result.get('ok'):
+            raise result.get('err', RuntimeError("kernel build failed"))
+        return prog
+
     def generate_bloom_filter(self, target_words):
         total_bytes = self.params['BLOOM_NUM_SHARDS'] * self.params['BLOOM_SHARD_BYTES']
         bf = np.zeros(total_bytes, dtype=np.uint8)
@@ -1683,7 +1805,10 @@ class GPUEngine:
         total_bytes = ns * shard_bytes
         nw = len(target_words)
         if not self.context or not self.program or not self.kernel_bloom:
-            log_debug("[BLOOM] GPU kernel not ready — fallback to CPU")
+            reason = ("no GPU context" if not self.context else
+                      "kernel not compiled" if not self.program else
+                      "bloom kernel missing after compile")
+            log_warn(f"[BLOOM] GPU not ready ({reason}) — falling back to CPU build")
             return self.generate_bloom_filter(target_words)
         log_info(f"[BLOOM] GPU build: {total_bytes//1024//1024}MB, {nw} words, {ns} shards")
         mf = cl.mem_flags
@@ -1702,10 +1827,21 @@ class GPUEngine:
             self.kernel_bloom.set_args(words_buf, offsets_buf, lengths_buf, np.int32(nw), bf_buf)
             cl.enqueue_nd_range_kernel(self.queue, self.kernel_bloom, (gs,), (self.local_work_size,))
             if not self._safe_queue_finish(): raise RuntimeError("queue finish timeout")
-            # Verify at least 256 bytes of the bloom filter – if all zero, fallback
-            sample = np.empty(min(2048, bf_int32_size), dtype=np.int32)
-            cl.enqueue_copy(self.queue, sample, bf_buf)
-            if np.count_nonzero(sample) == 0 and nw > 0:
+            # Verify the GPU actually wrote something non-trivial before trusting
+            # this buffer. A bloom filter can legitimately have a very low fill
+            # ratio (e.g. fill=0.001% on a large --bloom-mb with a small
+            # wordlist), in which case the set bits are sparse and can easily
+            # fall entirely outside a small sampled region — sampling only the
+            # first few KB of a 256MB+ buffer produced false "all-zero"
+            # positives and silently discarded valid GPU results every time.
+            # Downloading the full buffer is a one-off cost (once per bloom
+            # build, not per batch) and gives an exact answer instead of a
+            # statistical guess.
+            verify = np.empty(bf_int32_size, dtype=np.int32)
+            cl.enqueue_copy(self.queue, verify, bf_buf)
+            all_zero = np.count_nonzero(verify) == 0
+            del verify
+            if all_zero and nw > 0:
                 log_warn("[BLOOM] GPU build all-zero -> fallback to CPU")
                 raise RuntimeError("all-zero")
             if self.bloom_buf: self.bloom_buf.release()
@@ -1780,7 +1916,8 @@ class GPUEngine:
         return dict(words_flat=wf, word_offsets=wo, word_lengths=wl,
                     num_words=end-start, num_rules=len(self.gpu_rules))
 
-    def process_all_words_single_rule(self, base_words, rules, bloom_filter):
+    def process_all_words_single_rule(self, base_words, rules, bloom_filter, _silent=False,
+                                       _shared_combos=None, _shared_lock=None):
         self.upload_bloom_filter(bloom_filter)
         if not self.compile_kernel(): return Counter()
         # Refresh GPU rules list
@@ -1791,7 +1928,8 @@ class GPUEngine:
         ncols = shutil.get_terminal_size((80,24)).columns
         t0 = time.time(); words_done = 0; nr = len(self.gpu_rules)
         with tqdm(total=len(base_words), desc=green("  STAGE 1 "), unit="word", ncols=ncols,
-                  bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}") as pbar:
+                  bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}",
+                  disable=_silent) as pbar:
             for i in range(0, len(base_words), bs):
                 if _kb.quit_requested: break
                 batch = base_words[i:i+bs]
@@ -1805,8 +1943,14 @@ class GPUEngine:
                         if self._consecutive_errors >= self._MAX_CONSECUTIVE_ERRORS: break
                     words_done += len(batch)
                     elapsed = time.time()-t0
-                    combos = words_done * nr
-                    spd = _fmt_speed(combos / elapsed if elapsed>0 else 0)
+                    delta = len(batch) * nr
+                    if _shared_combos is not None and _shared_lock is not None:
+                        with _shared_lock:
+                            _shared_combos[0] += delta
+                        combos_for_speed = _shared_combos[0]
+                    else:
+                        combos_for_speed = words_done * nr
+                    spd = _fmt_speed(combos_for_speed / elapsed if elapsed>0 else 0)
                     pbar.set_postfix({"rules": cyan(str(len(counter))), "spd": green(spd)}, refresh=False)
                 pbar.update(len(batch))
         log_info(f"[S1]    {bold(green(str(len(counter))))} unique rules passed bloom filter")
@@ -2007,7 +2151,7 @@ class GPUEngine:
                         sbd[2].add(f"{t_op} {leet_op}")
         return dict(sbd)
 
-    def run_seed_extraction_pass(self, base_words, sbd, bloom_filter, phase1_rules):
+    def run_seed_extraction_pass(self, base_words, sbd, bloom_filter, phase1_rules, _silent=False):
         if self.bloom_buf is None: self.upload_bloom_filter(bloom_filter)
         if not self.program:
             if not self.compile_kernel(): return Counter()
@@ -2026,39 +2170,7 @@ class GPUEngine:
         depth_range_str = (f"d{d_levels[0]}–d{d_levels[-1]}" if len(d_levels) > 1
                            else (f"d{d_levels[0]}" if d_levels else "none"))
         log_info(f"[SEED]    Numeric seed pass: {total:,} chains across {len(d_levels)} depth level(s) ({depth_range_str})")
-        counter = Counter()
-        cbs = self.params['CHAINS_PER_BATCH']
-        wsb = self.params['WORD_SUB_BATCH']
-        n_batches = (len(multi)+cbs-1)//cbs
-        ncols = shutil.get_terminal_size((80,24)).columns
-        t0 = time.time()
-        total_combos = 0
-        self.set_base_words(base_words)
-        with tqdm(total=n_batches, desc=green("  SEED PASS "), unit="batch", ncols=ncols,
-                  bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}") as pbar:
-            for ci in range(0, len(multi), cbs):
-                if _kb.quit_requested: break
-                cb = multi[ci:ci+cbs]
-                seqs, depths = self._compute_chain_seqs(cb)
-                for wi in range(0, len(base_words), wsb):
-                    end = min(wi+wsb, len(base_words))
-                    bd = self.get_word_batch_data(wi, end)
-                    if bd['num_words'] == 0: continue
-                    found = self._run_chain_kernel(bd, cb, (seqs, depths))
-                    if found is None:
-                        self._consecutive_errors += 1
-                        if self._consecutive_errors >= self._MAX_CONSECUTIVE_ERRORS:
-                            log_error("Too many consecutive GPU errors, aborting SEED PASS")
-                            break
-                    elif found:
-                        self._consecutive_errors = 0
-                        counter.update(found)
-                if self._consecutive_errors >= self._MAX_CONSECUTIVE_ERRORS: break
-                total_combos += len(cb) * len(base_words)
-                elapsed = time.time()-t0
-                spd = _fmt_speed(total_combos / elapsed if elapsed>0 else 0)
-                pbar.set_postfix({"rules": cyan(str(len(counter))), "spd": green(spd)}, refresh=False)
-                pbar.update(1)
+        counter = self._run_chains_against_words(base_words, multi, "  SEED PASS ", _silent)
         log_info(f"[SEED]    {bold(green(str(len(counter))))} unique seed chains passed bloom filter")
         return counter
 
@@ -2081,7 +2193,7 @@ class GPUEngine:
         return list(chains)
 
     def process_all_words_chain_rules(self, base_words, rules, max_depth, bloom_filter,
-                                      single_counter, seed_chains=None, prebuilt_sbd=None):
+                                      single_counter, seed_chains=None, prebuilt_sbd=None, _silent=False):
         if self.bloom_buf is None: self.upload_bloom_filter(bloom_filter)
         if not self.program:
             if not self.compile_kernel(): return Counter()
@@ -2089,30 +2201,57 @@ class GPUEngine:
             self.rule_index = {r:i for i,r in enumerate(self.gpu_rules)}
         chains = self.generate_informed_chains(rules, single_counter, max_depth, seed_chains, prebuilt_sbd)
         if not chains: return Counter()
+        counter = self._run_chains_against_words(base_words, chains, "  STAGE 2 ", _silent)
+        log_info(f"[S2]    {bold(green(str(len(counter))))} unique chain rules passed bloom filter")
+        return counter
+
+    def _run_chains_against_words(self, base_words, chains, desc="  CHAINS  ", _silent=False,
+                                   _shared_combos=None, _shared_lock=None):
+        """Shared inner loop: iterate chain batches x word sub-batches, collect matches.
+        Uses the same pre-flattened word-batch fast path the original seed-extraction
+        pass used (set_base_words/get_word_batch_data), avoiding repeated
+        latin-1 re-encoding of base_words on every chain batch."""
         counter = Counter()
         cbs = self.params['CHAINS_PER_BATCH']
         wsb = self.params['WORD_SUB_BATCH']
-        n_batches = (len(chains)+cbs-1)//cbs
-        ncols = shutil.get_terminal_size((80,24)).columns
+        n_batches = (len(chains) + cbs - 1) // cbs
+        ncols = shutil.get_terminal_size((80, 24)).columns
         t0 = time.time()
         total_combos = 0
-        with tqdm(total=n_batches, desc=green("  STAGE 2 "), unit="batch", ncols=ncols,
-                  bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}") as pbar:
+        self.set_base_words(base_words)
+        with tqdm(total=n_batches, desc=green(desc), unit="batch", ncols=ncols,
+                  bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}",
+                  disable=_silent) as pbar:
             for ci in range(0, len(chains), cbs):
                 if _kb.quit_requested: break
-                cb = chains[ci:ci+cbs]
+                cb = chains[ci:ci + cbs]
                 seqs, depths = self._compute_chain_seqs(cb)
                 for wi in range(0, len(base_words), wsb):
-                    wb = base_words[wi:wi+wsb]
-                    if wb:
-                        found = self._run_chain_kernel(wb, cb, (seqs, depths))
-                        if found: counter.update(found)
-                total_combos += len(cb) * len(base_words)
-                elapsed = time.time()-t0
-                spd = _fmt_speed(total_combos / elapsed if elapsed>0 else 0)
+                    end = min(wi + wsb, len(base_words))
+                    bd = self.get_word_batch_data(wi, end)
+                    if bd['num_words'] == 0: continue
+                    found = self._run_chain_kernel(bd, cb, (seqs, depths))
+                    if found is None:
+                        self._consecutive_errors += 1
+                        if self._consecutive_errors >= self._MAX_CONSECUTIVE_ERRORS:
+                            log_error(f"Too many consecutive GPU errors, aborting {desc.strip()}")
+                            break
+                    elif found:
+                        self._consecutive_errors = 0
+                        counter.update(found)
+                if self._consecutive_errors >= self._MAX_CONSECUTIVE_ERRORS: break
+                delta = len(cb) * len(base_words)
+                total_combos += delta
+                if _shared_combos is not None and _shared_lock is not None:
+                    with _shared_lock:
+                        _shared_combos[0] += delta
+                    combos_for_speed = _shared_combos[0]
+                else:
+                    combos_for_speed = total_combos
+                elapsed = time.time() - t0
+                spd = _fmt_speed(combos_for_speed / elapsed if elapsed > 0 else 0)
                 pbar.set_postfix({"rules": cyan(str(len(counter))), "spd": green(spd)}, refresh=False)
                 pbar.update(1)
-        log_info(f"[S2]    {bold(green(str(len(counter))))} unique chain rules passed bloom filter")
         return counter
 
     def _compute_chain_seqs(self, chains):
@@ -2206,6 +2345,241 @@ class GPUEngine:
             for b in bufs:
                 try: b.release()
                 except Exception: pass
+
+# ----------------------------------------------------------------------
+# Multi-GPU engine — distributes word/chain batches across N GPUEngine
+# instances. Only used when the user explicitly requests --device all
+# and more than one GPU is present; a single detected GPU always falls
+# back to a plain GPUEngine so single-GPU performance is untouched.
+# ----------------------------------------------------------------------
+class MultiGPUEngine:
+    """Wraps N GPUEngine instances and splits work across them.
+
+    Stage 1 splits base_words across GPUs (word-dominated).
+    Stage S and Stage 2 split chains across GPUs (chain-dominated) — each GPU
+    tests its chain slice against all base_words.  Stage 3 (genetic) always
+    runs on the primary engine only — pass .engines[0] to GeneticRuleEvolver.
+    """
+
+    def __init__(self, params):
+        self._params = params
+        self.engines: List['GPUEngine'] = []
+
+    @property
+    def params(self):
+        return self._params
+
+    @params.setter
+    def params(self, value):
+        self._params = value
+        for eng in self.engines:
+            eng.params = value
+
+    @property
+    def device(self):
+        return self.engines[0].device if self.engines else None
+
+    def initialize_gpu(self, device_specs):
+        for spec in device_specs:
+            eng = GPUEngine(self._params)
+            if eng.initialize_gpu(spec):
+                self.engines.append(eng)
+            else:
+                log_warn(f"[GPU]  Skipping device {spec} — init failed")
+        if not self.engines:
+            return False
+        if len(self.engines) == 1:
+            log_info("[GPU]  Only one GPU initialised — falling back to single-GPU mode")
+        else:
+            log_info(f"[GPU]  {bold(str(len(self.engines)))} GPUs active for parallel processing")
+        return True
+
+    def _prune_disabled(self):
+        """Drop any engine whose kernel build timed out (see GPUEngine.disabled).
+        That device's driver may still be stuck holding an internal lock, so we
+        stop issuing it further work and continue with whatever GPU(s) remain
+        instead of retrying (and potentially hanging on) it again next stage."""
+        alive = []
+        for eng in self.engines:
+            if eng.disabled:
+                name = eng.device.name.strip() if eng.device else "unknown device"
+                log_warn(f"[GPU]  Dropping unresponsive device ({name}) — continuing with remaining GPU(s)")
+            else:
+                alive.append(eng)
+        removed = len(self.engines) - len(alive)
+        self.engines = alive
+        return removed
+
+    def compile_kernel(self, force=False):
+        # Recompiling right on the heels of concurrent multi-GPU execution
+        # (Stage 1 / Seed Pass just ran both devices at once) has been seen to
+        # trigger a build-time hang on mixed-vendor setups (e.g. NVIDIA +
+        # Intel) even though each device compiles fine completely on its own
+        # — some driver stacks share internal locking across vendors within
+        # the same process that a single-GPU run never exercises. Draining
+        # every engine's queue first, and giving the driver stack a brief
+        # moment to settle, avoids issuing a build while another vendor's
+        # driver may still be mid-transition.
+        if len(self.engines) > 1:
+            for eng in self.engines:
+                if eng.queue is not None:
+                    eng._safe_queue_finish()
+            time.sleep(0.5)
+        ok = True
+        for eng in self.engines:
+            ok = eng.compile_kernel(force=force) and ok
+        self._prune_disabled()
+        if not self.engines:
+            log_error("[GPU]  All GPUs became unresponsive during kernel compile")
+            return False
+        return ok
+
+    def generate_bloom_filter_gpu(self, target_words):
+        primary = self.engines[0]
+        bf = primary.generate_bloom_filter_gpu(target_words)
+        if len(self.engines) > 1:
+            if bf is _BLOOM_ALREADY_ON_GPU:
+                # Download from primary VRAM to share with other GPUs
+                buf = primary.bloom_buf
+                bf_np = np.empty(buf.size // 4, dtype=np.int32)
+                cl.enqueue_copy(primary.queue, bf_np, buf)
+                primary.queue.finish()
+            else:
+                bf_np = bf  # CPU fallback already returned a numpy array
+            for eng in self.engines[1:]:
+                eng.upload_bloom_filter(bf_np)
+        return bf
+
+    def upload_bloom_filter(self, bf):
+        for eng in self.engines:
+            eng.upload_bloom_filter(bf)
+
+    def build_numeric_seed_families(self, max_depth):
+        return self.engines[0].build_numeric_seed_families(max_depth)
+
+    def _split_words(self, words):
+        n = len(self.engines)
+        if n <= 1:
+            return [words]
+        chunk = max(1, (len(words) + n - 1) // n)
+        return [words[i * chunk:(i + 1) * chunk] for i in range(n)]
+
+    def _parallel_run(self, fn_per_engine, slices):
+        n = len(self.engines)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=n) as pool:
+            futs = [pool.submit(fn_per_engine, eng, sl)
+                    for eng, sl in zip(self.engines, slices) if sl]
+            merged = Counter()
+            for f in futs:
+                try:
+                    merged.update(f.result())
+                except Exception as exc:
+                    log_warn(f"[GPU]  Worker thread error: {exc}")
+        return merged
+
+    def process_all_words_single_rule(self, base_words, rules, bloom_filter):
+        if len(self.engines) == 1:
+            return self.engines[0].process_all_words_single_rule(base_words, rules, bloom_filter)
+        slices = self._split_words(base_words)
+        log_info(f"[GPU]  STAGE 1 split across {len(self.engines)} GPUs (~{len(slices[0]):,} words each; progress shows GPU 0 only)")
+        shared_combos = [0]; shared_lock = threading.Lock()
+        return self._parallel_run(
+            lambda eng, sl: eng.process_all_words_single_rule(
+                sl, rules, bloom_filter, _silent=(eng is not self.engines[0]),
+                _shared_combos=shared_combos, _shared_lock=shared_lock),
+            slices)
+
+    def _split_chains(self, chains):
+        n = len(self.engines)
+        if n <= 1:
+            return [chains]
+        chunk = max(1, (len(chains) + n - 1) // n)
+        return [chains[i * chunk:(i + 1) * chunk] for i in range(n)]
+
+    def _ensure_engine_ready(self, eng, bloom_filter, phase1_rules):
+        if eng.bloom_buf is None: eng.upload_bloom_filter(bloom_filter)
+        if not eng.program: eng.compile_kernel()
+        if not eng.rule_index:
+            eng.gpu_rules = HashcatRuleValidator.validate_rules_for_gpu(phase1_rules)
+            eng.rule_index = {r: i for i, r in enumerate(eng.gpu_rules)}
+
+    def run_seed_extraction_pass(self, base_words, sbd, bloom_filter, phase1_rules):
+        if len(self.engines) == 1:
+            return self.engines[0].run_seed_extraction_pass(base_words, sbd, bloom_filter, phase1_rules)
+        # Pre-extract chains from sbd so we can split them across GPUs
+        multi = []
+        for depth, chains in sorted(sbd.items()):
+            if depth >= 2:
+                multi.extend(chains)
+        if not multi:
+            log_info("[SEED]    No multi-depth seeds")
+            return Counter()
+        total = len(multi)
+        d_levels = sorted(d for d in sbd if d >= 2)
+        depth_range_str = (f"d{d_levels[0]}–d{d_levels[-1]}" if len(d_levels) > 1
+                           else (f"d{d_levels[0]}" if d_levels else "none"))
+        log_info(f"[SEED]    Numeric seed pass: {total:,} chains across {len(d_levels)} depth level(s) ({depth_range_str})")
+        if len(self.engines) > 1:
+            for eng in self.engines:
+                if eng.queue is not None:
+                    eng._safe_queue_finish()
+            time.sleep(0.5)
+        for eng in self.engines:
+            self._ensure_engine_ready(eng, bloom_filter, phase1_rules)
+        self._prune_disabled()
+        if not self.engines:
+            log_error("[SEED]    All GPUs became unresponsive — aborting seed pass")
+            return Counter()
+        if len(self.engines) == 1:
+            result = self.engines[0]._run_chains_against_words(base_words, multi, "  SEED PASS ")
+            log_info(f"[SEED]    {bold(green(str(len(result))))} unique seed chains passed bloom filter")
+            return result
+        chain_slices = self._split_chains(multi)
+        log_info(f"[GPU]  SEED split across {len(self.engines)} GPUs (~{len(chain_slices[0]):,} chains each)")
+        shared_combos = [0]; shared_lock = threading.Lock()
+        merged = self._parallel_run(
+            lambda eng, sl: eng._run_chains_against_words(
+                base_words, sl, "  SEED PASS ", eng is not self.engines[0],
+                shared_combos, shared_lock),
+            chain_slices)
+        log_info(f"[SEED]    {bold(green(str(len(merged))))} unique seed chains passed bloom filter")
+        return merged
+
+    def process_all_words_chain_rules(self, base_words, rules, max_depth, bloom_filter,
+                                       single_counter, seed_chains=None, prebuilt_sbd=None):
+        if len(self.engines) == 1:
+            return self.engines[0].process_all_words_chain_rules(
+                base_words, rules, max_depth, bloom_filter, single_counter, seed_chains, prebuilt_sbd)
+        # Generate chains once on the primary engine, then split across GPUs
+        primary = self.engines[0]
+        if primary.bloom_buf is None: primary.upload_bloom_filter(bloom_filter)
+        if not primary.rule_index:
+            primary.rule_index = {r: i for i, r in enumerate(primary.gpu_rules)}
+        chains = primary.generate_informed_chains(rules, single_counter, max_depth, seed_chains, prebuilt_sbd)
+        if not chains: return Counter()
+        if len(self.engines) > 1:
+            for eng in self.engines:
+                if eng.queue is not None:
+                    eng._safe_queue_finish()
+            time.sleep(0.5)
+        for eng in self.engines[1:]:
+            self._ensure_engine_ready(eng, bloom_filter, rules)
+        self._prune_disabled()
+        if len(self.engines) == 1:
+            result = primary._run_chains_against_words(base_words, chains, "  STAGE 2 ")
+            log_info(f"[S2]    {bold(green(str(len(result))))} unique chain rules passed bloom filter")
+            return result
+        chain_slices = self._split_chains(chains)
+        log_info(f"[GPU]  STAGE 2 split across {len(self.engines)} GPUs (~{len(chain_slices[0]):,} chains each)")
+        shared_combos = [0]; shared_lock = threading.Lock()
+        merged = self._parallel_run(
+            lambda eng, sl: eng._run_chains_against_words(
+                base_words, sl, "  STAGE 2 ", eng is not self.engines[0],
+                shared_combos, shared_lock),
+            chain_slices)
+        log_info(f"[S2]    {bold(green(str(len(merged))))} unique chain rules passed bloom filter")
+        return merged
+
 
 # ----------------------------------------------------------------------
 # Genetic Algorithm Rule Evolver (with signature cache limit)
@@ -2585,9 +2959,37 @@ class GPUExtractor:
                 all_seeds = list(all_seeds) + ts_chains
             n_s0_chains_to_stage2 += len(ts_chains)
 
-        self.gpu_engine = GPUEngine(self.params)
-        if not self.gpu_engine.initialize_gpu(self.device_spec):
-            return all_counts
+        is_explicit_multi = (
+            self.device_spec is not None
+            and self.device_spec != 'all'
+            and ',' in self.device_spec
+        )
+        if self.device_spec == 'all' or is_explicit_multi:
+            if is_explicit_multi:
+                # User (or the RCR GUI) passed an explicit comma-separated
+                # device list, e.g. "--device 0,1". Use exactly those specs
+                # instead of auto-discovering every GPU on the system.
+                specs = [s.strip() for s in self.device_spec.split(',') if s.strip()]
+                if not specs:
+                    log_error(f"[GPU]  No valid device IDs parsed from '{self.device_spec}'"); return all_counts
+            else:
+                gpu_devs = get_all_gpu_only_devices()
+                if not gpu_devs:
+                    log_error("[GPU]  No GPU devices found for --device all"); return all_counts
+                all_devs = get_all_devices()
+                specs = [str(i) for i, (_p, d) in enumerate(all_devs) if d in gpu_devs]
+            if len(specs) > 1:
+                self.gpu_engine = MultiGPUEngine(self.params)
+                if not self.gpu_engine.initialize_gpu(specs):
+                    return all_counts
+            else:
+                self.gpu_engine = GPUEngine(self.params)
+                if not self.gpu_engine.initialize_gpu(specs[0] if specs else None):
+                    return all_counts
+        else:
+            self.gpu_engine = GPUEngine(self.params)
+            if not self.gpu_engine.initialize_gpu(self.device_spec):
+                return all_counts
         self.params = calculate_dynamic_parameters(self.base_count, self.target_count, self.gpu_engine.device,
                                                    self.params['TARGET_SECONDS']/3600,
                                                    bloom_mb_override=self.bloom_mb, bloom_no_shard=self.bloom_no_shard)
@@ -2651,10 +3053,19 @@ class GPUExtractor:
 
         self.params['MAX_CHAIN_DEPTH'] = self.user_max_depth
         self.gpu_engine.params = self.params
-        if not self.gpu_engine.compile_kernel(force=True):
+        stage2_gpu_ready = self.gpu_engine.compile_kernel(force=True)
+        if not stage2_gpu_ready:
             log_warn("Failed to recompile kernel for Stage 2 depth")
+        # If this is a MultiGPUEngine and every device ended up disabled (e.g. a
+        # driver hung during compile and was dropped), or a single GPUEngine got
+        # poisoned the same way, there's nothing left to run Stage 2 on — skip it
+        # cleanly instead of calling into a dead engine.
+        no_gpu_left = (hasattr(self.gpu_engine, 'engines') and not self.gpu_engine.engines) or \
+                      (not hasattr(self.gpu_engine, 'engines') and self.gpu_engine.context is None)
+        if no_gpu_left:
+            log_error("[S2]    No usable GPU remaining — skipping STAGE 2 and STAGE 3")
 
-        if self.user_max_depth > 1 and not _kb.quit_requested:
+        if self.user_max_depth > 1 and not _kb.quit_requested and not no_gpu_left:
             log_section("STAGE 2 — Rule Chain Search")
             log_info(f"[S2]    {bold(cyan(str(n_s0_chains_to_stage2)))} rules from STAGE 0 injected into chain search")
 
@@ -2691,7 +3102,7 @@ class GPUExtractor:
                                                                    prebuilt_sbd=sbd)
             all_counts.update(chains)
 
-        if self.genetic and self.user_max_depth >= 2 and not _kb.quit_requested:
+        if self.genetic and self.user_max_depth >= 2 and not _kb.quit_requested and not no_gpu_left:
             log_section("STAGE 3 — Genetic Algorithm Rule Evolution")
             rule_pool = HashcatRuleValidator.validate_rules_for_gpu(rules_phase1)
             hot_rules = [r for r,_ in sorted(single.items(), key=lambda kv:-kv[1])]
@@ -2709,7 +3120,8 @@ class GPUExtractor:
             else:
                 log_info(f"[S3]    Budget: {bold(f'{ga_budget:.0f}s')}")
             known_set = set(all_counts.keys())
-            evolver = GeneticRuleEvolver(self.gpu_engine, base_words, rule_pool, self.user_max_depth,
+            _ga_engine = self.gpu_engine.engines[0] if isinstance(self.gpu_engine, MultiGPUEngine) else self.gpu_engine
+            evolver = GeneticRuleEvolver(_ga_engine, base_words, rule_pool, self.user_max_depth,
                                          pop_size=self.genetic_pop, elite_frac=self.genetic_elite,
                                          seed_hits=seed_hits, known_rules=known_set)
             ga_hits = evolver.evolve(hot_rules, self.genetic_generations, ga_budget)
@@ -2750,7 +3162,10 @@ def main():
     ap.add_argument('base_wordlist', nargs='?')
     ap.add_argument('target_wordlist', nargs='?')
     ap.add_argument('-o','--output', default='rulest_output.txt')
-    ap.add_argument('--device', default=None)
+    ap.add_argument('--device', default=None, metavar='SPEC',
+                    help='Device index, name substring, "all" to run every detected GPU in parallel, '
+                         'or a comma-separated list of indices (e.g. "0,1") to run only those GPUs in parallel '
+                         '(default: auto-select best single GPU)')
     ap.add_argument('--list-devices', action='store_true')
     ap.add_argument('--max-depth', type=int, default=2)
     ap.add_argument('--target-hours', type=float, default=0.5)
