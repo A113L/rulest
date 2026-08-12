@@ -2488,6 +2488,9 @@ class ProcessEngineProxy:
         self._bloom_ready = False
         self._compiled = False
         self._rules_ready = False
+        self._last_heartbeat = None
+        self._hb_drain_stop = None
+        self._hb_drain_thread = None
 
     # -- lifecycle --------------------------------------------------------
     def initialize_gpu(self, device_spec=None):
@@ -2514,10 +2517,41 @@ class ProcessEngineProxy:
             self._kill()
             return False
         self.device = _RemoteDeviceHandle(payload)
+        self._last_heartbeat = time.time()
+        self._start_heartbeat_drain()
         return True
+
+    def _start_heartbeat_drain(self):
+        """Continuously drain hb_q in the background, independent of whether
+        an RPC call is currently in flight. Without this, an engine that
+        sits idle for a long stretch (e.g. every non-primary GPU during
+        STAGE 3's genetic algorithm, which can legitimately run for hours
+        and only ever talks to engines[0]) still gets a heartbeat ping every
+        _WORKER_HEARTBEAT_SECS from its worker. Nobody was reading those
+        pings between calls, so they piled up in the pipe's OS buffer; once
+        that buffer filled, the child's ticker thread blocked on hb_q.put()
+        forever, and that half-stuck queue could then hang the parent at
+        shutdown (multiprocessing.Queue.join_thread() blocks until a
+        queue's buffered data is flushed). Keeping the queue drained at all
+        times avoids both problems."""
+        stop_evt = threading.Event()
+        def _drain():
+            while not stop_evt.is_set():
+                try:
+                    self._hb_q.get(timeout=1.0)
+                    self._last_heartbeat = time.time()
+                except Exception:
+                    pass
+        t = threading.Thread(target=_drain, daemon=True, name=f'hb-drain-{self.device_spec}')
+        self._hb_drain_stop = stop_evt
+        self._hb_drain_thread = t
+        t.start()
 
     def _kill(self):
         self.disabled = True
+        if self._hb_drain_stop is not None:
+            self._hb_drain_stop.set()
+            self._hb_drain_stop = None
         proc, self._proc = self._proc, None
         if proc is not None:
             try:
@@ -2529,6 +2563,17 @@ class ProcessEngineProxy:
                     proc.join(timeout=5)
             except Exception:
                 pass
+        # Never let a leftover queue block interpreter/process shutdown —
+        # cancel_join_thread() tells the Queue's internal feeder thread not
+        # to wait for a full flush, which is the standard fix for
+        # multiprocessing hanging on exit when a queue still has buffered
+        # (or partially written) data nobody is going to read anymore.
+        for q in (self._cmd_q, self._res_q, self._hb_q):
+            if q is None: continue
+            try: q.close()
+            except Exception: pass
+            try: q.cancel_join_thread()
+            except Exception: pass
 
     def terminate(self):
         if self.disabled or self._proc is None:
@@ -2547,16 +2592,12 @@ class ProcessEngineProxy:
         with self._lock:
             self._call_id += 1
             call_id = self._call_id
-            while True:  # drop stale heartbeats from before this call
-                try: self._hb_q.get_nowait()
-                except Exception: break
             try:
                 self._cmd_q.put((call_id, method, args, kwargs))
             except Exception as e:
                 log_warn(f"[GPU]  Failed to send '{method}' to worker: {e}")
                 self._kill()
                 return None
-            last_beat = time.time()
             while True:
                 try:
                     tag, status, payload = self._res_q.get(timeout=1.0)
@@ -2572,12 +2613,7 @@ class ProcessEngineProxy:
                     log_warn(f"[GPU]  Worker process died during '{method}' — dropping device")
                     self._kill()
                     return None
-                while True:
-                    try:
-                        self._hb_q.get_nowait()
-                        last_beat = time.time()
-                    except Exception:
-                        break
+                last_beat = self._last_heartbeat or 0
                 if time.time() - last_beat > _WORKER_HANG_TIMEOUT:
                     log_warn(f"[GPU]  Worker unresponsive for {_WORKER_HANG_TIMEOUT}s during "
                              f"'{method}' — killing device (driver hang)")
