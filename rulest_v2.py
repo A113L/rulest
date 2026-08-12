@@ -2346,11 +2346,337 @@ class GPUEngine:
                 try: b.release()
                 except Exception: pass
 
+    def ensure_rules_ready(self, phase1_rules):
+        """Populate gpu_rules/rule_index on demand. Split out of the various
+        call sites so it can also be invoked remotely as a single RPC by
+        ProcessEngineProxy (a remote caller can't just poke .gpu_rules /
+        .rule_index attributes and expect them to affect the real engine
+        living in another process)."""
+        if not self.rule_index:
+            self.gpu_rules = HashcatRuleValidator.validate_rules_for_gpu(phase1_rules)
+            self.rule_index = {r: i for i, r in enumerate(self.gpu_rules)}
+        return True
+
 # ----------------------------------------------------------------------
-# Multi-GPU engine — distributes word/chain batches across N GPUEngine
-# instances. Only used when the user explicitly requests --device all
-# and more than one GPU is present; a single detected GPU always falls
-# back to a plain GPUEngine so single-GPU performance is untouched.
+# Process-isolated GPU worker
+# ----------------------------------------------------------------------
+# A Python *thread* stuck inside a blocking C driver call (a hung
+# clBuildProgram/clFinish — the Intel NEO / iGPU driver is the most
+# frequent offender, and it gets much worse once a second vendor's
+# driver (e.g. NVIDIA) is active in the same process, per the mixed-lock
+# behaviour noted in MultiGPUEngine.compile_kernel below) cannot be
+# forcibly killed by Python. A *process* can be (SIGTERM/SIGKILL), which
+# is why every GPU in multi-GPU mode now gets its own OS process: if one
+# device's driver wedges, the parent detects the silence and hard-kills
+# just that process, and the run continues on whatever GPU(s) remain
+# instead of hanging forever. Single-GPU runs are untouched — they keep
+# using GPUEngine directly in-process, exactly as before.
+# ----------------------------------------------------------------------
+
+_WORKER_HEARTBEAT_SECS  = 3     # how often the child pings "still alive"
+_WORKER_HANG_TIMEOUT    = 480   # no heartbeat for this long -> declare the
+                                 # device hung and kill its process (covers
+                                 # the existing 180s+120s compile-retry path
+                                 # with headroom)
+_WORKER_STARTUP_TIMEOUT = 120   # time allowed for initialize_gpu() to reply
+
+# Methods whose return value is either not picklable (a live pyopencl
+# Program) or needs server-side resolution before it can cross the
+# process boundary (the "already uploaded to this GPU's VRAM" sentinel).
+# Handled specially in the worker loop instead of via plain getattr-forward.
+_WORKER_SPECIAL_METHODS = {'compile_kernel', 'generate_bloom_filter_gpu'}
+
+
+def _gpu_worker_entry(device_spec, params, cmd_q, res_q, hb_q):
+    """Runs inside the child process. Owns exactly one real GPUEngine and
+    executes RPC-style commands sent by the parent over cmd_q/res_q, while
+    a background thread pings hb_q so the parent can tell 'still working'
+    apart from 'driver wedged'."""
+    try:
+        os.environ['PYOPENCL_COMPILER_OUTPUT'] = '0'
+        eng = GPUEngine(params)
+        ok = False
+        try:
+            ok = eng.initialize_gpu(device_spec)
+        except Exception as e:
+            res_q.put(('__init__', 'err', f"init crashed: {e}"))
+            return
+        dev_name = eng.device.name.strip() if (ok and eng.device) else None
+        res_q.put(('__init__', 'ok' if ok else 'err', dev_name))
+        if not ok:
+            return
+
+        stop_evt = threading.Event()
+        def _ticker():
+            while not stop_evt.is_set():
+                try: hb_q.put(time.time())
+                except Exception: pass
+                stop_evt.wait(_WORKER_HEARTBEAT_SECS)
+        threading.Thread(target=_ticker, daemon=True, name='hb-ticker').start()
+
+        while True:
+            try:
+                call_id, method, args, kwargs = cmd_q.get()
+            except Exception:
+                break
+            if method == '__shutdown__':
+                break
+            if method == '__set_params__':
+                eng.params = args[0]
+                try: res_q.put((call_id, 'ok', None))
+                except Exception: pass
+                continue
+            try:
+                if method == 'compile_kernel':
+                    prog = eng.compile_kernel(*args, **kwargs)
+                    result = prog is not None
+                elif method == 'generate_bloom_filter_gpu':
+                    bf = eng.generate_bloom_filter_gpu(*args, **kwargs)
+                    if bf is _BLOOM_ALREADY_ON_GPU:
+                        buf = eng.bloom_buf
+                        bf_np = np.empty(buf.size // 4, dtype=np.int32)
+                        cl.enqueue_copy(eng.queue, bf_np, buf)
+                        eng.queue.finish()
+                        bf = bf_np
+                    result = bf
+                else:
+                    fn = getattr(eng, method)
+                    result = fn(*args, **kwargs)
+                res_q.put((call_id, 'ok', result))
+            except Exception as e:
+                try:
+                    res_q.put((call_id, 'err', f"{type(e).__name__}: {e}"))
+                except Exception:
+                    pass
+        stop_evt.set()
+    except Exception as e:
+        try:
+            res_q.put(('__init__', 'err', f"worker crashed before init: {e}"))
+        except Exception:
+            pass
+
+
+class _RemoteDeviceHandle:
+    """Stand-in for a pyopencl Device across the process boundary — callers
+    only ever read .name off the primary engine's .device for logging."""
+    def __init__(self, name):
+        self.name = name or "remote device"
+
+
+class ProcessEngineProxy:
+    """Drop-in stand-in for a GPUEngine that actually lives in its own OS
+    process, used by MultiGPUEngine/GeneticRuleEvolver in place of a real
+    GPUEngine whenever more than one GPU is active. Mirrors the subset of
+    the GPUEngine surface those callers use (.device, .disabled,
+    .bloom_buf/.program/.rule_index as truthy readiness flags, .queue, and
+    method calls). Any call that goes silent (no heartbeat) for longer
+    than _WORKER_HANG_TIMEOUT gets its process hard-killed and the device
+    marked disabled — a legitimately long GPU sweep keeps pinging the
+    whole time, so this only trips on an actual wedged driver."""
+
+    def __init__(self, params, device_spec):
+        self._params = params
+        self.device_spec = device_spec
+        self.disabled = False
+        self.device = None
+        self._proc = None
+        self._cmd_q = None
+        self._res_q = None
+        self._hb_q = None
+        self._call_id = 0
+        self._lock = threading.Lock()
+        self._bloom_ready = False
+        self._compiled = False
+        self._rules_ready = False
+
+    # -- lifecycle --------------------------------------------------------
+    def initialize_gpu(self, device_spec=None):
+        if device_spec is not None:
+            self.device_spec = device_spec
+        ctx = mp.get_context('spawn')
+        self._cmd_q = ctx.Queue()
+        self._res_q = ctx.Queue()
+        self._hb_q = ctx.Queue()
+        self._proc = ctx.Process(target=_gpu_worker_entry,
+                                  args=(self.device_spec, self._params,
+                                        self._cmd_q, self._res_q, self._hb_q),
+                                  daemon=True, name=f'gpu-worker-{self.device_spec}')
+        self._proc.start()
+        try:
+            tag, status, payload = self._res_q.get(timeout=_WORKER_STARTUP_TIMEOUT)
+        except Exception:
+            log_warn(f"[GPU]  Worker for device {self.device_spec} did not respond to init in "
+                     f"{_WORKER_STARTUP_TIMEOUT}s — killing")
+            self._kill()
+            return False
+        if status != 'ok':
+            log_warn(f"[GPU]  Worker for device {self.device_spec} failed to init: {payload}")
+            self._kill()
+            return False
+        self.device = _RemoteDeviceHandle(payload)
+        return True
+
+    def _kill(self):
+        self.disabled = True
+        proc, self._proc = self._proc, None
+        if proc is not None:
+            try:
+                if proc.is_alive():
+                    proc.terminate()
+                    proc.join(timeout=5)
+                if proc.is_alive():
+                    proc.kill()
+                    proc.join(timeout=5)
+            except Exception:
+                pass
+
+    def terminate(self):
+        if self.disabled or self._proc is None:
+            self._kill()
+            return
+        try:
+            self._cmd_q.put((None, '__shutdown__', (), {}))
+        except Exception:
+            pass
+        self._kill()
+
+    # -- generic RPC --------------------------------------------------------
+    def _call(self, method, *args, **kwargs):
+        if self.disabled or self._proc is None:
+            return None
+        with self._lock:
+            self._call_id += 1
+            call_id = self._call_id
+            while True:  # drop stale heartbeats from before this call
+                try: self._hb_q.get_nowait()
+                except Exception: break
+            try:
+                self._cmd_q.put((call_id, method, args, kwargs))
+            except Exception as e:
+                log_warn(f"[GPU]  Failed to send '{method}' to worker: {e}")
+                self._kill()
+                return None
+            last_beat = time.time()
+            while True:
+                try:
+                    tag, status, payload = self._res_q.get(timeout=1.0)
+                    if tag != call_id:
+                        continue  # stale reply from an earlier, since-abandoned call
+                    if status == 'ok':
+                        return payload
+                    log_warn(f"[GPU]  Worker error in '{method}': {payload}")
+                    return None
+                except Exception:
+                    pass
+                if self._proc is None or not self._proc.is_alive():
+                    log_warn(f"[GPU]  Worker process died during '{method}' — dropping device")
+                    self._kill()
+                    return None
+                while True:
+                    try:
+                        self._hb_q.get_nowait()
+                        last_beat = time.time()
+                    except Exception:
+                        break
+                if time.time() - last_beat > _WORKER_HANG_TIMEOUT:
+                    log_warn(f"[GPU]  Worker unresponsive for {_WORKER_HANG_TIMEOUT}s during "
+                             f"'{method}' — killing device (driver hang)")
+                    self._kill()
+                    return None
+
+    # -- GPUEngine-compatible surface --------------------------------------
+    @property
+    def params(self): return self._params
+
+    @params.setter
+    def params(self, value):
+        self._params = value
+        if not self.disabled and self._proc is not None:
+            self._call('__set_params__', value)
+
+    @property
+    def bloom_buf(self):
+        return True if self._bloom_ready else None
+
+    @property
+    def program(self):
+        return True if self._compiled else None
+
+    @property
+    def rule_index(self):
+        return {'ready': True} if self._rules_ready else {}
+
+    @property
+    def queue(self):
+        return True if (not self.disabled and self._proc is not None) else None
+
+    def compile_kernel(self, force=False):
+        ok = bool(self._call('compile_kernel', force=force))
+        self._compiled = ok
+        return ok
+
+    def upload_bloom_filter(self, bf):
+        r = self._call('upload_bloom_filter', bf)
+        self._bloom_ready = not self.disabled
+        return r
+
+    def generate_bloom_filter_gpu(self, target_words):
+        bf = self._call('generate_bloom_filter_gpu', target_words)
+        if bf is not None:
+            self._bloom_ready = True
+        return bf
+
+    def ensure_rules_ready(self, phase1_rules):
+        r = self._call('ensure_rules_ready', phase1_rules)
+        self._rules_ready = bool(r)
+        return r
+
+    def build_numeric_seed_families(self, max_depth):
+        return self._call('build_numeric_seed_families', max_depth=max_depth) or {}
+
+    def process_all_words_single_rule(self, base_words, rules, bloom_filter, _silent=False,
+                                       _shared_combos=None, _shared_lock=None):
+        # _shared_combos/_shared_lock are in-process threading primitives from
+        # MultiGPUEngine._parallel_run and can't cross a process boundary —
+        # each worker just reports its own progress bar instead.
+        return self._call('process_all_words_single_rule', base_words, rules, bloom_filter,
+                           _silent=_silent) or Counter()
+
+    def run_seed_extraction_pass(self, base_words, sbd, bloom_filter, phase1_rules, _silent=False):
+        return self._call('run_seed_extraction_pass', base_words, sbd, bloom_filter,
+                           phase1_rules, _silent=_silent) or Counter()
+
+    def process_all_words_chain_rules(self, base_words, rules, max_depth, bloom_filter,
+                                       single_counter, seed_chains=None, prebuilt_sbd=None, _silent=False):
+        r = self._call('process_all_words_chain_rules', base_words, rules, max_depth, bloom_filter,
+                        single_counter, seed_chains=seed_chains, prebuilt_sbd=prebuilt_sbd, _silent=_silent)
+        if r is not None: self._compiled = True; self._bloom_ready = True; self._rules_ready = True
+        return r or Counter()
+
+    def generate_informed_chains(self, rules, single_found, max_depth, seed_chains=None, prebuilt_sbd=None):
+        return self._call('generate_informed_chains', rules, single_found, max_depth,
+                           seed_chains, prebuilt_sbd) or []
+
+    def _run_chains_against_words(self, base_words, chains, desc="  CHAINS  ", _silent=False,
+                                   _shared_combos=None, _shared_lock=None):
+        return self._call('_run_chains_against_words', base_words, chains, desc, _silent) or Counter()
+
+    def _compute_chain_seqs(self, chains):
+        return self._call('_compute_chain_seqs', chains) or ([], [])
+
+    def _run_chain_kernel(self, words, chains, _precomputed=None, return_word_idx=False):
+        return self._call('_run_chain_kernel', words, chains, _precomputed, return_word_idx) or []
+
+    def _safe_queue_finish(self):
+        return bool(self._call('_safe_queue_finish'))
+
+
+# ----------------------------------------------------------------------
+# Multi-GPU engine — distributes word/chain batches across N process-
+# isolated GPU workers. Only used when the user explicitly requests
+# --device all (or an explicit "0,1" list) and more than one GPU is
+# present; a single detected GPU always falls back to a plain in-process
+# GPUEngine so single-GPU performance/behaviour is untouched.
 # ----------------------------------------------------------------------
 class MultiGPUEngine:
     """Wraps N GPUEngine instances and splits work across them.
@@ -2380,8 +2706,10 @@ class MultiGPUEngine:
         return self.engines[0].device if self.engines else None
 
     def initialize_gpu(self, device_specs):
+        # Each GPU gets its own OS process (see ProcessEngineProxy above) so a
+        # single wedged driver can be hard-killed instead of hanging the run.
         for spec in device_specs:
-            eng = GPUEngine(self._params)
+            eng = ProcessEngineProxy(self._params, spec)
             if eng.initialize_gpu(spec):
                 self.engines.append(eng)
             else:
@@ -2391,7 +2719,8 @@ class MultiGPUEngine:
         if len(self.engines) == 1:
             log_info("[GPU]  Only one GPU initialised — falling back to single-GPU mode")
         else:
-            log_info(f"[GPU]  {bold(str(len(self.engines)))} GPUs active for parallel processing")
+            log_info(f"[GPU]  {bold(str(len(self.engines)))} GPUs active for parallel processing "
+                      f"(process-isolated — a hung driver on one GPU is killed without affecting the others)")
         return True
 
     def _prune_disabled(self):
@@ -2436,18 +2765,15 @@ class MultiGPUEngine:
 
     def generate_bloom_filter_gpu(self, target_words):
         primary = self.engines[0]
+        # ProcessEngineProxy.generate_bloom_filter_gpu already resolves the
+        # "already on this GPU's VRAM" sentinel server-side (inside the
+        # worker process, where the real cl.Buffer/queue actually live) and
+        # always hands back a plain numpy array here — never a live GPU
+        # handle, since that can't cross a process boundary.
         bf = primary.generate_bloom_filter_gpu(target_words)
-        if len(self.engines) > 1:
-            if bf is _BLOOM_ALREADY_ON_GPU:
-                # Download from primary VRAM to share with other GPUs
-                buf = primary.bloom_buf
-                bf_np = np.empty(buf.size // 4, dtype=np.int32)
-                cl.enqueue_copy(primary.queue, bf_np, buf)
-                primary.queue.finish()
-            else:
-                bf_np = bf  # CPU fallback already returned a numpy array
+        if len(self.engines) > 1 and bf is not None:
             for eng in self.engines[1:]:
-                eng.upload_bloom_filter(bf_np)
+                eng.upload_bloom_filter(bf)
         return bf
 
     def upload_bloom_filter(self, bf):
@@ -2456,6 +2782,13 @@ class MultiGPUEngine:
 
     def build_numeric_seed_families(self, max_depth):
         return self.engines[0].build_numeric_seed_families(max_depth)
+
+    def shutdown(self):
+        """Cleanly terminate every worker process. Safe to call multiple
+        times / on partially-initialised state."""
+        for eng in self.engines:
+            try: eng.terminate()
+            except Exception: pass
 
     def _split_words(self, words):
         n = len(self.engines)
@@ -2499,9 +2832,7 @@ class MultiGPUEngine:
     def _ensure_engine_ready(self, eng, bloom_filter, phase1_rules):
         if eng.bloom_buf is None: eng.upload_bloom_filter(bloom_filter)
         if not eng.program: eng.compile_kernel()
-        if not eng.rule_index:
-            eng.gpu_rules = HashcatRuleValidator.validate_rules_for_gpu(phase1_rules)
-            eng.rule_index = {r: i for i, r in enumerate(eng.gpu_rules)}
+        if not eng.rule_index: eng.ensure_rules_ready(phase1_rules)
 
     def run_seed_extraction_pass(self, base_words, sbd, bloom_filter, phase1_rules):
         if len(self.engines) == 1:
@@ -2553,8 +2884,7 @@ class MultiGPUEngine:
         # Generate chains once on the primary engine, then split across GPUs
         primary = self.engines[0]
         if primary.bloom_buf is None: primary.upload_bloom_filter(bloom_filter)
-        if not primary.rule_index:
-            primary.rule_index = {r: i for i, r in enumerate(primary.gpu_rules)}
+        if not primary.rule_index: primary.ensure_rules_ready(rules)
         chains = primary.generate_informed_chains(rules, single_counter, max_depth, seed_chains, prebuilt_sbd)
         if not chains: return Counter()
         if len(self.engines) > 1:
@@ -3097,6 +3427,18 @@ class GPUExtractor:
             for d, bgt in depth_budgets.items():
                 self.params[f'CHAIN_GEN_LIMIT_{d}'] = bgt
             log_info(f"[S2]    depth 2-{self.user_max_depth} | " + " | ".join(f"d{d}:{v:,}" for d,v in depth_budgets.items()))
+            # IMPORTANT: with a single in-process GPUEngine, self.params and
+            # gpu_engine.params were always the *same* dict object, so mutating
+            # self.params in place (just above) was automatically visible to the
+            # engine — no re-push needed. With process-isolated workers
+            # (MultiGPUEngine/ProcessEngineProxy) that's no longer true: each
+            # "params =" assignment ships a *copy* of the dict into the worker
+            # process over IPC, so any mutation made afterwards (like the
+            # CHAIN_GEN_LIMIT_* budgets we just computed) never reaches the
+            # workers unless we push it again here. Without this, every worker
+            # reads CHAIN_GEN_LIMIT_* as 0, generates ~no chains, and STAGE 2
+            # finishes suspiciously fast with an almost-empty result.
+            self.gpu_engine.params = self.params
             chains = self.gpu_engine.process_all_words_chain_rules(base_words, rules_phase1, self.user_max_depth,
                                                                    bloom_filter, single, seed_chains=seed_chains,
                                                                    prebuilt_sbd=sbd)
@@ -3257,7 +3599,11 @@ def main():
         token_strip_chunk_size=args.token_strip_chunk_size,
     )
     depth_overrides = {f'depth{i}_override': getattr(args, f'depth{i}_chains') for i in range(2,11)}
-    raw_counts = extractor.extract_rules(base_words, target_words, **depth_overrides)
+    try:
+        raw_counts = extractor.extract_rules(base_words, target_words, **depth_overrides)
+    finally:
+        if isinstance(extractor.gpu_engine, MultiGPUEngine):
+            extractor.gpu_engine.shutdown()
     _kb.stop()
     del target_words
     gc.collect()
