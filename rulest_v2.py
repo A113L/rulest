@@ -3104,16 +3104,32 @@ class GeneticRuleEvolver:
         if not valid: return hit_words
         wsb = self.gpu_engine.params.get('WORD_SUB_BATCH',20000)
         cbs = self.gpu_engine.params.get('CHAINS_PER_BATCH',2000)
+        # Cache the flattened base_words once (same trick Stage 2 uses via
+        # _run_chains_against_words -> set_base_words). Previously this loop
+        # sliced self.base_words (a raw Python list of strings) and handed it
+        # straight to _run_chain_kernel, which fell through to
+        # prepare_words_data()/_flatten() and re-encoded the *entire* word
+        # sub-batch from scratch on every single generation x chain-batch x
+        # word-batch call. That redundant CPU-side re-encoding — not the GPU
+        # kernel — was why Stage 3 ran at a small fraction of Stage 2's
+        # throughput. get_word_batch_data() just slices a pre-flattened numpy
+        # array instead, which is effectively free.
+        if getattr(self.gpu_engine, '_base_words_precomputed', None) is None or \
+           getattr(self, '_ga_base_words_cached_for', None) is not self.base_words:
+            self.gpu_engine.set_base_words(self.base_words)
+            self._ga_base_words_cached_for = self.base_words
+        n_words_total = len(self.base_words)
         for ci in range(0, len(valid), cbs):
             cb = valid[ci:ci+cbs]
             seqs, depths = self.gpu_engine._compute_chain_seqs(cb)
-            for wi in range(0, len(self.base_words), wsb):
-                wb = self.base_words[wi:wi+wsb]
-                if wb:
-                    found = self.gpu_engine._run_chain_kernel(wb, cb, (seqs, depths), return_word_idx=True)
-                    if found:
-                        for local_idx, rule_str in found:
-                            hit_words[rule_str].add(wi + local_idx)
+            for wi in range(0, n_words_total, wsb):
+                end = min(wi + wsb, n_words_total)
+                bd = self.gpu_engine.get_word_batch_data(wi, end)
+                if bd['num_words'] == 0: continue
+                found = self.gpu_engine._run_chain_kernel(bd, cb, (seqs, depths), return_word_idx=True)
+                if found:
+                    for local_idx, rule_str in found:
+                        hit_words[rule_str].add(wi + local_idx)
             self.gpu_engine._safe_queue_finish()
         return hit_words
 
