@@ -26,6 +26,7 @@ import gc
 import datetime
 import multiprocessing as mp
 import threading
+import queue
 
 # Windows' WaitForMultipleObjects (used internally by multiprocessing.Pool on
 # win32) can only wait on at most 63 handles at once. With many CPU cores
@@ -1917,7 +1918,8 @@ class GPUEngine:
                     num_words=end-start, num_rules=len(self.gpu_rules))
 
     def process_all_words_single_rule(self, base_words, rules, bloom_filter, _silent=False,
-                                       _shared_combos=None, _shared_lock=None):
+                                       _shared_combos=None, _shared_lock=None, _position=None,
+                                       _label=None):
         self.upload_bloom_filter(bloom_filter)
         if not self.compile_kernel(): return Counter()
         # Refresh GPU rules list
@@ -1927,9 +1929,10 @@ class GPUEngine:
         bs = self.params['WORDS_PER_BATCH']
         ncols = shutil.get_terminal_size((80,24)).columns
         t0 = time.time(); words_done = 0; nr = len(self.gpu_rules)
-        with tqdm(total=len(base_words), desc=green("  STAGE 1 "), unit="word", ncols=ncols,
+        desc = f"  STAGE 1 [{_label}] " if _label else "  STAGE 1 "
+        with tqdm(total=len(base_words), desc=green(desc), unit="word", ncols=ncols,
                   bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}",
-                  disable=_silent) as pbar:
+                  disable=_silent, position=_position, leave=True) as pbar:
             for i in range(0, len(base_words), bs):
                 if _kb.quit_requested: break
                 batch = base_words[i:i+bs]
@@ -2151,7 +2154,8 @@ class GPUEngine:
                         sbd[2].add(f"{t_op} {leet_op}")
         return dict(sbd)
 
-    def run_seed_extraction_pass(self, base_words, sbd, bloom_filter, phase1_rules, _silent=False):
+    def run_seed_extraction_pass(self, base_words, sbd, bloom_filter, phase1_rules, _silent=False,
+                                  _position=None, _label=None):
         if self.bloom_buf is None: self.upload_bloom_filter(bloom_filter)
         if not self.program:
             if not self.compile_kernel(): return Counter()
@@ -2170,7 +2174,8 @@ class GPUEngine:
         depth_range_str = (f"d{d_levels[0]}–d{d_levels[-1]}" if len(d_levels) > 1
                            else (f"d{d_levels[0]}" if d_levels else "none"))
         log_info(f"[SEED]    Numeric seed pass: {total:,} chains across {len(d_levels)} depth level(s) ({depth_range_str})")
-        counter = self._run_chains_against_words(base_words, multi, "  SEED PASS ", _silent)
+        counter = self._run_chains_against_words(base_words, multi, "  SEED PASS ", _silent,
+                                                   _position=_position, _label=_label)
         log_info(f"[SEED]    {bold(green(str(len(counter))))} unique seed chains passed bloom filter")
         return counter
 
@@ -2193,7 +2198,8 @@ class GPUEngine:
         return list(chains)
 
     def process_all_words_chain_rules(self, base_words, rules, max_depth, bloom_filter,
-                                      single_counter, seed_chains=None, prebuilt_sbd=None, _silent=False):
+                                      single_counter, seed_chains=None, prebuilt_sbd=None, _silent=False,
+                                      _position=None, _label=None):
         if self.bloom_buf is None: self.upload_bloom_filter(bloom_filter)
         if not self.program:
             if not self.compile_kernel(): return Counter()
@@ -2201,12 +2207,14 @@ class GPUEngine:
             self.rule_index = {r:i for i,r in enumerate(self.gpu_rules)}
         chains = self.generate_informed_chains(rules, single_counter, max_depth, seed_chains, prebuilt_sbd)
         if not chains: return Counter()
-        counter = self._run_chains_against_words(base_words, chains, "  STAGE 2 ", _silent)
+        counter = self._run_chains_against_words(base_words, chains, "  STAGE 2 ", _silent,
+                                                   _position=_position, _label=_label)
         log_info(f"[S2]    {bold(green(str(len(counter))))} unique chain rules passed bloom filter")
         return counter
 
     def _run_chains_against_words(self, base_words, chains, desc="  CHAINS  ", _silent=False,
-                                   _shared_combos=None, _shared_lock=None):
+                                   _shared_combos=None, _shared_lock=None, _position=None,
+                                   _label=None):
         """Shared inner loop: iterate chain batches x word sub-batches, collect matches.
         Uses the same pre-flattened word-batch fast path the original seed-extraction
         pass used (set_base_words/get_word_batch_data), avoiding repeated
@@ -2219,9 +2227,10 @@ class GPUEngine:
         t0 = time.time()
         total_combos = 0
         self.set_base_words(base_words)
-        with tqdm(total=n_batches, desc=green(desc), unit="batch", ncols=ncols,
+        bar_desc = f"{desc}[{_label}] " if _label else desc
+        with tqdm(total=n_batches, desc=green(bar_desc), unit="batch", ncols=ncols,
                   bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}",
-                  disable=_silent) as pbar:
+                  disable=_silent, position=_position, leave=True) as pbar:
             for ci in range(0, len(chains), cbs):
                 if _kb.quit_requested: break
                 cb = chains[ci:ci + cbs]
@@ -2253,6 +2262,37 @@ class GPUEngine:
                 pbar.set_postfix({"rules": cyan(str(len(counter))), "spd": green(spd)}, refresh=False)
                 pbar.update(1)
         return counter
+
+    def evaluate_chains_for_ga(self, chains):
+        """Stage 3 (genetic) companion to _run_chains_against_words above. Runs the
+        full chain-batch x word-sub-batch sweep for one engine's slice of chains
+        against whatever base_words were already cached via set_base_words(), and
+        returns {chain_str: set(global_word_index)} for that slice only.
+
+        This is exposed as a single high-level call (rather than the parent
+        driving get_word_batch_data/_run_chain_kernel/etc one RPC at a time) so
+        that in multi-GPU mode a non-primary engine's ProcessEngineProxy only
+        needs ONE round trip per generation instead of dozens — each of those
+        would otherwise pickle numpy word/result arrays across the process
+        boundary redundantly (worker -> parent -> worker) for no reason, since
+        the parent never needed to see the intermediate word batch at all."""
+        cbs = self.params.get('CHAINS_PER_BATCH', 2000)
+        wsb = self.params.get('WORD_SUB_BATCH', 20000)
+        n_words_total = len(self._base_words_precomputed[1]) if getattr(self, '_base_words_precomputed', None) else 0
+        hit_words = defaultdict(set)
+        for ci in range(0, len(chains), cbs):
+            cb = chains[ci:ci+cbs]
+            seqs, depths = self._compute_chain_seqs(cb)
+            for wi in range(0, n_words_total, wsb):
+                end = min(wi + wsb, n_words_total)
+                bd = self.get_word_batch_data(wi, end)
+                if bd['num_words'] == 0: continue
+                found = self._run_chain_kernel(bd, cb, (seqs, depths), return_word_idx=True)
+                if found:
+                    for local_idx, rule_str in found:
+                        hit_words[rule_str].add(wi + local_idx)
+            self._safe_queue_finish()
+        return dict(hit_words)
 
     def _compute_chain_seqs(self, chains):
         maxd = self.params['MAX_CHAIN_DEPTH']
@@ -2671,21 +2711,26 @@ class ProcessEngineProxy:
         return self._call('build_numeric_seed_families', max_depth=max_depth) or {}
 
     def process_all_words_single_rule(self, base_words, rules, bloom_filter, _silent=False,
-                                       _shared_combos=None, _shared_lock=None):
+                                       _shared_combos=None, _shared_lock=None, _position=None,
+                                       _label=None):
         # _shared_combos/_shared_lock are in-process threading primitives from
-        # MultiGPUEngine._parallel_run and can't cross a process boundary —
-        # each worker just reports its own progress bar instead.
+        # MultiGPUEngine._parallel_run and can't cross a process boundary — each
+        # worker renders its own tqdm bar (pinned to _position, tagged _label)
+        # instead, so every device gets a visible, independent line.
         return self._call('process_all_words_single_rule', base_words, rules, bloom_filter,
-                           _silent=_silent) or Counter()
+                           _silent=_silent, _position=_position, _label=_label) or Counter()
 
-    def run_seed_extraction_pass(self, base_words, sbd, bloom_filter, phase1_rules, _silent=False):
+    def run_seed_extraction_pass(self, base_words, sbd, bloom_filter, phase1_rules, _silent=False,
+                                  _position=None, _label=None):
         return self._call('run_seed_extraction_pass', base_words, sbd, bloom_filter,
-                           phase1_rules, _silent=_silent) or Counter()
+                           phase1_rules, _silent=_silent, _position=_position, _label=_label) or Counter()
 
     def process_all_words_chain_rules(self, base_words, rules, max_depth, bloom_filter,
-                                       single_counter, seed_chains=None, prebuilt_sbd=None, _silent=False):
+                                       single_counter, seed_chains=None, prebuilt_sbd=None, _silent=False,
+                                       _position=None, _label=None):
         r = self._call('process_all_words_chain_rules', base_words, rules, max_depth, bloom_filter,
-                        single_counter, seed_chains=seed_chains, prebuilt_sbd=prebuilt_sbd, _silent=_silent)
+                        single_counter, seed_chains=seed_chains, prebuilt_sbd=prebuilt_sbd, _silent=_silent,
+                        _position=_position, _label=_label)
         if r is not None: self._compiled = True; self._bloom_ready = True; self._rules_ready = True
         return r or Counter()
 
@@ -2694,8 +2739,20 @@ class ProcessEngineProxy:
                            seed_chains, prebuilt_sbd) or []
 
     def _run_chains_against_words(self, base_words, chains, desc="  CHAINS  ", _silent=False,
-                                   _shared_combos=None, _shared_lock=None):
-        return self._call('_run_chains_against_words', base_words, chains, desc, _silent) or Counter()
+                                   _shared_combos=None, _shared_lock=None, _position=None, _label=None):
+        return self._call('_run_chains_against_words', base_words, chains, desc, _silent,
+                           _position=_position, _label=_label) or Counter()
+
+    def set_base_words(self, words):
+        # Stage 3 (genetic) calls this once per engine up front, then reuses the
+        # cached flattened copy in the worker process across every generation via
+        # evaluate_chains_for_ga() below — avoids re-encoding the wordlist (and
+        # re-sending it across the process boundary) every generation.
+        return self._call('set_base_words', words)
+
+    def evaluate_chains_for_ga(self, chains):
+        r = self._call('evaluate_chains_for_ga', chains)
+        return r if r is not None else {}
 
     def _compute_chain_seqs(self, chains):
         return self._call('_compute_chain_seqs', chains) or ([], [])
@@ -2719,13 +2776,96 @@ class MultiGPUEngine:
 
     Stage 1 splits base_words across GPUs (word-dominated).
     Stage S and Stage 2 split chains across GPUs (chain-dominated) — each GPU
-    tests its chain slice against all base_words.  Stage 3 (genetic) always
-    runs on the primary engine only — pass .engines[0] to GeneticRuleEvolver.
+    tests its chain slice against all base_words. Stage 3 (genetic) also splits
+    chains (its per-generation population) across GPUs the same way — see
+    GeneticRuleEvolver.evaluate_population, which accepts a MultiGPUEngine
+    directly rather than being handed a single engine.
     """
 
     def __init__(self, params):
         self._params = params
         self.engines: List['GPUEngine'] = []
+        # Adaptive load balancing: measured throughput per (engine, work-kind),
+        # smoothed with an EMA. Splits then default to equal shares until we
+        # have at least one real measurement, then shift toward proportional-
+        # to-speed shares. Kept on the MultiGPUEngine (not per-stage) so a slow
+        # card (e.g. an Intel iGPU alongside a discrete GPU) gets calibrated
+        # once and every later stage — including Stage 3's GA, which reuses
+        # this same instance — starts from a sane split instead of 50/50.
+        self._speed_ema = {}      # (id(eng), kind) -> items/sec
+        self._speed_alpha = 0.5   # EMA weight for the newest sample
+        self._warned_slow = set() # kinds we've already logged a slow-card warning for
+
+    def record_speed(self, eng, kind, n_items, elapsed):
+        if n_items <= 0 or elapsed <= 0.01:
+            return
+        rate = n_items / elapsed
+        key = (id(eng), kind)
+        prev = self._speed_ema.get(key)
+        self._speed_ema[key] = rate if prev is None else (self._speed_alpha*rate + (1-self._speed_alpha)*prev)
+
+    def weighted_split(self, items, kind, min_frac=0.03, engines=None):
+        """Split `items` across `engines` (default: self.engines) proportionally
+        to each engine's measured throughput for this work `kind` (words/chains/
+        ga), instead of always slicing evenly. Falls back to an equal split for
+        any engine we have no measurement for yet, so the very first batch of a
+        run is always plain 50/50 (there's nothing to weight by until something
+        has actually been timed) and subsequent batches self-correct. Every
+        engine is guaranteed at least `min_frac` of the items (default 3%) so
+        a slow card still gets *some* work each round and its speed estimate
+        keeps getting refreshed, rather than starving to zero and never being
+        re-measured (e.g. if it happened to be busy compiling on round one).
+
+        Always pass the exact engine list the caller is about to zip() the
+        returned slices against (e.g. after filtering out disabled engines) —
+        this must default to self.engines rather than assuming it, since a
+        stale/mismatched engine list here would misalign slices to engines."""
+        engines = self.engines if engines is None else engines
+        n = len(engines)
+        if n <= 1 or not items:
+            return [items]
+        speeds = [self._speed_ema.get((id(eng), kind)) for eng in engines]
+        if all(s is None for s in speeds):
+            chunk = max(1, (len(items) + n - 1) // n)
+            return [items[i*chunk:(i+1)*chunk] for i in range(n)]
+        # Engines with no measurement yet: assume the median known speed so
+        # they get a fair-ish initial slice rather than being starved to the
+        # floor before we've ever timed them.
+        known = [s for s in speeds if s is not None]
+        fallback = sorted(known)[len(known)//2]
+        speeds = [s if s is not None else fallback for s in speeds]
+        total = sum(speeds) or 1.0
+        weights = [max(min_frac, s/total) for s in speeds]
+        wsum = sum(weights)
+        weights = [w/wsum for w in weights]
+        # Warn once per work-kind if one engine is dramatically slower — the
+        # user asked specifically about this (Intel iGPU next to a discrete
+        # GPU): worth flagging since even a perfectly weighted split still
+        # pays some coordination overhead for a card contributing almost
+        # nothing.
+        if kind not in self._warned_slow and len(known) == n:
+            fastest = max(speeds); slowest = min(speeds)
+            if fastest > 0 and slowest/fastest < 0.15:
+                slow_idx = speeds.index(slowest)
+                dev = getattr(engines[slow_idx], 'device', None)
+                dev_name = getattr(dev, 'name', 'device').strip() if dev else f"GPU {slow_idx}"
+                log_warn(f"[GPU]  {dev_name} is measured at <15% the speed of your fastest GPU for "
+                         f"'{kind}' work — consider excluding it via --device to avoid it dragging "
+                         f"down the combined throughput.")
+                self._warned_slow.add(kind)
+        sizes = [max(1, int(round(w*len(items)))) for w in weights]
+        # Rounding can over/under-allocate by a few items — fix up the last
+        # slice so slices always sum to exactly len(items).
+        diff = len(items) - sum(sizes)
+        sizes[-1] += diff
+        sizes[-1] = max(1, sizes[-1]) if sizes[-1] > 0 else sizes[-1]
+        slices = []
+        idx = 0
+        for sz in sizes:
+            sz = max(0, sz)
+            slices.append(items[idx:idx+sz])
+            idx += sz
+        return slices
 
     @property
     def params(self):
@@ -2826,17 +2966,21 @@ class MultiGPUEngine:
             try: eng.terminate()
             except Exception: pass
 
-    def _split_words(self, words):
+    def _parallel_run(self, fn_per_engine, slices, kind=None):
+        """Runs fn_per_engine(eng, slice) for every non-empty (engine, slice) pair
+        concurrently. When `kind` is given, times each engine's call and feeds
+        the result into record_speed() so the *next* weighted_split() call for
+        that work kind can account for it — this is how the split self-corrects
+        from an initial 50/50 toward each card's actual measured throughput."""
         n = len(self.engines)
-        if n <= 1:
-            return [words]
-        chunk = max(1, (len(words) + n - 1) // n)
-        return [words[i * chunk:(i + 1) * chunk] for i in range(n)]
-
-    def _parallel_run(self, fn_per_engine, slices):
-        n = len(self.engines)
+        def _run(eng, sl):
+            t0 = time.time()
+            r = fn_per_engine(eng, sl)
+            if kind is not None:
+                self.record_speed(eng, kind, len(sl), time.time()-t0)
+            return r
         with concurrent.futures.ThreadPoolExecutor(max_workers=n) as pool:
-            futs = [pool.submit(fn_per_engine, eng, sl)
+            futs = [pool.submit(_run, eng, sl)
                     for eng, sl in zip(self.engines, slices) if sl]
             merged = Counter()
             for f in futs:
@@ -2846,24 +2990,26 @@ class MultiGPUEngine:
                     log_warn(f"[GPU]  Worker thread error: {exc}")
         return merged
 
+    def _engine_label(self, idx, eng):
+        dev = getattr(eng, 'device', None)
+        name = getattr(dev, 'name', None)
+        name = name.strip() if name else None
+        return f"GPU{idx}:{name}" if name else f"GPU{idx}"
+
     def process_all_words_single_rule(self, base_words, rules, bloom_filter):
         if len(self.engines) == 1:
             return self.engines[0].process_all_words_single_rule(base_words, rules, bloom_filter)
-        slices = self._split_words(base_words)
-        log_info(f"[GPU]  STAGE 1 split across {len(self.engines)} GPUs (~{len(slices[0]):,} words each; progress shows GPU 0 only)")
+        slices = self.weighted_split(base_words, kind='words')
+        sizes_str = "/".join(f"{len(s):,}" for s in slices)
+        log_info(f"[GPU]  STAGE 1 split across {len(self.engines)} GPUs ({sizes_str} words; "
+                 f"one progress bar per device)")
         shared_combos = [0]; shared_lock = threading.Lock()
         return self._parallel_run(
             lambda eng, sl: eng.process_all_words_single_rule(
-                sl, rules, bloom_filter, _silent=(eng is not self.engines[0]),
-                _shared_combos=shared_combos, _shared_lock=shared_lock),
-            slices)
-
-    def _split_chains(self, chains):
-        n = len(self.engines)
-        if n <= 1:
-            return [chains]
-        chunk = max(1, (len(chains) + n - 1) // n)
-        return [chains[i * chunk:(i + 1) * chunk] for i in range(n)]
+                sl, rules, bloom_filter, _silent=False,
+                _shared_combos=shared_combos, _shared_lock=shared_lock,
+                _position=self.engines.index(eng), _label=self._engine_label(self.engines.index(eng), eng)),
+            slices, kind='words')
 
     def _ensure_engine_ready(self, eng, bloom_filter, phase1_rules):
         if eng.bloom_buf is None: eng.upload_bloom_filter(bloom_filter)
@@ -2901,14 +3047,17 @@ class MultiGPUEngine:
             result = self.engines[0]._run_chains_against_words(base_words, multi, "  SEED PASS ")
             log_info(f"[SEED]    {bold(green(str(len(result))))} unique seed chains passed bloom filter")
             return result
-        chain_slices = self._split_chains(multi)
-        log_info(f"[GPU]  SEED split across {len(self.engines)} GPUs (~{len(chain_slices[0]):,} chains each)")
+        chain_slices = self.weighted_split(multi, kind='chains')
+        sizes_str = "/".join(f"{len(s):,}" for s in chain_slices)
+        log_info(f"[GPU]  SEED split across {len(self.engines)} GPUs ({sizes_str} chains; "
+                 f"one progress bar per device)")
         shared_combos = [0]; shared_lock = threading.Lock()
         merged = self._parallel_run(
             lambda eng, sl: eng._run_chains_against_words(
-                base_words, sl, "  SEED PASS ", eng is not self.engines[0],
-                shared_combos, shared_lock),
-            chain_slices)
+                base_words, sl, "  SEED PASS ", False,
+                shared_combos, shared_lock,
+                _position=self.engines.index(eng), _label=self._engine_label(self.engines.index(eng), eng)),
+            chain_slices, kind='chains')
         log_info(f"[SEED]    {bold(green(str(len(merged))))} unique seed chains passed bloom filter")
         return merged
 
@@ -2935,14 +3084,17 @@ class MultiGPUEngine:
             result = primary._run_chains_against_words(base_words, chains, "  STAGE 2 ")
             log_info(f"[S2]    {bold(green(str(len(result))))} unique chain rules passed bloom filter")
             return result
-        chain_slices = self._split_chains(chains)
-        log_info(f"[GPU]  STAGE 2 split across {len(self.engines)} GPUs (~{len(chain_slices[0]):,} chains each)")
+        chain_slices = self.weighted_split(chains, kind='chains')
+        sizes_str = "/".join(f"{len(s):,}" for s in chain_slices)
+        log_info(f"[GPU]  STAGE 2 split across {len(self.engines)} GPUs ({sizes_str} chains; "
+                 f"one progress bar per device)")
         shared_combos = [0]; shared_lock = threading.Lock()
         merged = self._parallel_run(
             lambda eng, sl: eng._run_chains_against_words(
-                base_words, sl, "  STAGE 2 ", eng is not self.engines[0],
-                shared_combos, shared_lock),
-            chain_slices)
+                base_words, sl, "  STAGE 2 ", False,
+                shared_combos, shared_lock,
+                _position=self.engines.index(eng), _label=self._engine_label(self.engines.index(eng), eng)),
+            chain_slices, kind='chains')
         log_info(f"[S2]    {bold(green(str(len(merged))))} unique chain rules passed bloom filter")
         return merged
 
@@ -2972,6 +3124,13 @@ class GeneticRuleEvolver:
         self._sig_cache = {}
         self._sig_cache_max = 50000
         self._sig_to_best = {}
+        # -- Feature: CPU/GPU pipelining (see _start_prefetch) --
+        self._prefetch_q = None
+        self._prefetch_stop = None
+        self._prefetch_thread = None
+        # -- Feature: word subsampling (see _pick_generation_words) --
+        self.active_words = base_words
+        self._ga_cached_engines = {}
 
     def _get_sig(self, chain_str):
         if chain_str not in self._sig_cache:
@@ -3059,6 +3218,63 @@ class GeneticRuleEvolver:
         if depth<=0: depth = random.randint(2, self.max_depth)
         return [random.choice(self.rule_pool) for _ in range(depth)]
 
+    def _random_depth_biased(self):
+        return random.randint(3,self.max_depth) if self.max_depth>=3 and random.random()<0.5 else random.randint(2,self.max_depth)
+
+    # -- Pipelining: overlap CPU random-chain generation with GPU eval -------
+    # The GA's true dependency chain (eval -> fitness -> breed -> eval...) is
+    # inherently serial per generation: next_pop can't be built before this
+    # generation's fitness is known. But a meaningful slice of the CPU-side
+    # breeding work is NOT dependent on this generation's fitness at all —
+    # it's pure random exploration: the "fill remaining slots" loop, the
+    # stagnation-refresh population, and the crossover-fallback branch (when
+    # a bred child collides with an already-known signature) all just need
+    # *some* fresh random chain, drawn from the same rule_pool/depth
+    # distribution regardless of what generation N's results were. We
+    # generate those in a background thread that runs continuously for the
+    # whole evolve() call, so while the GPU is busy evaluating a population,
+    # the CPU is already producing tomorrow's random candidates instead of
+    # sitting idle waiting for the GPU and only then starting to generate
+    # them. No staleness is introduced into the actual selection/fitness
+    # logic — this only pipelines the parts of breeding that were always
+    # independent of the current population.
+    def _start_prefetch(self):
+        self._prefetch_stop = threading.Event()
+        self._prefetch_q = queue.Queue(maxsize=max(64, self.pop_size*4))
+        def _worker():
+            while not self._prefetch_stop.is_set():
+                try:
+                    ind = tuple(self._random_chain(self._random_depth_biased()))
+                    self._prefetch_q.put(ind, timeout=0.5)
+                except queue.Full:
+                    continue
+                except Exception:
+                    continue
+        self._prefetch_thread = threading.Thread(target=_worker, daemon=True, name='ga-prefetch')
+        self._prefetch_thread.start()
+
+    def _stop_prefetch(self):
+        if self._prefetch_stop is not None:
+            self._prefetch_stop.set()
+        self._prefetch_thread = None
+
+    def _get_prefetched(self, avoid_set, max_tries=8):
+        """Pull a pre-generated random chain not already in avoid_set. Falls back
+        to synchronous generation if the prefetch buffer is empty (e.g. right at
+        the start of evolve() before the background thread has filled it, or if
+        CPU breeding is briefly outpacing the prefetch thread) — correctness is
+        never compromised, this is purely a speed optimization."""
+        q = self._prefetch_q
+        if q is not None:
+            for _ in range(max_tries):
+                try:
+                    ind = q.get_nowait()
+                except queue.Empty:
+                    break
+                if ind not in avoid_set:
+                    return list(ind)
+        return self._random_chain(self._random_depth_biased())
+
     def _clamp(self, tokens):
         if len(tokens)<2: tokens += self._random_chain(2-len(tokens))
         return tokens[:self.max_depth]
@@ -3094,46 +3310,109 @@ class GeneticRuleEvolver:
             tokens[idx] = random.choice(self.rule_pool)
         return tokens
 
+    def _eval_on_engine(self, eng, chains, hit_words):
+        """Run one engine's slice of chains against the FULL base_words set (already
+        cached on that engine via set_base_words) using the single high-level
+        evaluate_chains_for_ga() RPC, and merge results (as global word indices)
+        into the shared hit_words dict. Each chain only ever belongs to one
+        engine's slice, so different threads never write the same hit_words key
+        -- no locking needed."""
+        result = eng.evaluate_chains_for_ga(chains)
+        for rule_str, idx_set in result.items():
+            hit_words[rule_str] |= idx_set
+
+    def _ensure_base_words_cached(self, eng):
+        # Cache the flattened active_words once per engine per distinct word set
+        # (same trick Stage 2 uses via _run_chains_against_words -> set_base_words).
+        # active_words changes across generations when word subsampling (Feature 3)
+        # is enabled — a fresh random subsample object each time a sampling block
+        # starts, or self.base_words itself on full-sweep generations — so this
+        # naturally re-flattens only when the word set actually changes, not
+        # every single generation. Without this caching, _run_chain_kernel would
+        # fall through to prepare_words_data()/_flatten() and re-encode the
+        # entire word batch from scratch on every generation x chain-batch x
+        # word-batch call, which is what made Stage 3 slow in the first place.
+        if self._ga_cached_engines.get(id(eng)) is not self.active_words:
+            eng.set_base_words(self.active_words)
+            self._ga_cached_engines[id(eng)] = self.active_words
+
     def evaluate_population(self, population):
-        """Returns {chain_str: set(global_word_index)} — the set of base_words indices
-        each chain successfully hit. Tracking word identity (not just a hit count) is
-        what makes marginal-coverage-gain fitness possible in evolve()."""
+        """Returns {chain_str: set(local_word_index)} — the set of self.active_words
+        indices each chain successfully hit (indices are local to whatever word set
+        is active this generation — see evolve()'s word-subsampling logic — not
+        necessarily the full base_words). Tracking word identity (not just a hit
+        count) is what makes marginal-coverage-gain fitness possible in evolve().
+
+        Fans out across every active GPU when self.gpu_engine is a MultiGPUEngine,
+        the same way Stage 1/2/Seed do: split the (small) population's chain batch
+        across engines and run each slice against all of self.active_words on its
+        own GPU in parallel, then merge. Each chain only ever runs on one engine, so
+        merging hit_words is just a dict union — no cross-engine set merging needed."""
         cs = [' '.join(tok) for tok in population]
         valid = [c for c in cs if HashcatRuleValidator.validate_rule_for_gpu(c)]
         hit_words = {c: set() for c in cs}
         if not valid: return hit_words
-        wsb = self.gpu_engine.params.get('WORD_SUB_BATCH',20000)
-        cbs = self.gpu_engine.params.get('CHAINS_PER_BATCH',2000)
-        # Cache the flattened base_words once (same trick Stage 2 uses via
-        # _run_chains_against_words -> set_base_words). Previously this loop
-        # sliced self.base_words (a raw Python list of strings) and handed it
-        # straight to _run_chain_kernel, which fell through to
-        # prepare_words_data()/_flatten() and re-encoded the *entire* word
-        # sub-batch from scratch on every single generation x chain-batch x
-        # word-batch call. That redundant CPU-side re-encoding — not the GPU
-        # kernel — was why Stage 3 ran at a small fraction of Stage 2's
-        # throughput. get_word_batch_data() just slices a pre-flattened numpy
-        # array instead, which is effectively free.
-        if getattr(self.gpu_engine, '_base_words_precomputed', None) is None or \
-           getattr(self, '_ga_base_words_cached_for', None) is not self.base_words:
-            self.gpu_engine.set_base_words(self.base_words)
-            self._ga_base_words_cached_for = self.base_words
-        n_words_total = len(self.base_words)
-        for ci in range(0, len(valid), cbs):
-            cb = valid[ci:ci+cbs]
-            seqs, depths = self.gpu_engine._compute_chain_seqs(cb)
-            for wi in range(0, n_words_total, wsb):
-                end = min(wi + wsb, n_words_total)
-                bd = self.gpu_engine.get_word_batch_data(wi, end)
-                if bd['num_words'] == 0: continue
-                found = self.gpu_engine._run_chain_kernel(bd, cb, (seqs, depths), return_word_idx=True)
-                if found:
-                    for local_idx, rule_str in found:
-                        hit_words[rule_str].add(wi + local_idx)
-            self.gpu_engine._safe_queue_finish()
+
+        engines = self.gpu_engine.engines if isinstance(self.gpu_engine, MultiGPUEngine) else [self.gpu_engine]
+        engines = [e for e in engines if not getattr(e, 'disabled', False)]
+        if not engines: return hit_words
+
+        for eng in engines:
+            self._ensure_base_words_cached(eng)
+
+        if len(engines) == 1:
+            self._eval_on_engine(engines[0], valid, hit_words)
+            return hit_words
+
+        # Split the chain batch across GPUs, proportionally to each engine's
+        # measured throughput for 'ga' work if MultiGPUEngine has calibrated it
+        # (either from earlier GA generations, or bootstrapped from Stage 1/2/
+        # Seed's 'words'/'chains' measurements the first time — see fallback
+        # logic below). Population sizes are typically small (hundreds), so
+        # slices can be tiny with many GPUs — that's fine, each GPU still
+        # tests its slice against all of active_words, which is the expensive
+        # axis. Every chain lands in exactly one slice, so no locking is
+        # needed: each thread only ever writes to the hit_words[rule_str]
+        # entries for its own chains.
+        if isinstance(self.gpu_engine, MultiGPUEngine):
+            slices = self.gpu_engine.weighted_split(valid, kind='ga', engines=engines)
+        else:
+            n = len(engines)
+            chunk = max(1, (len(valid) + n - 1) // n)
+            slices = [valid[i*chunk:(i+1)*chunk] for i in range(n)]
+
+        def _timed_eval(eng, sl):
+            t0 = time.time()
+            self._eval_on_engine(eng, sl, hit_words)
+            if isinstance(self.gpu_engine, MultiGPUEngine) and sl:
+                self.gpu_engine.record_speed(eng, 'ga', len(sl), time.time()-t0)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(engines)) as pool:
+            futs = [pool.submit(_timed_eval, eng, sl)
+                    for eng, sl in zip(engines, slices) if sl]
+            for f in futs:
+                try:
+                    f.result()
+                except Exception as exc:
+                    log_warn(f"[S3]    GPU worker error: {exc}")
         return hit_words
 
-    def evolve(self, hot_rules, generations, time_budget):
+    def evolve(self, hot_rules, generations, time_budget,
+               word_sample_frac=0.25, full_sweep_every=4):
+        """word_sample_frac / full_sweep_every implement Feature 3 (stratified
+        word subsampling): most generations only evaluate the population
+        against a systematic subsample of base_words (every Nth word, with a
+        fresh random phase offset each time the block resamples) instead of
+        the entire wordlist, which is normally the dominant per-generation
+        cost. Every `full_sweep_every` generations (plus generation 0 and the
+        very last generation) we do a full sweep instead, both to keep the
+        fitness landscape honest (avoid drifting toward chains that only look
+        good on a lucky subsample) and to record accurate hit counts. Hit
+        counts recorded from a sampled generation are rescaled by
+        len(base_words)/len(sample) so they stay roughly comparable in
+        magnitude to full-sweep counts in all_new/the signature registry;
+        final counts are corrected with one full-sweep verification pass
+        below once evolution finishes."""
         if not self.rule_pool: log_warn("[S3] empty rule pool"); return Counter()
         if time_budget<=0: log_warn("[S3] no time budget"); return Counter()
         start = time.time()
@@ -3142,103 +3421,154 @@ class GeneticRuleEvolver:
         stagnation = 0
         best_ever = 0
         log_info(f"[S3]    pop={self.pop_size}  max_gen={generations}  elite={self.elite_frac:.0%}  budget={time_budget:.0f}s  pool={len(self.rule_pool):,}  known={len(self.known_rules):,}")
+        do_subsample = 0.0 < word_sample_frac < 1.0 and len(self.base_words) >= 2000
+        if do_subsample:
+            log_info(f"[S3]    Word subsampling: ~{word_sample_frac:.0%}/gen, full sweep every {full_sweep_every} gens")
         pop = self.initial_population(hot_rules)
         last_gen=0
         ncols = shutil.get_terminal_size((80,24)).columns
         t0 = time.time()
         total_combos = 0
-        with tqdm(total=generations, desc=green("  STAGE 3 "), unit="gen", ncols=ncols,
-                  bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}") as pbar:
-            for gen in range(generations):
-                last_gen=gen
-                if _kb.quit_requested: break
-                if time.time()-start >= time_budget: break
-                hit_words = self.evaluate_population(pop)
-                raw = {c: len(s) for c, s in hit_words.items()}
-                self._update_sig_registry(raw)
-                for cs, hits in raw.items():
-                    if hits>0 and HashcatRuleValidator.validate_rule_for_gpu(cs):
-                        if hits > all_new[cs]: all_new[cs]=hits
+        self._start_prefetch()
+        try:
+            with tqdm(total=generations, desc=green("  STAGE 3 "), unit="gen", ncols=ncols,
+                      bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}") as pbar:
+                for gen in range(generations):
+                    last_gen=gen
+                    if _kb.quit_requested: break
+                    if time.time()-start >= time_budget: break
 
-                # --- Marginal coverage gain (submodular greedy) ---
-                # Process individuals in descending order of raw hit count and credit each
-                # one only for the base_words it covers that no higher-priority individual
-                # in this generation already covered. This is what "efficiency" means in
-                # the concentrator/Pareto sense: a chain that duplicates coverage already
-                # provided by a better individual contributes ~0 fitness, regardless of its
-                # own raw hit count, so the population stops rewarding near-duplicates.
-                order = sorted(pop, key=lambda ind: -len(hit_words.get(' '.join(ind), ())))
-                covered = set()
-                marginal = {}
-                for ind in order:
-                    cs_i = ' '.join(ind)
-                    s = hit_words.get(cs_i, set())
-                    gain = len(s - covered)
-                    marginal[cs_i] = gain
-                    covered |= s
+                    is_full = (not do_subsample) or gen==0 or gen==generations-1 or (gen % full_sweep_every == 0)
+                    if is_full:
+                        self.active_words = self.base_words
+                        scale = 1.0
+                    else:
+                        step = max(2, int(round(1.0/word_sample_frac)))
+                        offset = random.randint(0, step-1)
+                        self.active_words = self.base_words[offset::step]
+                        scale = len(self.base_words) / max(1, len(self.active_words))
 
-                # Novelty bonus now checks functional-signature membership (_sig_is_covered)
-                # instead of an exact string match against known_rules. A syntactically
-                # different chain that is functionally identical (on BUILTIN_PROBES) to an
-                # already-known rule no longer gets rewarded as if it were novel.
-                fitness = sorted(
-                    [(tuple(ind), marginal.get(' '.join(ind), 0) * (1 if self._sig_is_covered(' '.join(ind)) else 2))
-                     for ind in pop],
-                    key=lambda x: -x[1])
-                best = fitness[0][1] if fitness else 0
-                total_combos += len(pop) * len(self.base_words)
-                elapsed = time.time()-t0
-                spd = _fmt_speed(total_combos / elapsed if elapsed>0 else 0)
-                if best>best_ever: best_ever=best; stagnation=0
-                else: stagnation+=1
-                if stagnation>=5:
-                    stagnation=0
-                    n_ref = max(1, int(self.pop_size*0.3))
-                    refresh = []
-                    refresh_set = {fitness[0][0]} if fitness else set()
-                    rt=0
-                    while len(refresh)<n_ref and rt<n_ref*20:
-                        rt+=1
-                        d = random.randint(3,self.max_depth) if self.max_depth>=3 and random.random()<0.6 else random.randint(2,self.max_depth)
-                        ind = tuple(self._random_chain(d))
-                        if ind not in refresh_set:
-                            refresh.append(list(ind)); refresh_set.add(ind)
-                    keep = [list(ind) for ind,_ in fitness[:self.pop_size-n_ref]]
-                    pop = keep+refresh
-                    pbar.update(1)
-                    pbar.set_postfix({"best":cyan(str(best)), "new":cyan(str(len(all_new))), "sigs":cyan(str(len(self._sig_to_best))), "spd":green(spd), "stag":yellow("REFRESH")}, refresh=False)
-                    continue
-                elites = [list(ind) for ind,_ in fitness[:n_elite]]
-                next_pop = elites[:]
-                next_set = {tuple(e) for e in elites}
-                breed_attempts=0
-                while len(next_pop)<self.pop_size and breed_attempts<(self.pop_size-len(next_pop))*8:
-                    breed_attempts+=1
-                    p1 = self._tournament_select(fitness)
-                    p2 = self._tournament_select(fitness)
-                    c1,c2 = self._crossover(p1,p2)
-                    c1 = self._mutate_adaptive(c1)
-                    c2 = self._mutate_adaptive(c2)
-                    for c in (c1,c2):
-                        if len(next_pop)>=self.pop_size: break
-                        key = tuple(c)
-                        if key in next_set: continue
-                        if self._sig_is_covered(' '.join(c)):
-                            d = random.randint(3,self.max_depth) if self.max_depth>=3 and random.random()<0.7 else random.randint(2,self.max_depth)
-                            c = self._random_chain(d)
+                    hit_words = self.evaluate_population(pop)
+                    raw = {c: len(s) for c, s in hit_words.items()}
+                    raw_scaled = raw if scale==1.0 else {c: int(round(h*scale)) for c,h in raw.items()}
+                    self._update_sig_registry(raw_scaled)
+                    for cs, hits in raw_scaled.items():
+                        if hits>0 and HashcatRuleValidator.validate_rule_for_gpu(cs):
+                            if hits > all_new[cs]: all_new[cs]=hits
+
+                    # --- Marginal coverage gain (submodular greedy) ---
+                    # Process individuals in descending order of raw hit count and credit each
+                    # one only for the base_words it covers that no higher-priority individual
+                    # in this generation already covered. This is what "efficiency" means in
+                    # the concentrator/Pareto sense: a chain that duplicates coverage already
+                    # provided by a better individual contributes ~0 fitness, regardless of its
+                    # own raw hit count, so the population stops rewarding near-duplicates.
+                    # (Uses raw unscaled hit_words — the sets are only ever compared against
+                    # each other within this same generation/same word sample, so scaling
+                    # doesn't matter here, only for the cross-generation bookkeeping above.)
+                    order = sorted(pop, key=lambda ind: -len(hit_words.get(' '.join(ind), ())))
+                    covered = set()
+                    marginal = {}
+                    for ind in order:
+                        cs_i = ' '.join(ind)
+                        s = hit_words.get(cs_i, set())
+                        gain = len(s - covered)
+                        marginal[cs_i] = gain
+                        covered |= s
+
+                    # Novelty bonus now checks functional-signature membership (_sig_is_covered)
+                    # instead of an exact string match against known_rules. A syntactically
+                    # different chain that is functionally identical (on BUILTIN_PROBES) to an
+                    # already-known rule no longer gets rewarded as if it were novel.
+                    fitness = sorted(
+                        [(tuple(ind), marginal.get(' '.join(ind), 0) * (1 if self._sig_is_covered(' '.join(ind)) else 2))
+                         for ind in pop],
+                        key=lambda x: -x[1])
+                    best = fitness[0][1] if fitness else 0
+                    total_combos += len(pop) * len(self.active_words)
+                    elapsed = time.time()-t0
+                    spd = _fmt_speed(total_combos / elapsed if elapsed>0 else 0)
+                    if best>best_ever: best_ever=best; stagnation=0
+                    else: stagnation+=1
+                    if stagnation>=5:
+                        stagnation=0
+                        n_ref = max(1, int(self.pop_size*0.3))
+                        refresh = []
+                        refresh_set = {fitness[0][0]} if fitness else set()
+                        rt=0
+                        while len(refresh)<n_ref and rt<n_ref*20:
+                            rt+=1
+                            ind = tuple(self._get_prefetched(refresh_set))
+                            if ind not in refresh_set:
+                                refresh.append(list(ind)); refresh_set.add(ind)
+                        keep = [list(ind) for ind,_ in fitness[:self.pop_size-n_ref]]
+                        pop = keep+refresh
+                        pbar.update(1)
+                        pbar.set_postfix({"best":cyan(str(best)), "new":cyan(str(len(all_new))), "sigs":cyan(str(len(self._sig_to_best))), "spd":green(spd), "stag":yellow("REFRESH")}, refresh=False)
+                        continue
+                    elites = [list(ind) for ind,_ in fitness[:n_elite]]
+                    next_pop = elites[:]
+                    next_set = {tuple(e) for e in elites}
+                    breed_attempts=0
+                    while len(next_pop)<self.pop_size and breed_attempts<(self.pop_size-len(next_pop))*8:
+                        breed_attempts+=1
+                        p1 = self._tournament_select(fitness)
+                        p2 = self._tournament_select(fitness)
+                        c1,c2 = self._crossover(p1,p2)
+                        c1 = self._mutate_adaptive(c1)
+                        c2 = self._mutate_adaptive(c2)
+                        for c in (c1,c2):
+                            if len(next_pop)>=self.pop_size: break
                             key = tuple(c)
                             if key in next_set: continue
-                        next_pop.append(c); next_set.add(key)
-                fill_attempts=0
-                while len(next_pop)<self.pop_size and fill_attempts<self.pop_size*4:
-                    fill_attempts+=1
-                    d = random.randint(3,self.max_depth) if self.max_depth>=3 and random.random()<0.5 else random.randint(2,self.max_depth)
-                    ind = tuple(self._random_chain(d))
-                    if ind not in next_set:
-                        next_pop.append(list(ind)); next_set.add(ind)
-                pop = next_pop[:self.pop_size]
-                pbar.update(1)
-                pbar.set_postfix({"best":cyan(str(best)), "new":cyan(str(len(all_new))), "sigs":cyan(str(len(self._sig_to_best))), "spd":green(spd)}, refresh=False)
+                            if self._sig_is_covered(' '.join(c)):
+                                c = self._get_prefetched(next_set)
+                                key = tuple(c)
+                                if key in next_set: continue
+                            next_pop.append(c); next_set.add(key)
+                    fill_attempts=0
+                    while len(next_pop)<self.pop_size and fill_attempts<self.pop_size*4:
+                        fill_attempts+=1
+                        ind = tuple(self._get_prefetched(next_set))
+                        if ind not in next_set:
+                            next_pop.append(list(ind)); next_set.add(ind)
+                    pop = next_pop[:self.pop_size]
+                    pbar.update(1)
+                    pbar.set_postfix({"best":cyan(str(best)), "new":cyan(str(len(all_new))), "sigs":cyan(str(len(self._sig_to_best))), "spd":green(spd)}, refresh=False)
+        finally:
+            self._stop_prefetch()
+
+        # Final correction pass: re-verify every distinct rule chain we ever
+        # credited against the FULL base_words in one batch, so counts that
+        # came from a subsampled generation (only ever an estimate, scaled by
+        # 1/frac) get replaced with exact figures before we return. This is a
+        # single bounded sweep over the deduped set of winners, not per
+        # generation, so it stays cheap even though it's a full-wordlist pass.
+        if do_subsample and all_new and not _kb.quit_requested:
+            log_info(f"[S3]    Verifying {len(all_new):,} candidate chain(s) against the full wordlist...")
+            self.active_words = self.base_words
+            verify_chains = list(all_new.keys())
+            hit_words = {}
+            engines = self.gpu_engine.engines if isinstance(self.gpu_engine, MultiGPUEngine) else [self.gpu_engine]
+            engines = [e for e in engines if not getattr(e, 'disabled', False)]
+            if engines:
+                for eng in engines:
+                    self._ensure_base_words_cached(eng)
+                hit_words = {c: set() for c in verify_chains}
+                if len(engines) == 1:
+                    self._eval_on_engine(engines[0], verify_chains, hit_words)
+                else:
+                    n = len(engines)
+                    chunk = max(1, (len(verify_chains) + n - 1) // n)
+                    slices = [verify_chains[i*chunk:(i+1)*chunk] for i in range(n)]
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=n) as pool:
+                        futs = [pool.submit(self._eval_on_engine, eng, sl, hit_words)
+                                for eng, sl in zip(engines, slices) if sl]
+                        for f in futs:
+                            try: f.result()
+                            except Exception as exc: log_warn(f"[S3]    Verify worker error: {exc}")
+                all_new = Counter({c: len(s) for c, s in hit_words.items() if s})
+
         elapsed = time.time()-start
         log_info(f"[S3]    Evolution complete — {bold(green(str(len(all_new))))} unique chains passed bloom filter  ({bold(cyan(str(len(self._sig_to_best))))} distinct functional signatures)  ({elapsed:.1f}s, {last_gen+1} generation(s))")
         return all_new
@@ -3514,8 +3844,18 @@ class GPUExtractor:
             else:
                 log_info(f"[S3]    Budget: {bold(f'{ga_budget:.0f}s')}")
             known_set = set(all_counts.keys())
-            _ga_engine = self.gpu_engine.engines[0] if isinstance(self.gpu_engine, MultiGPUEngine) else self.gpu_engine
-            evolver = GeneticRuleEvolver(_ga_engine, base_words, rule_pool, self.user_max_depth,
+            # Stage 3 now fans out across every active GPU the same way Stage 1/2/Seed
+            # do (see GeneticRuleEvolver.evaluate_population) — pass the MultiGPUEngine
+            # itself instead of unwrapping to engines[0]. Make sure every engine has
+            # its bloom filter / rules / kernel ready first (Stage 2 only does this
+            # for engines[1:] when it itself splits across GPUs; if e.g. Stage 2 was
+            # skipped or ran single-GPU for some reason, secondary engines could
+            # otherwise be unprepared here).
+            if isinstance(self.gpu_engine, MultiGPUEngine) and len(self.gpu_engine.engines) > 1:
+                for eng in self.gpu_engine.engines:
+                    self.gpu_engine._ensure_engine_ready(eng, bloom_filter, rules_phase1)
+                self.gpu_engine._prune_disabled()
+            evolver = GeneticRuleEvolver(self.gpu_engine, base_words, rule_pool, self.user_max_depth,
                                          pop_size=self.genetic_pop, elite_frac=self.genetic_elite,
                                          seed_hits=seed_hits, known_rules=known_set)
             ga_hits = evolver.evolve(hot_rules, self.genetic_generations, ga_budget)
