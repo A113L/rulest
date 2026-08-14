@@ -1121,6 +1121,6 @@ MIT
  
 ## Credits
 
-@Shooter3k for testing script on Windows OS
+@Shooter3k for testing script on multi-GPU system
 
 https://github.com/synacktiv/rulesfinder
