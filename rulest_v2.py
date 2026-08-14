@@ -3106,7 +3106,8 @@ class GeneticRuleEvolver:
     def __init__(self, gpu_engine, base_words, rule_pool, max_depth,
                  pop_size=200, elite_frac=0.15, tournament_k=4, crossover_p=0.80,
                  mut_replace_p=0.60, mut_insert_p=0.20, mut_delete_p=0.20,
-                 seed_hits=None, known_rules=None):
+                 seed_hits=None, known_rules=None,
+                 parsimony_alpha=0.05, sharing_sigma=0.5):
         self.gpu_engine = gpu_engine
         self.base_words = base_words
         self.rule_pool = rule_pool
@@ -3131,6 +3132,36 @@ class GeneticRuleEvolver:
         # -- Feature: word subsampling (see _pick_generation_words) --
         self.active_words = base_words
         self._ga_cached_engines = {}
+        # -- Feature: parsimony pressure (Occam's razor) --
+        # Divides fitness by (1 + parsimony_alpha*(depth-2)) so that among two
+        # chains with equal marginal coverage, the shorter one wins ties. Keeps
+        # depth-2 chains (the cheapest possible) unpenalized, scales up slowly.
+        self.parsimony_alpha = parsimony_alpha
+        # -- Feature: fitness sharing (structural diversity pressure) --
+        # sigma is the Jaccard-distance niche radius: individuals whose token
+        # sets are closer than this to each other compete for shared fitness,
+        # discouraging the population from converging on near-identical chains.
+        self.sharing_sigma = sharing_sigma
+        # -- Feature: cross-generation hit cache --
+        # Elites (and any chain that happens to reappear verbatim) are re-sent
+        # to the GPU every generation even though their hit set against the
+        # *same* active_words hasn't changed. Cache by (chain_str) -> (word-set
+        # version token, hit-set) and skip GPU evaluation on a hit.
+        #
+        # IMPORTANT: the version token is an explicit counter, NOT id(self.active_words).
+        # self.active_words is reassigned to a *new* list object every subsampled
+        # generation (self.base_words[offset::step]); once superseded, that old
+        # list can be garbage-collected, and CPython is free to reuse its memory
+        # address for the *next* new list — so id() can silently collide across
+        # two genuinely different word subsets and produce a false cache hit
+        # (wrong hit-set served as if it were current). Token 0 is reserved for
+        # "full sweep" (self.active_words is self.base_words, a single object
+        # that lives for the whole evolve() call, so it's always safe to share);
+        # every subsampled block gets its own strictly-increasing token instead.
+        self._active_words_token = 0
+        self._active_words_token_ctr = 0
+        self._hit_cache = {}
+        self._hit_cache_max = 20000
 
     def _get_sig(self, chain_str):
         if chain_str not in self._sig_cache:
@@ -3284,6 +3315,56 @@ class GeneticRuleEvolver:
         contenders = random.sample(fitness, k)
         return list(max(contenders, key=lambda x:x[1])[0])
 
+    def _sharing_denoms(self, pop):
+        """Fitness sharing (Goldberg & Richardson) over token-set Jaccard distance.
+        Individuals whose rule_pool tokens overlap heavily with many peers get
+        their fitness divided by a larger 'niche count', so a population that
+        has piled onto one structural neighborhood stops getting rewarded for
+        near-duplicates of each other — complements the marginal-coverage
+        novelty bonus, which only catches *functional* duplicates (same
+        BUILTIN_PROBES signature), not structurally similar-but-distinct chains
+        that haven't converged to the same signature yet.
+
+        Implementation note: tokens are mapped to bit positions in a per-call,
+        per-generation local vocabulary (built on the fly, not tied to
+        rule_pool, since an individual can also carry a whole hot-rule string
+        as a single "gene" — see initial_population). Jaccard distance then
+        reduces to popcount arithmetic on Python ints instead of building and
+        intersecting a fresh set object for every one of the O(n^2) pairs,
+        which is the dominant cost here since pop_size is only in the
+        hundreds but this runs every generation."""
+        n = len(pop)
+        denom = [1.0] * n
+        sigma = self.sharing_sigma
+        if sigma <= 0 or n < 2: return denom
+        token_bit = {}
+        masks = [0] * n
+        popcounts = [0] * n
+        for i, ind in enumerate(pop):
+            m = 0
+            for t in set(ind):
+                b = token_bit.get(t)
+                if b is None:
+                    b = len(token_bit)
+                    token_bit[t] = b
+                m |= (1 << b)
+            masks[i] = m
+            popcounts[i] = bin(m).count('1')
+        for i in range(n):
+            mi, ci = masks[i], popcounts[i]
+            if ci == 0: continue
+            for j in range(i+1, n):
+                mj, cj = masks[j], popcounts[j]
+                if cj == 0: continue
+                inter = bin(mi & mj).count('1')
+                union = ci + cj - inter
+                d = 1.0 - (inter / union) if union else 0.0
+                if d < sigma:
+                    sh = 1.0 - (d / sigma)
+                    denom[i] += sh
+                    denom[j] += sh
+        return denom
+
     def _crossover(self, p1, p2):
         if len(p1)<2 or len(p2)<2 or random.random()>self.crossover_p:
             return list(p1), list(p2)
@@ -3347,11 +3428,30 @@ class GeneticRuleEvolver:
         the same way Stage 1/2/Seed do: split the (small) population's chain batch
         across engines and run each slice against all of self.active_words on its
         own GPU in parallel, then merge. Each chain only ever runs on one engine, so
-        merging hit_words is just a dict union — no cross-engine set merging needed."""
+        merging hit_words is just a dict union — no cross-engine set merging needed.
+
+        Cross-generation cache: elites carried over unchanged from the previous
+        generation (and any other chain that happens to repeat verbatim) are
+        served from self._hit_cache instead of re-run on GPU, as long as
+        active_words hasn't changed since the cached result was recorded (see
+        __init__ for the invalidation rule). Only genuinely new/unseen chains,
+        or ones whose cache entry belongs to a stale active_words set, hit the
+        GPU this generation."""
         cs = [' '.join(tok) for tok in population]
         valid = [c for c in cs if HashcatRuleValidator.validate_rule_for_gpu(c)]
         hit_words = {c: set() for c in cs}
         if not valid: return hit_words
+
+        aw_id = self._active_words_token
+        to_eval = []
+        for c in valid:
+            cached = self._hit_cache.get(c)
+            if cached is not None and cached[0] == aw_id:
+                hit_words[c] = cached[1]
+            else:
+                to_eval.append(c)
+        if not to_eval:
+            return hit_words
 
         engines = self.gpu_engine.engines if isinstance(self.gpu_engine, MultiGPUEngine) else [self.gpu_engine]
         engines = [e for e in engines if not getattr(e, 'disabled', False)]
@@ -3360,8 +3460,16 @@ class GeneticRuleEvolver:
         for eng in engines:
             self._ensure_base_words_cached(eng)
 
+        def _remember(chains):
+            for c in chains:
+                self._hit_cache[c] = (aw_id, hit_words[c])
+            if len(self._hit_cache) > self._hit_cache_max:
+                for k in list(self._hit_cache.keys())[:len(self._hit_cache)-self._hit_cache_max]:
+                    del self._hit_cache[k]
+
         if len(engines) == 1:
-            self._eval_on_engine(engines[0], valid, hit_words)
+            self._eval_on_engine(engines[0], to_eval, hit_words)
+            _remember(to_eval)
             return hit_words
 
         # Split the chain batch across GPUs, proportionally to each engine's
@@ -3375,11 +3483,11 @@ class GeneticRuleEvolver:
         # needed: each thread only ever writes to the hit_words[rule_str]
         # entries for its own chains.
         if isinstance(self.gpu_engine, MultiGPUEngine):
-            slices = self.gpu_engine.weighted_split(valid, kind='ga', engines=engines)
+            slices = self.gpu_engine.weighted_split(to_eval, kind='ga', engines=engines)
         else:
             n = len(engines)
-            chunk = max(1, (len(valid) + n - 1) // n)
-            slices = [valid[i*chunk:(i+1)*chunk] for i in range(n)]
+            chunk = max(1, (len(to_eval) + n - 1) // n)
+            slices = [to_eval[i*chunk:(i+1)*chunk] for i in range(n)]
 
         def _timed_eval(eng, sl):
             t0 = time.time()
@@ -3395,6 +3503,7 @@ class GeneticRuleEvolver:
                     f.result()
                 except Exception as exc:
                     log_warn(f"[S3]    GPU worker error: {exc}")
+        _remember(to_eval)
         return hit_words
 
     def evolve(self, hot_rules, generations, time_budget,
@@ -3441,11 +3550,14 @@ class GeneticRuleEvolver:
                     is_full = (not do_subsample) or gen==0 or gen==generations-1 or (gen % full_sweep_every == 0)
                     if is_full:
                         self.active_words = self.base_words
+                        self._active_words_token = 0
                         scale = 1.0
                     else:
                         step = max(2, int(round(1.0/word_sample_frac)))
                         offset = random.randint(0, step-1)
                         self.active_words = self.base_words[offset::step]
+                        self._active_words_token_ctr += 1
+                        self._active_words_token = self._active_words_token_ctr
                         scale = len(self.base_words) / max(1, len(self.active_words))
 
                     hit_words = self.evaluate_population(pop)
@@ -3466,11 +3578,16 @@ class GeneticRuleEvolver:
                     # (Uses raw unscaled hit_words — the sets are only ever compared against
                     # each other within this same generation/same word sample, so scaling
                     # doesn't matter here, only for the cross-generation bookkeeping above.)
-                    order = sorted(pop, key=lambda ind: -len(hit_words.get(' '.join(ind), ())))
+                    #
+                    # pop_cs is computed once and reused everywhere below instead of calling
+                    # ' '.join(ind) repeatedly per individual (it was previously joined once
+                    # for `order`, again inside the marginal loop, and up to twice more inside
+                    # _base_fit — up to 4x redundant string-building work per individual/gen).
+                    pop_cs = [' '.join(ind) for ind in pop]
+                    order = sorted(zip(pop, pop_cs), key=lambda pc: -len(hit_words.get(pc[1], ())))
                     covered = set()
                     marginal = {}
-                    for ind in order:
-                        cs_i = ' '.join(ind)
+                    for ind, cs_i in order:
                         s = hit_words.get(cs_i, set())
                         gain = len(s - covered)
                         marginal[cs_i] = gain
@@ -3480,11 +3597,38 @@ class GeneticRuleEvolver:
                     # instead of an exact string match against known_rules. A syntactically
                     # different chain that is functionally identical (on BUILTIN_PROBES) to an
                     # already-known rule no longer gets rewarded as if it were novel.
+                    #
+                    # Parsimony pressure: divide by (1 + alpha*(depth-2)) so that among
+                    # two chains covering the same words, the shorter (cheaper, more
+                    # general) one wins ties instead of the GA drifting toward
+                    # needlessly long chains that cover nothing extra.
+                    #
+                    # base_fit is computed exactly once per individual here and reused for
+                    # both `fitness` (raw, used for elites/best/stagnation) and
+                    # `shared_fitness` (diversity-adjusted, used only for parent selection)
+                    # below — previously each individual's fitness was computed twice.
+                    base_fit = [0.0] * len(pop)
+                    for i, (ind, cs_i) in enumerate(zip(pop, pop_cs)):
+                        gain = marginal.get(cs_i, 0)
+                        novelty = 1 if self._sig_is_covered(cs_i) else 2
+                        depth_penalty = 1.0 + self.parsimony_alpha * max(0, len(ind)-2)
+                        base_fit[i] = (gain * novelty) / depth_penalty
+
                     fitness = sorted(
-                        [(tuple(ind), marginal.get(' '.join(ind), 0) * (1 if self._sig_is_covered(' '.join(ind)) else 2))
-                         for ind in pop],
+                        ((tuple(ind), base_fit[i]) for i, ind in enumerate(pop)),
                         key=lambda x: -x[1])
                     best = fitness[0][1] if fitness else 0
+
+                    # Fitness sharing: elites (used below for next_pop and reporting)
+                    # are still picked from the raw `fitness` above, so the single
+                    # best-found chain each generation is never discarded for being
+                    # "too similar" to something else. Sharing only reshapes the
+                    # odds during tournament selection of *parents*, spreading
+                    # reproductive opportunity away from crowded structural niches.
+                    share_denoms = self._sharing_denoms(pop)
+                    shared_fitness = sorted(
+                        ((tuple(ind), base_fit[i] / share_denoms[i]) for i, ind in enumerate(pop)),
+                        key=lambda x: -x[1])
                     total_combos += len(pop) * len(self.active_words)
                     elapsed = time.time()-t0
                     spd = _fmt_speed(total_combos / elapsed if elapsed>0 else 0)
@@ -3512,8 +3656,8 @@ class GeneticRuleEvolver:
                     breed_attempts=0
                     while len(next_pop)<self.pop_size and breed_attempts<(self.pop_size-len(next_pop))*8:
                         breed_attempts+=1
-                        p1 = self._tournament_select(fitness)
-                        p2 = self._tournament_select(fitness)
+                        p1 = self._tournament_select(shared_fitness)
+                        p2 = self._tournament_select(shared_fitness)
                         c1,c2 = self._crossover(p1,p2)
                         c1 = self._mutate_adaptive(c1)
                         c2 = self._mutate_adaptive(c2)
