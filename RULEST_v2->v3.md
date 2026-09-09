@@ -29,7 +29,7 @@ old raw-GPU-frequency sort. The new selection path is fully opt-in.
 outputs of a fully **automated pipeline** (raw GPU generation + one of two
 mechanical selection modes — frequency sort or CELF), not the result of
 manual, expensive tuning/debugging like most other rulesets in the
-comparison spreadsheet these were pulled from. Keep that in mind when
+comparison [spreadsheet](https://docs.google.com/spreadsheets/d/1ctT9o-hdMaJMe9ZM7e6t9x0uDmGphvOixe0FHnHGCEI/edit?gid=1513384572#gid=1513384572) these were pulled from. Keep that in mind when
 reading the numbers below — there's no external, hand-curated ruleset in
 this table, only the two `rulest` selection modes compared against each
 other at matched budgets.
