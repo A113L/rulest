@@ -54,7 +54,7 @@ A first-generation implementation using a **Breadth-First Search (BFS)** chainin
 
 A ~210 KB single-file rewrite adding Hashcat GPU rule validation, a GPU-only Bloom filter (with automatic sharding above ~512 MB), staged extraction (single-rule sweep → built-in seed families → informed chain generation → optional genetic algorithm), token-strip pre-extraction, multi-GPU execution with process-isolated workers, and frequency-ranked output. Still supported for compatibility, but superseded by v3's package structure and greedy rule selection.
 
-### 🚀 `rulest` v3 — Package + Greedy Selection (Recommended)
+### `rulest` v3 — Package + Greedy Selection (Recommended)
 
 v3 takes the entire v2 engine — Stages 0–3, the Bloom filter (including sharding), token-strip, multi-GPU execution, and the genetic algorithm — and:
 
