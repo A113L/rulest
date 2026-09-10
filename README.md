@@ -583,4 +583,6 @@ MIT
 
 @Shooter3k for testing script on multi-GPU system
 
+@0xVavaldi for coverage optimization inspiration
+
 https://github.com/synacktiv/rulesfinder
