@@ -184,6 +184,7 @@ usage: run_rulest.py [options] base_wordlist target_wordlist
 | `--local-search` | off | Enable 1-swap local search (requires `--select-mode greedy`) |
 | `--local-search-swaps N` | `3000` | Max swap attempts |
 | `--local-search-pool N` | `15000` | Size of the residual-candidate pool |
+| `--local-search-refresh N` | 3 | Stop local search once this many consecutive full passes over the selected set |
 
 ---
 
