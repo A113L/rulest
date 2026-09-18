@@ -181,6 +181,9 @@ usage: run_rulest.py [options] base_wordlist target_wordlist
 | `--select-budgets` | None | Comma-separated budgets (e.g. `"64,250,1500,10000,25000,50000,150000"`); emits extra files `<output>.<budget>.txt` cut from the same ordering, for either select mode |
 | `--select-cost-alpha` | `0.0` | `gain(r) = new_recovery(r) / depth(r)**alpha`. `0` (default) = pure marginal coverage; `>0` favors shorter/cheaper chains among rules with similar marginal gain |
 | `--exact-recovery` | off | Report exact distinct target-word recovery after greedy selection (reporting only — greedy coverage is already exact, resolved through the verification kernel before CELF selection) |
+| `--local-search` | off | Enable 1-swap local search (requires `--select-mode greedy`) |
+| `--local-search-swaps N` | `3000` | Max swap attempts |
+| `--local-search-pool N` | `15000` | Size of the residual-candidate pool |
 
 ---
 
