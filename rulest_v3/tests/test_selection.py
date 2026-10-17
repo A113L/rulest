@@ -296,3 +296,63 @@ def test_dedupe_targets_no_longer_spams_raw_hashmap_prints(capsys):
 def test_dedupe_targets_handles_empty_input():
     from rulest.selection import _rulest_dedupe_targets_with_progress
     assert _rulest_dedupe_targets_with_progress([]) == []
+
+
+def test_greedy_selection_reads_celf_state_from_the_selected_single_gpu(monkeypatch):
+    """The MultiGPUEngine itself has no CELF workspace fields; its primary
+    ProcessEngineProxy does. Selection must use that same primary proxy for
+    depth handling, workspace sizing, scoring, and cleanup."""
+    import rulest.selection as selection_module
+
+    class PrimaryEngine:
+        def __init__(self):
+            self.device = _FakeDevice("NVIDIA test GPU")
+            self.params = {
+                "MAX_CHAIN_DEPTH": 8,
+                "CELF_SEEN_SCRATCH_MB": 4,
+                "CELF_RULE_BATCH_SIZE": 4,
+            }
+            self._celf_seen_words = 2
+            self._celf_batch_capacity = 1
+
+        def compile_kernel(self, force=False):
+            return True
+
+        def celf_report_profile(self):
+            return None
+
+        def celf_profile_summary(self):
+            return None
+
+    primary = PrimaryEngine()
+    secondary = _FakeSubEngine("second GPU")
+
+    class FakeMultiEngine:
+        def __init__(self):
+            self.engines = [primary, secondary]
+
+    class FakeScorer:
+        def __init__(self, gpu_engine, base_words, target_words, pair_batch_size, candidate_rules):
+            self.gpu_engine = gpu_engine
+
+        def upper_bound_batch(self, rules):
+            return [1] * len(rules)
+
+        def score_one_with_targets(self, rule, covered_mask=None, progress_callback=None):
+            return 1, {0}
+
+        def score_gains_batch(self, rules, progress_callback=None):
+            return [1] * len(rules)
+
+        def mark_selected(self, target_ids):
+            return None
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(selection_module, "_GpuExactScorer", FakeScorer)
+    selected, covered = selection_module.select_rules_by_marginal_coverage(
+        FakeMultiEngine(), ["base"], ["target"], ["l"], 8, budget=1
+    )
+    assert selected == [("l", 1)]
+    assert int(covered.sum()) == 1
