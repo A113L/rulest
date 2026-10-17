@@ -26,30 +26,38 @@ from .multi_gpu import MultiGPUEngine
 from .minimize import minimize_by_signature
 from .selection import select_rules_by_marginal_coverage
 from .io_utils import load_wordlist
+from .profiling import stage_profiler
 
 def main():
     ap = argparse.ArgumentParser(prog='rulest', description='GPU-Compatible Hashcat Rules Engine (optimized)',
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
+    # Every option below takes a single-letter short form alongside its long
+    # name (e.g. --select-budget / -b), normalized the same way -o/--output
+    # already worked, so any flag can be used either way. A handful of rare/
+    # dangerous switches (--bloom-no-shard, --allow-reject-rules) and the
+    # numbered --depthN-chains family intentionally have no short form —
+    # one letter per depth (2..10) would eat most of the alphabet for
+    # options nobody runs from memory anyway.
     ap.add_argument('base_wordlist', nargs='?')
     ap.add_argument('target_wordlist', nargs='?')
     ap.add_argument('-o','--output', default='rulest_output.txt')
-    ap.add_argument('--device', default=None, metavar='SPEC',
+    ap.add_argument('-d', '--device', default=None, metavar='SPEC',
                     help='Device index, name substring, "all" to run every detected GPU in parallel, '
                          'or a comma-separated list of indices (e.g. "0,1") to run only those GPUs in parallel '
                          '(default: auto-select best single GPU)')
-    ap.add_argument('--list-devices', action='store_true')
-    ap.add_argument('--max-depth', type=int, default=2)
-    ap.add_argument('--target-hours', type=float, default=0.5)
-    ap.add_argument('--max-chains', type=int, default=0)
-    ap.add_argument('--bloom-mb', type=int, default=0)
+    ap.add_argument('-L', '--list-devices', action='store_true')
+    ap.add_argument('-m', '--max-depth', type=int, default=2)
+    ap.add_argument('-t', '--target-hours', type=float, default=0.5)
+    ap.add_argument('-c', '--max-chains', type=int, default=0)
+    ap.add_argument('-B', '--bloom-mb', type=int, default=0)
     ap.add_argument('--bloom-no-shard', action='store_true')
-    ap.add_argument('--seed-rules', default=None)
+    ap.add_argument('-r', '--seed-rules', default=None)
     for i in range(2,11):
         ap.add_argument(f'--depth{i}-chains', type=int, default=None, dest=f'depth{i}_chains')
     ap.add_argument('--allow-reject-rules', action='store_true')
-    ap.add_argument('--no-builtin-seeds', action='store_true')
+    ap.add_argument('-n', '--no-builtin-seeds', action='store_true')
     pt = ap.add_argument_group('STAGE 0 — Token-Strip')
-    pt.add_argument('--token-strip', action='store_true')
+    pt.add_argument('-T', '--token-strip', action='store_true')
     pt.add_argument('--token-strip-min-stem', type=int, default=4)
     pt.add_argument('--token-strip-max-prefix', type=int, default=4)
     pt.add_argument('--token-strip-max-suffix', type=int, default=4)
@@ -57,38 +65,57 @@ def main():
     pt.add_argument('--token-strip-workers', type=int, default=0)
     pt.add_argument('--token-strip-chunk-size', type=int, default=0)
     ga = ap.add_argument_group('Genetic Algorithm')
-    ga.add_argument('--genetic', action='store_true')
-    ga.add_argument('--genetic-generations', type=int, default=50)
-    ga.add_argument('--genetic-pop', type=int, default=200)
-    ga.add_argument('--genetic-elite', type=float, default=0.15)
+    ga.add_argument('-g', '--genetic', action='store_true')
+    ga.add_argument('-G', '--genetic-generations', type=int, default=50)
+    ga.add_argument('-P', '--genetic-pop', type=int, default=200)
+    ga.add_argument('-E', '--genetic-elite', type=float, default=0.15)
     sel = ap.add_argument_group('Rule Selection (post-processing)')
-    sel.add_argument('--select-mode', choices=['frequency', 'greedy'], default='frequency',
+    sel.add_argument('-M', '--select-mode', choices=['frequency', 'greedy'], default='frequency',
                       help="frequency (default): sort by raw GPU hit count, as before. "
                            "greedy: lazy-greedy (CELF) marginal-coverage selection against "
                            "the real TARGET wordlist — maximizes |union of recovered words| "
                            "per rule budget instead of summed per-rule score.")
-    sel.add_argument('--select-budget', type=int, default=0,
+    sel.add_argument('-b', '--select-budget', type=int, default=0,
                       help="Max rules to keep with --select-mode greedy (0 = run to "
                            "saturation, i.e. until no remaining rule adds new coverage).")
-    sel.add_argument('--select-budgets', default=None,
+    sel.add_argument('-s', '--select-budgets', default=None,
                       help="Comma-separated list of budgets (e.g. '100,1000,10000,150000') to "
                            "additionally emit as separate prefix files '<output>.<budget>.txt' "
                            "cut from the same greedy ordering — lets you compare recovery vs. "
                            "budget without rerunning coverage eval for each size.")
-    sel.add_argument('--select-cost-alpha', type=float, default=0.0,
+    sel.add_argument('-a', '--select-cost-alpha', type=float, default=0.0,
                       help="gain(r) = new_recovery(r) / depth(r)**alpha. 0 (default) = pure "
                            "marginal coverage. >0 favors shorter/cheaper chains among rules "
                            "with similar marginal gain.")
-    sel.add_argument('--exact-recovery', action='store_true',
+    sel.add_argument('-e', '--exact-recovery', action='store_true',
                       help="Explicitly report exact distinct target-word recovery after greedy "
                            "selection. Greedy coverage is already exact: bloom-positive GPU "
                            "hits are resolved through the exact verification kernel before CELF "
                            "selection, so this flag adds reporting only (no second GPU pass).")
-    ap.add_argument('--debug', action='store_true')
+    ap.add_argument('-D', '--debug', action='store_true')
+    ap.add_argument('-p', '--profile', action='store_true',
+                    help='Enable profiling: prints a per-stage wall-clock breakdown table '
+                         '(STAGE 0-3, bloom build, minimization, selection/CELF) at the end '
+                         'of the run, with GPU-level CELF detail folded into the Selection '
+                         'row. Equivalent to setting RULEST_PROFILE=1 (and implies the finer '
+                         'RULEST_CELF_PROFILE=1 GPU-event accounting); use for tuning, not '
+                         'for normal runs, since the CELF side adds a little per-call overhead.')
     args = ap.parse_args()
 
     state.ALLOW_REJECT_RULES = args.allow_reject_rules
     state.VERBOSE = args.debug
+    # Single switch for every profiling signal in the pipeline: the always-cheap
+    # per-stage wall-clock table (STAGE 0-3, bloom build, minimize, selection) and
+    # the heavier per-call GPU-event CELF accounting inside gpu_engine.py, which is
+    # itself gated on this same env var so it stays off unless asked for. Either the
+    # flag (-p/--profile) or the env var (for scripted/GUI launches that don't go
+    # through argparse) turns both on together -- no more needing to know there
+    # were two switches.
+    profiling_on = args.profile or os.environ.get("RULEST_PROFILE") == "1" or \
+                   os.environ.get("RULEST_CELF_PROFILE") == "1"
+    if profiling_on:
+        os.environ["RULEST_CELF_PROFILE"] = "1"
+    stage_profiler.configure(profiling_on)
     print_banner()
     _print_controls()
     if args.list_devices: list_devices(); sys.exit(0)
@@ -145,6 +172,7 @@ def main():
 
     _kb.start()
     t_start = time.time()
+    stage_profiler.begin_run()
     extractor = GPUExtractor(
         len(base_words), len(target_words), args.max_depth, args.device,
         args.target_hours, args.max_chains, args.seed_rules, args.bloom_mb,
@@ -176,7 +204,9 @@ def main():
     if _kb.quit_requested: log_warn("[QUIT]  Early exit — saving partial results")
     log_info(f"\n[GPU]  Raw bloom-filter candidates: {bold(cyan(str(len(raw_counts))))}"); print()
 
-    final_counts = minimize_by_signature(raw_counts, BUILTIN_PROBES)
+    with stage_profiler.track("Minimization (dedup)", unit="rule") as _mint:
+        final_counts = minimize_by_signature(raw_counts, BUILTIN_PROBES)
+        _mint.set_count(len(raw_counts))
     if ':' not in final_counts: final_counts[':'] = 0
 
     depth_dist = defaultdict(int)
@@ -220,15 +250,17 @@ def main():
         n_target = len(set(target_words))
         budget = args.select_budget if args.select_budget > 0 else None
 
-        selected, covered_mask = select_rules_by_marginal_coverage(
-            extractor.gpu_engine,
-            base_words,
-            target_words,
-            candidate_rules,
-            args.max_depth,
-            budget=budget,
-            cost_alpha=args.select_cost_alpha,
-        )
+        with stage_profiler.track("Selection (CELF greedy)", unit="candidate") as _selt:
+            selected, covered_mask = select_rules_by_marginal_coverage(
+                extractor.gpu_engine,
+                base_words,
+                target_words,
+                candidate_rules,
+                args.max_depth,
+                budget=budget,
+                cost_alpha=args.select_cost_alpha,
+            )
+            _selt.set_count(len(candidate_rules))
 
         ordered_rules = [rule for rule, _gain in selected]
         top_selected = list(selected)
@@ -322,6 +354,7 @@ def main():
                 log_info(f"       budget={b:>9,}  rules={len(sub):>9,}  -> {sub_path}")
 
     elapsed = time.time()-t_start
+    stage_profiler.report()
     sep = '─' * shutil.get_terminal_size((80,24)).columns
     print()
     log_info(cyan(sep))

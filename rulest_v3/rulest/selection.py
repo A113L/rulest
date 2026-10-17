@@ -20,6 +20,7 @@ import numpy as np
 # of looking stalled. Styling below is normalized to match the other phases'
 # real-tqdm bars (green desc, cyan postfix, same bar glyphs/format).
 from .progress import tqdm, ActivityHeartbeat  # CELF_PROGRESS_DIAGNOSTICS_PATCH_V2
+from .profiling import stage_profiler
 
 from .common import (
     MAX_CHAIN_STRING_LEN,
@@ -664,6 +665,19 @@ def select_rules_by_marginal_coverage(
                 scorer.gpu_engine.celf_report_profile()
             except Exception as exc:
                 log_warn(f"[CELF] Could not report GPU profile: {exc}")
+            # Fold the same GPU-event breakdown into the unified per-stage
+            # profiling table's "Selection (CELF greedy)" row (see cli.py,
+            # which wraps this whole function in stage_profiler.track(...))
+            # instead of only ever appearing in its own separate block above.
+            # Gated on `detailed` since building/formatting this string costs
+            # a little extra and is only useful when profiling was asked for.
+            if stage_profiler.detailed:
+                try:
+                    summary = scorer.gpu_engine.celf_profile_summary()
+                    if summary:
+                        stage_profiler.note("Selection (CELF greedy)", extra=summary)
+                except Exception as exc:
+                    log_warn(f"[CELF] Could not fold GPU profile into stage table: {exc}")
             try:
                 scorer.close()
             except Exception as exc:

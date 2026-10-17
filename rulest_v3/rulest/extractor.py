@@ -22,6 +22,7 @@ from .genetic import GeneticRuleEvolver
 from .token_strip import (
     extract_token_strip_rules, _log_token_strip_stats, _generate_toggle_chain_seeds,
 )
+from .profiling import stage_profiler
 
 class GPUExtractor:
     def __init__(self, base_count, target_count, max_depth, device_spec=None,
@@ -71,6 +72,29 @@ class GPUExtractor:
         except Exception as e: log_warn(f"Seed load failed: {e}")
         return seeds
 
+    def _note_gpu_phase(self, stage_name, source=None):
+        """Fold the just-finished GPU call's detailed host/event breakdown
+        (GpuPhaseProfile, same shape CELF's profiler uses) into `stage_name`'s
+        row in the unified profiling table. Call this right after a stage's
+        GPU call returns, before the next GPU-heavy call overwrites the
+        engine's `_last_gpu_phase_profile`. `source` defaults to
+        self.gpu_engine; STAGE 3 passes the GeneticRuleEvolver instead, since
+        its GPU time is accumulated across a whole run of generations rather
+        than attached to a single engine call. Silently does nothing when
+        the source has no such data (not profiling, or a MultiGPUEngine/
+        ProcessEngineProxy run that never populated it) -- the coarse
+        per-stage wall time keeps working regardless."""
+        getter = getattr(source if source is not None else self.gpu_engine,
+                          "last_gpu_phase_summary", None)
+        if getter is None:
+            return
+        try:
+            summary = getter()
+        except Exception:
+            return
+        if summary:
+            stage_profiler.note(stage_name, extra=summary)
+
     def extract_rules(self, base_words, target_words, **depth_overrides):
         all_counts = Counter()
         rules = self.rules_gen.generate_gpu_compatible_rules()
@@ -84,39 +108,41 @@ class GPUExtractor:
 
         if self.token_strip:
             log_section("STAGE 0 — Token-Strip Rule Extraction (Core + Insert)")
-            base_set_ts = set(base_words)
-            log_info(f"[S0]    {len(target_words):,} target words  base {len(base_set_ts):,}  min-stem={self.token_strip_min_stem}  prefix={self.token_strip_max_prefix}  suffix={self.token_strip_max_suffix}  leet-amb={self.token_strip_min_leet_amb}")
-            s0_max_depth = min(self.user_max_depth, MAX_HASHCAT_CHAIN)
-            ts_all = extract_token_strip_rules(target_words, base_set_ts, max_depth=s0_max_depth,
-                                               min_stem_len=self.token_strip_min_stem,
-                                               max_prefix_len=self.token_strip_max_prefix,
-                                               max_suffix_len=self.token_strip_max_suffix,
-                                               max_leet_ambiguity=self.token_strip_min_leet_amb,
-                                               workers=self.token_strip_workers,
-                                               chunk_size=self.token_strip_chunk_size)
-            for r in ts_all:
-                d = len(r.split())
-                if d==1: ts_singles.append(r)
-                else:
-                    if d <= self.user_max_depth:
-                        ts_chains.append(r)
-                        ts_sbd[d].add(r)
+            with stage_profiler.track("STAGE 0 — Token-Strip", unit="word") as _s0t:
+                base_set_ts = set(base_words)
+                log_info(f"[S0]    {len(target_words):,} target words  base {len(base_set_ts):,}  min-stem={self.token_strip_min_stem}  prefix={self.token_strip_max_prefix}  suffix={self.token_strip_max_suffix}  leet-amb={self.token_strip_min_leet_amb}")
+                s0_max_depth = min(self.user_max_depth, MAX_HASHCAT_CHAIN)
+                ts_all = extract_token_strip_rules(target_words, base_set_ts, max_depth=s0_max_depth,
+                                                   min_stem_len=self.token_strip_min_stem,
+                                                   max_prefix_len=self.token_strip_max_prefix,
+                                                   max_suffix_len=self.token_strip_max_suffix,
+                                                   max_leet_ambiguity=self.token_strip_min_leet_amb,
+                                                   workers=self.token_strip_workers,
+                                                   chunk_size=self.token_strip_chunk_size)
+                for r in ts_all:
+                    d = len(r.split())
+                    if d==1: ts_singles.append(r)
                     else:
-                        log_debug(f"[S0] Dropping chain depth {d} > user max depth {self.user_max_depth}: {r}")
-            _log_token_strip_stats(len(target_words), ts_all, inject_sbd=self.builtin_seeds)
-            if self.user_max_depth >= 2:
-                toggle_max_depth = min(12, self.user_max_depth)
-                toggle = _generate_toggle_chain_seeds(toggle_max_depth)
-                for tc in toggle:
-                    d = len(tc.split())
-                    if d>=2 and d <= self.user_max_depth:
-                        ts_chains.append(tc)
-                        ts_sbd.setdefault(d,set()).add(tc)
-                        n_s0_chains_to_stage2 += 1
-            ts_extra_singles = [r for r in ts_singles if r not in builtin_set]
-            if ts_chains:
-                all_seeds = list(all_seeds) + ts_chains
-            n_s0_chains_to_stage2 += len(ts_chains)
+                        if d <= self.user_max_depth:
+                            ts_chains.append(r)
+                            ts_sbd[d].add(r)
+                        else:
+                            log_debug(f"[S0] Dropping chain depth {d} > user max depth {self.user_max_depth}: {r}")
+                _log_token_strip_stats(len(target_words), ts_all, inject_sbd=self.builtin_seeds)
+                if self.user_max_depth >= 2:
+                    toggle_max_depth = min(12, self.user_max_depth)
+                    toggle = _generate_toggle_chain_seeds(toggle_max_depth)
+                    for tc in toggle:
+                        d = len(tc.split())
+                        if d>=2 and d <= self.user_max_depth:
+                            ts_chains.append(tc)
+                            ts_sbd.setdefault(d,set()).add(tc)
+                            n_s0_chains_to_stage2 += 1
+                ts_extra_singles = [r for r in ts_singles if r not in builtin_set]
+                if ts_chains:
+                    all_seeds = list(all_seeds) + ts_chains
+                n_s0_chains_to_stage2 += len(ts_chains)
+                _s0t.set_count(len(target_words))
 
         is_explicit_multi = (
             self.device_spec is not None
@@ -172,40 +198,53 @@ class GPUExtractor:
             log_warn("Empty wordlist(s), aborting extraction")
             return Counter()
         log_info("[GPU]  Building bloom filter on GPU …")
-        if not self.gpu_engine.compile_kernel(): return all_counts
-        bloom_filter = self.gpu_engine.generate_bloom_filter_gpu(target_words)
-        self.gpu_engine.upload_bloom_filter(bloom_filter)
+        with stage_profiler.track("Bloom filter build", unit="word") as _bft:
+            if not self.gpu_engine.compile_kernel(): return all_counts
+            bloom_filter = self.gpu_engine.generate_bloom_filter_gpu(target_words)
+            self.gpu_engine.upload_bloom_filter(bloom_filter)
+            _bft.set_count(len(target_words))
+            self._note_gpu_phase("Bloom filter build")
 
         log_section("STAGE 1 — Single Rule Search")
         seed_note = f"  ({len(extra_valid)} from seeds)" if extra_valid else ""
         log_info(f"[S1]    {len(base_words):,} base words × {len(rules_phase1):,} atomic rules{seed_note}")
         t0 = time.time()
-        single = self.gpu_engine.process_all_words_single_rule(base_words, rules_phase1, bloom_filter)
+        with stage_profiler.track("STAGE 1 — Single Rule Search", unit="combo") as _s1t:
+            single = self.gpu_engine.process_all_words_single_rule(base_words, rules_phase1, bloom_filter)
+            _s1t.set_count(len(base_words) * len(rules_phase1))
+            self._note_gpu_phase("STAGE 1 — Single Rule Search")
         t1 = time.time()
         all_counts.update(single)
 
         seed_hits = Counter()
         if self.builtin_seeds and not _kb.poll():
             log_section("STAGE S — Seed Extraction (families A-M)")
-            sbd = self.gpu_engine.build_numeric_seed_families(max_depth=seed_pass_depth)
-            if ts_sbd:
-                n_injected = 0
-                n_ts_total = 0
-                for depth, chains in ts_sbd.items():
-                    n_ts_total += len(chains)
-                    before = len(sbd.setdefault(depth, set()))
-                    sbd[depth].update(chains)
-                    n_injected += len(sbd[depth]) - before
-                n_dupes = n_ts_total - n_injected
-                dupe_str = f"  ({n_dupes:,} already in builtin families)" if n_dupes else ""
-                if n_injected:
-                    log_info(f"[SEED]    STAGE 0 injected {bold(cyan(str(n_injected)))} chain(s) into STAGE S sbd{dupe_str}")
-            seed_hits = self.gpu_engine.run_seed_extraction_pass(base_words, sbd, bloom_filter, rules_phase1)
-            all_counts.update(seed_hits)
+            with stage_profiler.track("STAGE S — Seed Extraction") as _sst:
+                sbd = self.gpu_engine.build_numeric_seed_families(max_depth=seed_pass_depth)
+                if ts_sbd:
+                    n_injected = 0
+                    n_ts_total = 0
+                    for depth, chains in ts_sbd.items():
+                        n_ts_total += len(chains)
+                        before = len(sbd.setdefault(depth, set()))
+                        sbd[depth].update(chains)
+                        n_injected += len(sbd[depth]) - before
+                    n_dupes = n_ts_total - n_injected
+                    dupe_str = f"  ({n_dupes:,} already in builtin families)" if n_dupes else ""
+                    if n_injected:
+                        log_info(f"[SEED]    STAGE 0 injected {bold(cyan(str(n_injected)))} chain(s) into STAGE S sbd{dupe_str}")
+                seed_hits = self.gpu_engine.run_seed_extraction_pass(base_words, sbd, bloom_filter, rules_phase1)
+                all_counts.update(seed_hits)
+                _sst.set_count(sum(len(v) for v in sbd.values()), unit="chain")
+                self._note_gpu_phase("STAGE S — Seed Extraction")
             ts = time.time()
         else:
-            if _kb.quit_requested: log_warn("[SEED]    Skipped — early exit")
-            else: log_info(f"[SEED]    {yellow('Skipped')} (--no-builtin-seeds)")
+            if _kb.quit_requested:
+                log_warn("[SEED]    Skipped — early exit")
+                stage_profiler.note("STAGE S — Seed Extraction", extra="skipped: early exit")
+            else:
+                log_info(f"[SEED]    {yellow('Skipped')} (--no-builtin-seeds)")
+                stage_profiler.note("STAGE S — Seed Extraction", extra="skipped: --no-builtin-seeds")
             sbd = {}
             ts = t1
 
@@ -267,10 +306,16 @@ class GPUExtractor:
             # reads CHAIN_GEN_LIMIT_* as 0, generates ~no chains, and STAGE 2
             # finishes suspiciously fast with an almost-empty result.
             self.gpu_engine.params = self.params
-            chains = self.gpu_engine.process_all_words_chain_rules(base_words, rules_phase1, self.user_max_depth,
-                                                                   bloom_filter, single, seed_chains=seed_chains,
-                                                                   prebuilt_sbd=sbd)
+            with stage_profiler.track("STAGE 2 — Rule Chain Search", unit="chain") as _s2t:
+                chains = self.gpu_engine.process_all_words_chain_rules(base_words, rules_phase1, self.user_max_depth,
+                                                                       bloom_filter, single, seed_chains=seed_chains,
+                                                                       prebuilt_sbd=sbd)
+                _s2t.set_count(sum(depth_budgets.values()))
+                self._note_gpu_phase("STAGE 2 — Rule Chain Search")
             all_counts.update(chains)
+        else:
+            reason = "early exit" if _kb.poll() else ("no usable GPU" if no_gpu_left else "--max-depth 1")
+            stage_profiler.note("STAGE 2 — Rule Chain Search", extra=f"skipped: {reason}")
 
         if self.genetic and self.user_max_depth >= 2 and not _kb.poll() and not no_gpu_left:
             log_section("STAGE 3 — Genetic Algorithm Rule Evolution")
@@ -304,7 +349,10 @@ class GPUExtractor:
             evolver = GeneticRuleEvolver(self.gpu_engine, base_words, rule_pool, self.user_max_depth,
                                          pop_size=self.genetic_pop, elite_frac=self.genetic_elite,
                                          seed_hits=seed_hits, known_rules=known_set)
-            ga_hits = evolver.evolve(hot_rules, self.genetic_generations, ga_budget)
+            with stage_profiler.track("STAGE 3 — Genetic Algorithm", unit="gen") as _s3t:
+                ga_hits = evolver.evolve(hot_rules, self.genetic_generations, ga_budget)
+                _s3t.set_count(self.genetic_generations)
+                self._note_gpu_phase("STAGE 3 — Genetic Algorithm", source=evolver)
             before = len(all_counts)
             all_counts.update(ga_hits)
             new_from_ga = len(all_counts)-before

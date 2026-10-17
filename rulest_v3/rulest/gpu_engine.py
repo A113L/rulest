@@ -30,6 +30,7 @@ from .hashing import fnv1a64_batch, build_indexed_open_addressing_table, table_s
 from .kernel_source import GPU_KERNEL_TEMPLATE
 from .progress import ActivityHeartbeat  # CELF_PROGRESS_DIAGNOSTICS_PATCH_V2
 from . import hashing as _rulest_hashing
+from .profiling import GpuPhaseProfile
 
 class _KernelBuildTimeout(Exception):
     """Raised by GPUEngine._safe_build_program when the OpenCL driver's
@@ -376,6 +377,9 @@ class GPUEngine:
         log_info(f"[BLOOM] GPU build: {total_bytes//1024//1024}MB, {nw} words, {ns} shards")
         mf = cl.mem_flags
         bufs = []
+        _profile = GpuPhaseProfile() if os.environ.get("RULEST_CELF_PROFILE") == "1" else None
+        self._last_gpu_phase_profile = _profile
+        _alloc_t0 = time.perf_counter() if _profile is not None else None
         try:
             wf, wo, wl = self._flatten(target_words)
             words_buf = cl.Buffer(self.context, mf.READ_ONLY|mf.COPY_HOST_PTR, hostbuf=wf)
@@ -386,10 +390,17 @@ class GPUEngine:
             bf_init = np.zeros(bf_int32_size, dtype=np.int32)
             bf_buf = cl.Buffer(self.context, mf.READ_WRITE|mf.COPY_HOST_PTR, hostbuf=bf_init)
             bufs.append(bf_buf)  # register for cleanup on exception; removed below on success
+            if _profile is not None:
+                _host_alloc_s = time.perf_counter() - _alloc_t0
+                _enqueue_t0 = time.perf_counter()
             gs = ((nw + self.local_work_size - 1) // self.local_work_size) * self.local_work_size
             self.kernel_bloom.set_args(words_buf, offsets_buf, lengths_buf, np.int32(nw), bf_buf)
-            cl.enqueue_nd_range_kernel(self.queue, self.kernel_bloom, (gs,), (self.local_work_size,))
+            kev = cl.enqueue_nd_range_kernel(self.queue, self.kernel_bloom, (gs,), (self.local_work_size,))
+            if _profile is not None:
+                _host_enqueue_s = time.perf_counter() - _enqueue_t0
+                _wait_t0 = time.perf_counter()
             if not self._safe_queue_finish(): raise RuntimeError("queue finish timeout")
+            if _profile is not None: _wait_wall_s = time.perf_counter() - _wait_t0
             # Verify the GPU actually wrote something non-trivial before trusting
             # this buffer. A bloom filter can legitimately have a very low fill
             # ratio (e.g. fill=0.001% on a large --bloom-mb with a small
@@ -401,7 +412,10 @@ class GPUEngine:
             # build, not per batch) and gives an exact answer instead of a
             # statistical guess.
             verify = np.empty(bf_int32_size, dtype=np.int32)
-            cl.enqueue_copy(self.queue, verify, bf_buf)
+            dev = cl.enqueue_copy(self.queue, verify, bf_buf)
+            if _profile is not None:
+                _profile.add_call(items=nw, host_alloc=_host_alloc_s, host_enqueue=_host_enqueue_s,
+                                   wait=_wait_wall_s, kernel_events=[kev], d2h_events=[dev])
             all_zero = np.count_nonzero(verify) == 0
             del verify
             if all_zero and nw > 0:
@@ -488,6 +502,12 @@ class GPUEngine:
         ncols = shutil.get_terminal_size((80,24)).columns
         t0 = time.time(); words_done = 0; nr = len(self.gpu_rules)
         desc = f"  STAGE 1 [{_label}] " if _label else "  STAGE 1 "
+        # Only built when --profile is on (RULEST_CELF_PROFILE=1): the same
+        # host/GPU-event breakdown CELF already reports, now for STAGE 1 too.
+        # Stored on self so extractor.py can fold it into the unified
+        # per-stage profiling table right after this call returns.
+        _profile = GpuPhaseProfile() if os.environ.get("RULEST_CELF_PROFILE") == "1" else None
+        self._last_gpu_phase_profile = _profile
         with tqdm(total=len(base_words), desc=green(desc), unit="word", ncols=ncols,
                   bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}",
                   disable=_silent, position=_position, leave=True) as pbar:
@@ -495,7 +515,7 @@ class GPUEngine:
                 if _kb.poll(): break
                 batch = base_words[i:i+bs]
                 if batch:
-                    found = self._run_single_kernel(self.prepare_words_data(batch))
+                    found = self._run_single_kernel(self.prepare_words_data(batch), _profile=_profile)
                     if found:
                         self._consecutive_errors = 0
                         counter.update(found)
@@ -517,10 +537,11 @@ class GPUEngine:
         log_info(f"[S1]    {bold(green(str(len(counter))))} unique rules passed bloom filter")
         return counter
 
-    def _run_single_kernel(self, bd):
+    def _run_single_kernel(self, bd, _profile=None):
         if not self.context or not self.queue or not self.kernel_single:
             return []
         mf = cl.mem_flags; bufs = []
+        _alloc_t0 = time.perf_counter() if _profile is not None else None
         try:
             def B(arr, f=mf.READ_ONLY):
                 b = cl.Buffer(self.context, f|mf.COPY_HOST_PTR, hostbuf=arr); bufs.append(b); return b
@@ -529,23 +550,40 @@ class GPUEngine:
             outs = self.safe_output_buffer_size(bd['num_words'], bd['num_rules'])
             fo = cl.Buffer(self.context, mf.WRITE_ONLY, outs*MAX_CHAIN_STRING_LEN); bufs.append(fo)
             fc = cl.Buffer(self.context, mf.READ_WRITE, 4); bufs.append(fc)
-            cl.enqueue_copy(self.queue, fc, np.array([0], dtype=np.int32))
+            if _profile is not None:
+                _host_alloc_s = time.perf_counter() - _alloc_t0
+                _enqueue_t0 = time.perf_counter()
+                _h2d_events = []; _kernel_events = []; _d2h_events = []
+            ev = cl.enqueue_copy(self.queue, fc, np.array([0], dtype=np.int32))
+            if _profile is not None: _h2d_events.append(ev)
             tot = bd['num_words'] * bd['num_rules']
             gs = ((tot+self.local_work_size-1)//self.local_work_size)*self.local_work_size
             self.kernel_single.set_args(bb, bbo, bbl, rb, rbo, rbl, self.bloom_buf,
                                         np.int32(bd['num_words']), np.int32(bd['num_rules']), fo, fc)
-            cl.enqueue_nd_range_kernel(self.queue, self.kernel_single, (gs,), (self.local_work_size,))
+            kev = cl.enqueue_nd_range_kernel(self.queue, self.kernel_single, (gs,), (self.local_work_size,))
+            if _profile is not None:
+                _kernel_events.append(kev)
+                _host_enqueue_s = time.perf_counter() - _enqueue_t0
+                _wait_t0 = time.perf_counter()
             if not self._safe_queue_finish():
                 self._reset_gpu(RuntimeError("queue.finish() timed out or failed"))
                 return []
-            cnt = np.zeros(1, dtype=np.int32); cl.enqueue_copy(self.queue, cnt, fc)
+            if _profile is not None: _wait_wall_s = time.perf_counter() - _wait_t0
+            cnt = np.zeros(1, dtype=np.int32); cev = cl.enqueue_copy(self.queue, cnt, fc)
+            if _profile is not None: _d2h_events.append(cev)
             n = min(cnt[0], outs); out = []
             if n>0:
                 data = np.zeros(n*MAX_CHAIN_STRING_LEN, dtype=np.uint8)
-                cl.enqueue_copy(self.queue, data, fo)
+                dev = cl.enqueue_copy(self.queue, data, fo)
+                if _profile is not None: _d2h_events.append(dev)
                 for i in range(n):
                     r = bytes(data[i*MAX_CHAIN_STRING_LEN:(i+1)*MAX_CHAIN_STRING_LEN]).split(b'\0')[0].decode('latin-1', errors='ignore')
                     if r: out.append(r)
+            if _profile is not None:
+                _profile.add_call(items=bd['num_words'] * bd['num_rules'],
+                                   host_alloc=_host_alloc_s, host_enqueue=_host_enqueue_s,
+                                   wait=_wait_wall_s, kernel_events=_kernel_events,
+                                   h2d_events=_h2d_events, d2h_events=_d2h_events)
             return out
         except Exception as e:
             log_warn(f"Single kernel error: {e}")
@@ -732,8 +770,10 @@ class GPUEngine:
         depth_range_str = (f"d{d_levels[0]}–d{d_levels[-1]}" if len(d_levels) > 1
                            else (f"d{d_levels[0]}" if d_levels else "none"))
         log_info(f"[SEED]    Numeric seed pass: {total:,} chains across {len(d_levels)} depth level(s) ({depth_range_str})")
+        _profile = GpuPhaseProfile() if os.environ.get("RULEST_CELF_PROFILE") == "1" else None
+        self._last_gpu_phase_profile = _profile
         counter = self._run_chains_against_words(base_words, multi, "  SEED PASS ", _silent,
-                                                   _position=_position, _label=_label)
+                                                   _position=_position, _label=_label, _profile=_profile)
         log_info(f"[SEED]    {bold(green(str(len(counter))))} unique seed chains passed bloom filter")
         return counter
 
@@ -765,14 +805,16 @@ class GPUEngine:
             self.rule_index = {r:i for i,r in enumerate(self.gpu_rules)}
         chains = self.generate_informed_chains(rules, single_counter, max_depth, seed_chains, prebuilt_sbd)
         if not chains: return Counter()
+        _profile = GpuPhaseProfile() if os.environ.get("RULEST_CELF_PROFILE") == "1" else None
+        self._last_gpu_phase_profile = _profile
         counter = self._run_chains_against_words(base_words, chains, "  STAGE 2 ", _silent,
-                                                   _position=_position, _label=_label)
+                                                   _position=_position, _label=_label, _profile=_profile)
         log_info(f"[S2]    {bold(green(str(len(counter))))} unique chain rules passed bloom filter")
         return counter
 
     def _run_chains_against_words(self, base_words, chains, desc="  CHAINS  ", _silent=False,
                                    _shared_combos=None, _shared_lock=None, _position=None,
-                                   _label=None):
+                                   _label=None, _profile=None):
         """Shared inner loop: iterate chain batches x word sub-batches, collect matches.
         Uses the same pre-flattened word-batch fast path the original seed-extraction
         pass used (set_base_words/get_word_batch_data), avoiding repeated
@@ -797,7 +839,7 @@ class GPUEngine:
                     end = min(wi + wsb, len(base_words))
                     bd = self.get_word_batch_data(wi, end)
                     if bd['num_words'] == 0: continue
-                    found = self._run_chain_kernel(bd, cb, (seqs, depths))
+                    found = self._run_chain_kernel(bd, cb, (seqs, depths), _profile=_profile)
                     if found is None:
                         self._consecutive_errors += 1
                         if self._consecutive_errors >= self._MAX_CONSECUTIVE_ERRORS:
@@ -821,7 +863,7 @@ class GPUEngine:
                 pbar.update(1)
         return counter
 
-    def evaluate_chains_for_ga(self, chains):
+    def evaluate_chains_for_ga(self, chains, _profile=None):
         """Stage 3 (genetic) companion to _run_chains_against_words above. Runs the
         full chain-batch x word-sub-batch sweep for one engine's slice of chains
         against whatever base_words were already cached via set_base_words(), and
@@ -845,7 +887,7 @@ class GPUEngine:
                 end = min(wi + wsb, n_words_total)
                 bd = self.get_word_batch_data(wi, end)
                 if bd['num_words'] == 0: continue
-                found = self._run_chain_kernel(bd, cb, (seqs, depths), return_word_idx=True)
+                found = self._run_chain_kernel(bd, cb, (seqs, depths), return_word_idx=True, _profile=_profile)
                 if found:
                     for local_idx, rule_str in found:
                         hit_words[rule_str].add(wi + local_idx)
@@ -873,7 +915,7 @@ class GPUEngine:
             log_warn(f"[GPU] {truncated} chain(s) truncated to max depth {maxd}")
         return seqs, depths
 
-    def _run_chain_kernel(self, words, chains, _precomputed=None, return_word_idx=False):
+    def _run_chain_kernel(self, words, chains, _precomputed=None, return_word_idx=False, _profile=None):
         # `words` may be either a raw list of word strings, or an already-flattened
         # batch dict as returned by get_word_batch_data()/prepare_words_data() —
         # accept both so callers can pre-flatten once (SEED PASS) and avoid re-flattening
@@ -897,6 +939,7 @@ class GPUEngine:
         if n_words == 0 or not chains:
             return []
         mf = cl.mem_flags; bufs = []
+        _alloc_t0 = time.perf_counter() if _profile is not None else None
         try:
             def B(arr, f=mf.READ_ONLY):
                 b = cl.Buffer(self.context, f|mf.COPY_HOST_PTR, hostbuf=arr); bufs.append(b); return b
@@ -910,30 +953,52 @@ class GPUEngine:
             # now part of the compiled kernel's fixed signature; only decoded when the caller
             # (Stage 3 GA marginal-coverage fitness) actually needs per-word hit identity.
             fw = cl.Buffer(self.context, mf.WRITE_ONLY, outs*4); bufs.append(fw)
-            cl.enqueue_copy(self.queue, fc, np.array([0], dtype=np.int32))
+            if _profile is not None:
+                _host_alloc_s = time.perf_counter() - _alloc_t0
+                _enqueue_t0 = time.perf_counter()
+                _h2d_events = []; _kernel_events = []; _d2h_events = []
+            ev = cl.enqueue_copy(self.queue, fc, np.array([0], dtype=np.int32))
+            if _profile is not None: _h2d_events.append(ev)
             tot = n_words*len(chains)
             gs = ((tot+self.local_work_size-1)//self.local_work_size)*self.local_work_size
             self.kernel_chain.set_args(bb, bbo, bbl, rb, rbo, rbl, csb, cdb, self.bloom_buf,
                                        np.int32(n_words), np.int32(len(chains)),
                                        np.int32(self.params['MAX_CHAIN_DEPTH']), fo, fc, fw)
-            cl.enqueue_nd_range_kernel(self.queue, self.kernel_chain, (gs,), (self.local_work_size,))
+            kev = cl.enqueue_nd_range_kernel(self.queue, self.kernel_chain, (gs,), (self.local_work_size,))
+            if _profile is not None:
+                _kernel_events.append(kev)
+                _host_enqueue_s = time.perf_counter() - _enqueue_t0
+                _wait_t0 = time.perf_counter()
             if not self._safe_queue_finish():
                 self._reset_gpu(RuntimeError("queue.finish() timed out or failed"))
                 return None
-            cnt = np.zeros(1, dtype=np.int32); cl.enqueue_copy(self.queue, cnt, fc)
+            if _profile is not None: _wait_wall_s = time.perf_counter() - _wait_t0
+            cnt = np.zeros(1, dtype=np.int32); cev = cl.enqueue_copy(self.queue, cnt, fc)
+            if _profile is not None: _d2h_events.append(cev)
             n = min(cnt[0], outs)
+
+            def _finish_profile(extra_events=()):
+                if _profile is not None:
+                    _profile.add_call(items=n_words * len(chains), host_alloc=_host_alloc_s,
+                                       host_enqueue=_host_enqueue_s, wait=_wait_wall_s,
+                                       kernel_events=_kernel_events, h2d_events=_h2d_events,
+                                       d2h_events=list(_d2h_events) + list(extra_events))
+
             if n<=0:
+                _finish_profile()
                 return []
             data = np.zeros(n*MAX_CHAIN_STRING_LEN, dtype=np.uint8)
-            cl.enqueue_copy(self.queue, data, fo)
+            dev = cl.enqueue_copy(self.queue, data, fo)
             if return_word_idx:
                 widx = np.zeros(n, dtype=np.int32)
-                cl.enqueue_copy(self.queue, widx, fw)
+                wev = cl.enqueue_copy(self.queue, widx, fw)
+                _finish_profile((dev, wev))
                 out = []
                 for i in range(n):
                     r = bytes(data[i*MAX_CHAIN_STRING_LEN:(i+1)*MAX_CHAIN_STRING_LEN]).split(b'\0')[0].decode('latin-1', errors='ignore')
                     if r: out.append((int(widx[i]), r))
                 return out
+            _finish_profile((dev,))
             out = []
             for i in range(n):
                 r = bytes(data[i*MAX_CHAIN_STRING_LEN:(i+1)*MAX_CHAIN_STRING_LEN]).split(b'\0')[0].decode('latin-1', errors='ignore')
@@ -1352,9 +1417,21 @@ class GPUEngine:
                 _alloc_t0 = time.perf_counter()
                 host_slots = np.zeros(n_hits, dtype=np.int32)
                 _host_alloc_s += time.perf_counter() - _alloc_t0
+                # get_sub_region(0, n_hits * 4) used to be called here on
+                # every singleton exact-rescore -- offset is always 0, only
+                # the length varies, so this was creating a brand-new
+                # sub-buffer object (a real clCreateSubBuffer driver call,
+                # not a free Python view) on every one of these calls.
+                # Profiling the equivalent pattern in ranker's CELF GPU path
+                # found that driver-side cost dominant enough that caching
+                # just the *buffer object* cut that call's time by ~8x. Here
+                # the size varies every call (n_hits), so it can't be cached
+                # the same way -- but since the offset is always 0, the
+                # sub-buffer wrapper isn't needed at all: enqueue_copy()
+                # reads however many bytes host_slots.nbytes asks for,
+                # starting at device_offset=0, directly from the buffer.
                 event = cl.enqueue_copy(
-                    self.queue, host_slots,
-                    self._celf_hit_slots_buf.get_sub_region(0, n_hits * 4),
+                    self.queue, host_slots, self._celf_hit_slots_buf,
                     is_blocking=False,
                 )
                 if _profile_on: _read_events.append(event)
@@ -1410,9 +1487,12 @@ class GPUEngine:
         if host_slots is None:
             if n_hits:
                 host = np.zeros(n_hits, dtype=np.int32)
+                # Same get_sub_region() removal as celf_score_chains_gpu
+                # above -- offset is always 0 here too, so skip the
+                # per-call sub-buffer object and copy straight from the
+                # buffer.
                 event = cl.enqueue_copy(
-                    self.queue, host,
-                    self._celf_hit_slots_buf.get_sub_region(0, n_hits * 4),
+                    self.queue, host, self._celf_hit_slots_buf,
                     is_blocking=False,
                 )
                 event.wait()
@@ -1483,17 +1563,39 @@ class GPUEngine:
         self._celf_active_version = getattr(self, "_celf_active_version", 0) + 1
         self._celf_last_single_cache = None
 
-    def celf_report_profile(self):
-        """Log recompute costs by host enqueue, GPU events and synchronization."""
-        if os.environ.get("RULEST_CELF_PROFILE") != "1":
-            return
+    def last_gpu_phase_summary(self):
+        """Format the GpuPhaseProfile from whichever GPU-heavy call most
+        recently ran on this engine (bloom build, STAGE 1, STAGE S, STAGE 2,
+        or STAGE 3's per-generation scoring) the same way
+        `celf_profile_summary()` formats CELF's -- so every stage's detailed
+        row in the unified profiling table looks the same. The caller
+        (extractor.py / genetic.py) must fetch this right after the call it
+        wants the breakdown for, before the next GPU-heavy call overwrites
+        `_last_gpu_phase_profile`. Returns None when profiling wasn't on for
+        that call (so nothing was collected), including on MultiGPUEngine,
+        which doesn't define this method at all and is skipped via
+        getattr(..., None) at the call sites -- the coarse per-stage wall
+        time from StageProfiler still shows up either way, just without
+        this GPU-event detail in multi-GPU mode."""
+        prof = getattr(self, "_last_gpu_phase_profile", None)
+        if prof is None:
+            return None
+        return prof.summary()
+
+    def celf_profile_summary(self):
+        """Build the CELF recompute-cost breakdown as a single formatted
+        string (host enqueue, GPU events, synchronization), without logging
+        it. Shared by `celf_report_profile()` (periodic/standalone log line)
+        and by selection.py, which folds this same string into the unified
+        per-stage profiling table's "Selection (CELF greedy)" row instead
+        of printing a second, separate block. Returns None if no scoring
+        calls were collected yet."""
         p = getattr(self, "_celf_profile", {})
         if not p or not p.get("calls"):
-            log_info("[CELF PROFILE] no scoring calls collected")
-            return
+            return None
         calls = max(1, int(p["calls"]))
-        log_info(
-            "[CELF PROFILE] score calls={calls:,} (batch={batch:,}, singleton={single:,}), "
+        return (
+            "score calls={calls:,} (batch={batch:,}, singleton={single:,}), "
             "candidates={candidates:,}; wall={wall:.3f}s; host alloc={alloc:.3f}s; host enqueue={enqueue:.3f}s; "
             "GPU kernel={kernel:.3f}s; H2D={h2d:.3f}s; fills={fills:.3f}s; "
             "readback={readback:.3f}s; synchronization wait={wait:.3f}s; "
@@ -1506,6 +1608,20 @@ class GPUEngine:
                 avg=1000.0 * float(p["wall_s"]) / calls,
             )
         )
+
+    def celf_report_profile(self):
+        """Log recompute costs by host enqueue, GPU events and synchronization.
+        Used for the periodic in-flight heartbeat (every 10s of CELF scoring,
+        see the call site in this file) -- the final tally at the end of
+        selection goes through `celf_profile_summary()` into the unified
+        stage table instead, so it isn't printed twice."""
+        if os.environ.get("RULEST_CELF_PROFILE") != "1":
+            return
+        summary = self.celf_profile_summary()
+        if summary is None:
+            log_info("[CELF PROFILE] no scoring calls collected")
+            return
+        log_info(f"[CELF PROFILE] {summary}")
 
     def celf_release_target_table(self):
         """Release GPU-resident CELF table and associated host lookup state."""

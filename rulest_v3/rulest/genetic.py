@@ -4,6 +4,7 @@ the GPU-scored fitness of how many target words they explain, using
 diversity-aware selection (Jaccard distance over covered-word signatures)
 to avoid collapsing onto near-duplicate high-scoring chains.
 """
+import os
 import time
 import shutil
 import random
@@ -21,6 +22,8 @@ from .common import (
 )
 from .minimize import compute_rule_signature_hash
 from .multi_gpu import MultiGPUEngine
+from .gpu_worker import ProcessEngineProxy
+from .profiling import GpuPhaseProfile
 
 class GeneticRuleEvolver:
     def __init__(self, gpu_engine, base_words, rule_pool, max_depth,
@@ -53,6 +56,16 @@ class GeneticRuleEvolver:
         self.active_words = base_words
         self._sample_offset = 0
         self._ga_cached_engines = {}
+        # Only built when --profile is on (RULEST_CELF_PROFILE=1): the same
+        # host/GPU-event breakdown CELF and STAGE 1/S/2 already report, now
+        # accumulated across this whole GA run (every generation x engine
+        # call adds to the same accumulator, unlike STAGE 1/S/2 which get a
+        # fresh one per stage) since a single generation's GPU time is too
+        # small to be a useful row on its own. Only ever passed to in-process
+        # engines -- see _eval_on_engine -- so multi-GPU setups with
+        # ProcessEngineProxy workers just don't get this detail (the coarse
+        # STAGE 3 wall-time row from StageProfiler still shows up either way).
+        self._gpu_profile = GpuPhaseProfile() if os.environ.get("RULEST_CELF_PROFILE") == "1" else None
         # -- Feature: parsimony pressure (Occam's razor) --
         # Divides fitness by (1 + parsimony_alpha*(depth-2)) so that among two
         # chains with equal marginal coverage, the shorter one wins ties. Keeps
@@ -332,7 +345,16 @@ class GeneticRuleEvolver:
         raising: a KeyError here would blow up an entire multi-hour GPU
         sweep over what's fundamentally bad data for a handful of chains.
         """
-        result = eng.evaluate_chains_for_ga(chains)
+        # Pass the accumulator only to a real in-process GPUEngine -- a
+        # ProcessEngineProxy call crosses a process boundary, so mutating a
+        # GpuPhaseProfile object inside it wouldn't be visible back here
+        # anyway (the proxy would need to serialize the accumulated numbers
+        # back, which it doesn't do). Single-GPU runs are the common case
+        # this detail is meant for.
+        if self._gpu_profile is not None and not isinstance(eng, ProcessEngineProxy):
+            result = eng.evaluate_chains_for_ga(chains, _profile=self._gpu_profile)
+        else:
+            result = eng.evaluate_chains_for_ga(chains)
         for rule_str, idx_set in result.items():
             bucket = hit_words.get(rule_str)
             if bucket is None:
@@ -343,6 +365,17 @@ class GeneticRuleEvolver:
                 )
                 continue
             bucket |= idx_set
+
+    def last_gpu_phase_summary(self):
+        """Format this GA run's accumulated GpuPhaseProfile the same way
+        gpu_engine.py's `celf_profile_summary()`/`last_gpu_phase_summary()`
+        format theirs, for extractor.py to fold into the unified per-stage
+        table's "STAGE 3 — Genetic Algorithm" row. None if profiling wasn't
+        on, or if every generation ran on a ProcessEngineProxy (multi-GPU)
+        and nothing was ever recorded in-process."""
+        if self._gpu_profile is None:
+            return None
+        return self._gpu_profile.summary()
 
     def _ensure_base_words_cached(self, eng):
         # Cache the flattened active_words once per engine per distinct word set
