@@ -416,20 +416,75 @@ def _celf_select_from_upper_bounds(
             if bound:
                 heapq.heappush(heap, (-priority(bound, index), int(index), bound))
 
+        def score_seed_batch(seed_indices):
+            """Exact-score several top-of-heap candidates TOGETHER as this
+            round's seed, instead of scoring the single top candidate alone.
+
+            Profiling showed the single-seed version (one `score_exact_batch_fn`
+            call per round, each covering exactly one candidate) was the
+            dominant source of unbatched GPU dispatches once the stale-bound
+            batch path above was already fast: `synchronization wait` ran
+            ~67-76% of wall time because each round paid for its own
+            `clEnqueueNDRangeKernel` + blocking wait just to learn one
+            candidate's exact gain. Coverage is not committed until this
+            round's actual winner is chosen (after the inner while-loop
+            below), so scoring several top-ranked candidates against the
+            same `covered` snapshot up front is exactly as correct as
+            scoring them one at a time across consecutive rounds -- it just
+            replaces several small GPU launches with one larger one. Losers
+            are pushed back with their now-exact gain, which remains a valid
+            admissible bound in every later round (coverage only shrinks).
+
+            Returns (best_index, best_gain, best_ids=None) for the batch's
+            winner, or (None, 0, None) if every scored candidate was dead
+            (zero exact gain).
+            """
+            nonlocal exact_gain_only
+            exact_gain_only += len(seed_indices)
+            if on_scan_progress is None:
+                gains = score_exact_batch_fn(seed_indices, covered)
+            else:
+                gains = score_exact_batch_fn(seed_indices, covered, report_scan)
+            if len(gains) != len(seed_indices):
+                raise RuntimeError("CELF exact batch scorer returned the wrong number of gains")
+            report_scan()
+            winner_index, winner_gain = None, -1
+            for index, raw_gain in zip(seed_indices, gains):
+                gain = max(0, int(raw_gain))
+                if winner_index is None or gain > winner_gain or (gain == winner_gain and index < winner_index):
+                    if winner_index is not None:
+                        push(winner_index, winner_gain)
+                    winner_index, winner_gain = index, gain
+                else:
+                    push(index, gain)
+            if winner_gain <= 0:
+                return None, 0, None
+            return winner_index, winner_gain, None
+
         while heap and len(selected) < limit:
-            # Start each round with the strongest outstanding bound, but never
-            # assume that its upper bound is the exact gain.
-            _neg_seed_priority, seed_index, _seed_bound = heapq.heappop(heap)
-            seed_index = int(seed_index)
-            # Cheap exact-gain-only check first (see exact_gain()): most
-            # seeds popped off a duplicate-heavy raw-bound heap turn out to
-            # have a losing or zero exact gain, so this avoids paying for a
-            # full hit-recording scan on every single one of them.
-            best_gain, best_ids = exact_gain(seed_index)
-            if best_gain <= 0:
-                # Marginal gain can only shrink; zero-gain candidates are dead.
-                continue
-            best_index = seed_index
+            # Start each round with the strongest outstanding bound(s), but
+            # never assume a raw bound is the exact gain.
+            if score_exact_batch_fn is None:
+                # CPU/legacy fallback: exact-score exactly the single top
+                # candidate, unchanged from the original behaviour.
+                _neg_seed_priority, seed_index, _seed_bound = heapq.heappop(heap)
+                seed_index = int(seed_index)
+                best_gain, best_ids = exact_gain(seed_index)
+                if best_gain <= 0:
+                    # Marginal gain can only shrink; zero-gain candidates are dead.
+                    continue
+                best_index = seed_index
+            else:
+                seed_indices = []
+                while heap and len(seed_indices) < batch_size:
+                    _neg_p, index, _bound = heapq.heappop(heap)
+                    seed_indices.append(int(index))
+                current_batch_size = len(seed_indices)
+                best_index, best_gain, best_ids = score_seed_batch(seed_indices)
+                if best_index is None:
+                    # Every candidate in this seed batch was dead (zero exact
+                    # gain); pop the next batch and try again.
+                    continue
             fresh_this_round = set()
 
             while heap:
