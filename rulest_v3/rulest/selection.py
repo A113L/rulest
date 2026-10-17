@@ -177,6 +177,16 @@ _FNV1A64_PRIME = 1099511628211
 _UINT64_MASK = (1 << 64) - 1
 
 
+class _CelfExactBatchMismatch(RuntimeError):
+    """Signals that GPU batched exact gains failed winner-scan verification.
+
+    The partially completed greedy run must be discarded and restarted from an
+    empty active-target bitmap with batched exact rescoring disabled. Continuing
+    with the suspect gains could violate CELF's admissible-bound invariant.
+    """
+
+
+
 def _fingerprint64(text: str) -> int:
     """Stable 64-bit FNV-1a fingerprint over Rulest's byte encoding (Latin-1)."""
     value = _FNV1A64_OFFSET
@@ -233,16 +243,16 @@ class _ConstantCosts:
 def _celf_select_from_upper_bounds(
     rules, upper_bounds, target_count, score_fn, budget=None, cost_alpha=0.0,
     on_select=None, score_batch_fn=None, rescore_batch_size=32,
-    on_scan_progress=None,
+    on_scan_progress=None, score_exact_batch_fn=None,
 ):
-    """Heap CELF with fast admissible bounds and exact singleton winners.
+    """Heap CELF with admissible bounds and optional batched exact rescoring.
 
-    Batch scoring intentionally counts matching base-word outputs, so duplicates
-    may inflate a bound but can never make it smaller than true distinct-target
-    marginal coverage. Only singleton scoring (which deduplicates target IDs) is
-    allowed to establish the round winner. This is the same cheap bound contract
-    used by ranker's GPU CELF and avoids comparing two different scoring modes as
-    though both were exact.
+    Fast batch scoring counts matching base-word outputs, so duplicates may inflate
+    a bound but cannot undercount unique active targets. If `score_exact_batch_fn`
+    is supplied, contenders whose tightened bound can still win are exact-rescored
+    together using a per-candidate bitmap. The actual winner is then scanned once
+    with hit recording before its target IDs are committed. Legacy/CPU callers keep
+    the original singleton-rescore behaviour.
     """
     if len(rules) != len(upper_bounds):
         raise ValueError("rules and upper_bounds must have equal lengths")
@@ -293,6 +303,7 @@ def _celf_select_from_upper_bounds(
     batch_size = max(1, int(rescore_batch_size))
     selected = []
     exact_rescored = 0
+    exact_gain_only = 0
     batch_rescored = 0
     recovered = 0
     current_batch_size = 1
@@ -328,6 +339,7 @@ def _celf_select_from_upper_bounds(
                 "selected": cyan(str(len(selected))),
                 "batch": cyan(str(current_batch_size)),
                 "exact scans": cyan(f"{exact_rescored:,}"),
+                "exact gain": cyan(f"{exact_gain_only:,}"),
                 "batch bounds": cyan(f"{batch_rescored:,}"),
             }
             if done is not None and total is not None:
@@ -339,6 +351,13 @@ def _celf_select_from_upper_bounds(
                 last_refresh[0] = now
 
         def exact_score(index):
+            # Full exact scan WITH hit-slot recording -- the expensive path
+            # (one GPU wordlist pass, synchronous readback of the matched
+            # target IDs). This commits what becomes `best_ids`, so it must
+            # only be paid for once per round, for the candidate that is
+            # actually going to be selected -- never speculatively for a
+            # seed or a "fresh" re-check that might turn out to have zero or
+            # losing gain.
             nonlocal exact_rescored
             exact_rescored += 1
             if on_scan_progress is None:
@@ -351,6 +370,38 @@ def _celf_select_from_upper_bounds(
             }
             report_scan()
             return len(ids), ids
+
+        def exact_gain(index):
+            """Exact marginal gain for ONE candidate, preferring the cheap
+            batched-exact kernel (score_mode=1: deduplicates target IDs but
+            never transfers/records them) over the expensive recording scan.
+
+            Returns (gain, ids_or_None). `ids` is None whenever the cheap
+            path was used, mirroring the batch-tightening branch below: the
+            caller defers materializing target IDs until a candidate is
+            confirmed to be the round's actual winner, at which point exactly
+            one recording scan happens (see the `best_ids is None` check
+            after the inner loop).
+
+            This is what the seed-pop and "fresh_this_round" re-checks were
+            missing: they always called `exact_score()` (full recording
+            scan) even though most seeds / fresh contenders turn out to have
+            a losing or zero exact gain and never get recorded at all. That
+            showed up as thousands of expensive singleton recording scans
+            with `selected` barely moving.
+            """
+            nonlocal exact_gain_only
+            if score_exact_batch_fn is None:
+                return exact_score(index)
+            exact_gain_only += 1
+            if on_scan_progress is None:
+                gains = score_exact_batch_fn([index], covered)
+            else:
+                gains = score_exact_batch_fn([index], covered, report_scan)
+            if len(gains) != 1:
+                raise RuntimeError("CELF exact batch scorer returned the wrong number of gains")
+            report_scan()
+            return max(0, int(gains[0])), None
 
         def priority(bound, index):
             return max(0, int(bound)) / costs[int(index)]
@@ -370,8 +421,12 @@ def _celf_select_from_upper_bounds(
             # assume that its upper bound is the exact gain.
             _neg_seed_priority, seed_index, _seed_bound = heapq.heappop(heap)
             seed_index = int(seed_index)
-            best_gain, best_ids = exact_score(seed_index)
-            if best_gain <= 0 or not best_ids:
+            # Cheap exact-gain-only check first (see exact_gain()): most
+            # seeds popped off a duplicate-heavy raw-bound heap turn out to
+            # have a losing or zero exact gain, so this avoids paying for a
+            # full hit-recording scan on every single one of them.
+            best_gain, best_ids = exact_gain(seed_index)
+            if best_gain <= 0:
                 # Marginal gain can only shrink; zero-gain candidates are dead.
                 continue
             best_index = seed_index
@@ -388,7 +443,7 @@ def _celf_select_from_upper_bounds(
                 if top_index in fresh_this_round:
                     heapq.heappop(heap)
                     fresh_this_round.remove(top_index)
-                    gain, ids = exact_score(top_index)
+                    gain, ids = exact_gain(top_index)
                     if gain > best_gain or (gain == best_gain and top_index < best_index):
                         push(best_index, best_gain)  # previous exact winner remains a bound
                         best_index, best_gain, best_ids = top_index, gain, ids
@@ -432,18 +487,62 @@ def _celf_select_from_upper_bounds(
                     if len(raw_bounds) != len(batch_entries):
                         raise RuntimeError("CELF batch scorer returned the wrong number of upper bounds")
 
-                    for (index, old_bound), raw_bound in zip(batch_entries, raw_bounds):
-                        # Monotonicity guarantees an updated bound cannot need to be
-                        # larger than its previous value; min protects against a bad
-                        # later batch while keeping the value admissible.
-                        tightened = min(old_bound, max(0, int(raw_bound)))
-                        push(index, tightened)
-                        if tightened and can_beat(tightened, index, best_gain, best_index):
-                            fresh_this_round.add(index)
+                    if score_exact_batch_fn is None:
+                        # Compatibility path for CPU/tests and callers whose batch
+                        # scorer only provides admissible upper bounds.
+                        for (index, old_bound), raw_bound in zip(batch_entries, raw_bounds):
+                            tightened = min(old_bound, max(0, int(raw_bound)))
+                            push(index, tightened)
+                            if tightened and can_beat(tightened, index, best_gain, best_index):
+                                fresh_this_round.add(index)
+                    else:
+                        # First tighten every bound cheaply. Only candidates that
+                        # can still beat the current exact best pay for bitmap-based
+                        # exact scoring. Score those contenders together to avoid
+                        # hundreds of thousands of per-candidate GPU synchronizations.
+                        exact_entries = []
+                        for (index, old_bound), raw_bound in zip(batch_entries, raw_bounds):
+                            tightened = min(old_bound, max(0, int(raw_bound)))
+                            if tightened and can_beat(tightened, index, best_gain, best_index):
+                                exact_entries.append((index, tightened))
+                            else:
+                                push(index, tightened)
+
+                        if exact_entries:
+                            exact_indices = [index for index, _bound in exact_entries]
+                            if on_scan_progress is None:
+                                exact_gains = score_exact_batch_fn(exact_indices, covered)
+                            else:
+                                exact_gains = score_exact_batch_fn(exact_indices, covered, report_scan)
+                            if len(exact_gains) != len(exact_entries):
+                                raise RuntimeError("CELF exact batch scorer returned the wrong number of gains")
+
+                            for (index, _bound), raw_exact_gain in zip(exact_entries, exact_gains):
+                                tightened_exact_gain = max(0, int(raw_exact_gain))
+                                if tightened_exact_gain and can_beat(tightened_exact_gain, index, best_gain, best_index):
+                                    # The batch result has an exact gain but not target
+                                    # IDs. Preserve the old best as a valid future bound;
+                                    # materialize only the final winner's IDs below.
+                                    push(best_index, best_gain)
+                                    best_index, best_gain, best_ids = index, tightened_exact_gain, None
+                                else:
+                                    # Exact current marginal gain remains an admissible
+                                    # bound in every later round (coverage only shrinks).
+                                    push(index, tightened_exact_gain)
                 report_scan()
 
-            # The winner was scored exactly in this round. Clear by its target IDs,
-            # never by the last transient hit buffer (which another scan may replace).
+            # A batched exact score returns only gains. If it displaced the seed,
+            # perform one recording scan for the final winner and verify that its
+            # gain matches the batched score before changing coverage.
+            if best_ids is None:
+                recorded_gain, best_ids = exact_score(best_index)
+                if recorded_gain != best_gain:
+                    raise _CelfExactBatchMismatch(
+                        "CELF exact-batch/recording score mismatch for "
+                        f"candidate {best_index}: batch={best_gain}, recorded={recorded_gain}"
+                    )
+
+            # Clear by the winner's exact target IDs, never by a transient buffer.
             covered[np.fromiter(best_ids, dtype=np.int64)] = True
             recovered += len(best_ids)
             if on_select is not None:
@@ -516,6 +615,21 @@ class _GpuExactScorer:
             return []
         gains, _slots = self.gpu_engine.celf_score_chains_gpu(
             rules, record_hits=False, progress_callback=progress_callback
+        )
+        return [int(gain) for gain in gains]
+
+    def score_exact_gains_batch(self, rules, progress_callback=None):
+        """Return exact distinct-target marginal gains for a small candidate batch.
+
+        Unlike the raw-hit upper-bound scan, this mode uses one compact seen
+        bitmap per candidate but does not transfer/record target slots. It is
+        reserved for candidates whose upper bounds still threaten the winner.
+        """
+        if not rules:
+            return []
+        gains, _slots = self.gpu_engine.celf_score_chains_gpu(
+            rules, record_hits=False, exact_counts=True,
+            progress_callback=progress_callback,
         )
         return [int(gain) for gain in gains]
 
@@ -662,9 +776,11 @@ def select_rules_by_marginal_coverage(
         recompute_batch_size = max(1, int(os.environ.get("RULEST_GREEDY_RESCORE_BATCH", "32")))
         recompute_batch_size = min(recompute_batch_size, rule_batch_size)
         recompute_batch_size = _celf_auto_rescore_batch(recompute_batch_size, target_count, getattr(scorer, 'gpu_engine', None))  # CELF_ADAPTIVE_BATCH_PATCH_V4
+        exact_batch_enabled = os.environ.get("RULEST_CELF_EXACT_BATCH", "1").strip().lower() not in {"0", "false", "no", "off"}
         log_info(
             f"[CELF] Candidates: {bold(str(len(rules)))}; targets: {bold(str(target_count))}; "
             f"fast raw-hit upper bounds (duplicates may overcount); lazy heap batch={recompute_batch_size}; "
+            f"batched exact challenger rescoring={'enabled' if exact_batch_enabled else 'disabled'}; "
             f"candidate sequences cached on GPU; SplitMix64 table load <= 50%; coverage matrix: {green('none')}"
         )
 
@@ -686,14 +802,51 @@ def select_rules_by_marginal_coverage(
                 progress_callback=progress_callback or scan_progress,
             )
 
-        selected, covered = _celf_select_from_upper_bounds(
-            rules, upper_bounds, target_count, score_one,
-            budget=budget, cost_alpha=cost_alpha,
-            on_select=scorer.mark_selected,
-            score_batch_fn=score_many,
-            rescore_batch_size=recompute_batch_size,
-            on_scan_progress=scan_progress,
-        )
+        def score_exact_many(rule_indices, covered_mask, progress_callback=None):
+            return scorer.score_exact_gains_batch(
+                [rules[index] for index in rule_indices],
+                progress_callback=progress_callback or scan_progress,
+            )
+
+        try:
+            selected, covered = _celf_select_from_upper_bounds(
+                rules, upper_bounds, target_count, score_one,
+                budget=budget, cost_alpha=cost_alpha,
+                on_select=scorer.mark_selected,
+                score_batch_fn=score_many,
+                rescore_batch_size=recompute_batch_size,
+                on_scan_progress=scan_progress,
+                score_exact_batch_fn=score_exact_many if exact_batch_enabled else None,
+            )
+        except _CelfExactBatchMismatch as exc:
+            if not exact_batch_enabled:
+                raise
+            # Never continue with possibly undercounted/overcounted speculative
+            # gains: that could silently alter the greedy ordering. Reset the
+            # GPU active bitmap to the original universe and rerun the *entire*
+            # selection with the older, verified singleton exact-rescore path.
+            log_warn(
+                f"[CELF] {exc}. Discarding this partial selection, resetting GPU "
+                "coverage, and retrying with batched exact rescoring disabled."
+            )
+            try:
+                celf_engine.celf_reset_active_targets()
+            except Exception as reset_exc:
+                raise RuntimeError(
+                    "CELF batched exact scoring failed verification and the GPU "
+                    "active-target bitmap could not be reset safely; refusing to "
+                    f"continue with potentially incorrect coverage ({reset_exc}). "
+                    "Retry with RULEST_CELF_EXACT_BATCH=0."
+                ) from reset_exc
+            selected, covered = _celf_select_from_upper_bounds(
+                rules, upper_bounds, target_count, score_one,
+                budget=budget, cost_alpha=cost_alpha,
+                on_select=scorer.mark_selected,
+                score_batch_fn=score_many,
+                rescore_batch_size=recompute_batch_size,
+                on_scan_progress=scan_progress,
+                score_exact_batch_fn=None,
+            )
         log_info(
             f"[CELF] Selected {bold(str(len(selected)))} rules; exact recovery "
             f"{bold(cyan(f'{int(covered.sum()):,}/{target_count:,}'))}"

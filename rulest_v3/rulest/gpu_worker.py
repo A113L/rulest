@@ -397,14 +397,14 @@ class ProcessEngineProxy:
     def celf_prepare_candidate_pool(self, candidate_rules):
         return self._call('celf_prepare_candidate_pool', candidate_rules, _raise_on_error=True)
 
-    def celf_score_chains_gpu(self, chains, record_hits=False, progress_callback=None):
+    def celf_score_chains_gpu(self, chains, record_hits=False, progress_callback=None, exact_counts=False):
         # `progress_callback` is a parent-process closure and must not be
         # pickled across multiprocessing queues. The GPU method's own result
         # is returned synchronously; progress reporting remains at the caller.
-        result = self._call(
-            'celf_score_chains_gpu', chains, record_hits=record_hits,
-            _raise_on_error=True,
-        )
+        call_kwargs = {'record_hits': record_hits, '_raise_on_error': True}
+        if exact_counts:
+            call_kwargs['exact_counts'] = True
+        result = self._call('celf_score_chains_gpu', chains, **call_kwargs)
         if result is None:
             raise RuntimeError('GPU worker returned no CELF score result')
         return result
@@ -420,6 +420,10 @@ class ProcessEngineProxy:
 
     def celf_clear_target_ids(self, target_ids):
         return self._call('celf_clear_target_ids', target_ids, _raise_on_error=True)
+
+    def celf_reset_active_targets(self):
+        """Reset CELF coverage to the full target universe before a safe retry."""
+        return self._call('celf_reset_active_targets', _raise_on_error=True)
 
     def celf_release_target_table(self):
         return self._call('celf_release_target_table', _raise_on_error=True)

@@ -11,6 +11,7 @@ import os
 import sys
 import threading
 import itertools
+import warnings
 from collections import Counter, defaultdict
 
 import numpy as np
@@ -328,7 +329,29 @@ class GPUEngine:
         result = {}
         def do_build():
             try:
-                prog.build(options=build_options or [])
+                # pyopencl.CompilerWarning fires whenever the driver's build
+                # log is non-empty, even on a build that fully succeeded --
+                # e.g. NVIDIA's compiler notes that it overrode `noinline`
+                # on every `__kernel`-decorated function (expected: kernels
+                # are host-callable entry points and can never be inlined
+                # away, so the driver's own optimizer hint there is a no-op
+                # notice, not a problem). That is benign/expected on every
+                # build on this driver, so it is silenced here specifically
+                # -- scoped to just this build() call, inside the watchdog
+                # thread, so a real compiler ERROR still raises normally
+                # (build() raises cl.RuntimeError on failure regardless of
+                # this filter) and warnings from unrelated code elsewhere
+                # are untouched.
+                with warnings.catch_warnings():
+                    # getattr fallback: pyopencl has defined CompilerWarning
+                    # since well before any version Rulest supports, but
+                    # fall back to the generic UserWarning base rather than
+                    # raising AttributeError if a future/older pyopencl ever
+                    # renames it.
+                    warnings.simplefilter(
+                        "ignore", category=getattr(cl, "CompilerWarning", UserWarning)
+                    )
+                    prog.build(options=build_options or [])
                 result['ok'] = True
             except Exception as e:
                 result['ok'] = False
@@ -1261,11 +1284,12 @@ class GPUEngine:
                 f"GPU buffer allocation+upload={time.perf_counter() - _pool_alloc_t0:.3f}s"
             )
 
-    def celf_score_chains_gpu(self, chains, record_hits=False, progress_callback=None):
-        """Score via resident candidate sequences and persistent scratch/result buffers.
+    def celf_score_chains_gpu(self, chains, record_hits=False, progress_callback=None, exact_counts=False):
+        """Score resident candidate sequences with reusable GPU workspace.
 
-        Singleton scoring records hit slots on the GPU in the same pass. The slot
-        list is not copied to host unless this candidate becomes the selected winner.
+        Default batches return fast admissible raw-hit upper bounds. `exact_counts`
+        enables per-candidate target-ID deduplication without hit-slot readback;
+        `record_hits` is the singleton winner mode that also records matched slots.
         """
         _profile_on = os.environ.get("RULEST_CELF_PROFILE") == "1"
         _wall_t0 = time.perf_counter()
@@ -1283,6 +1307,9 @@ class GPUEngine:
             return np.zeros(0, dtype=np.int64), []
         if record_hits and len(chains) != 1:
             raise ValueError("record_hits=True requires exactly one candidate chain")
+        if record_hits and exact_counts:
+            # Recording mode already includes exact counting.
+            exact_counts = False
         if not getattr(self, "_celf_candidate_index", None):
             raise RuntimeError("CELF candidate pool has not been prepared")
         if not self.context or not self.kernel_celf_score:
@@ -1297,9 +1324,9 @@ class GPUEngine:
             raise RuntimeError(f"Candidate was not in the prepared CELF pool: {exc}") from exc
 
         n_rules = len(chains)
-        # Batched calls only compute a fast raw-hit upper bound. Exact singleton
-        # calls explicitly request recording and deduplicate target IDs with seen[].
-        do_record = bool(record_hits)
+        # Modes: 0=raw upper bound, 1=exact counts per candidate, 2=exact + slots.
+        do_exact = bool(record_hits or exact_counts)
+        score_mode = 2 if record_hits else (1 if exact_counts else 0)
         self._celf_last_single_cache = None
         _enqueue_t0 = time.perf_counter()
         _alloc_t0 = time.perf_counter()
@@ -1309,10 +1336,11 @@ class GPUEngine:
         if _profile_on: _h2d_events.append(event)
         event = cl.enqueue_fill_buffer(self.queue, self._celf_gains_buf, np.int32(0), 0, n_rules * 4)
         if _profile_on: _fill_events.append(event)
-        if do_record:
+        if do_exact:
             seen_bytes = n_rules * self._celf_seen_words * 4
             event = cl.enqueue_fill_buffer(self.queue, self._celf_seen_buf, np.uint32(0), 0, max(4, seen_bytes))
             if _profile_on: _fill_events.append(event)
+        if record_hits:
             event = cl.enqueue_fill_buffer(self.queue, self._celf_hit_count_buf, np.int32(0), 0, 4)
             if _profile_on: _fill_events.append(event)
 
@@ -1356,7 +1384,7 @@ class GPUEngine:
                 np.int32(num_words), np.int32(n_rules), np.int32(kernel_word_start),
                 np.int32(self.params["MAX_CHAIN_DEPTH"]),
                 np.uint32(self._celf_table_mask), np.int32(self._celf_seen_words),
-                np.int32(1 if do_record else 0),
+                np.int32(score_mode),
             )
             event = cl.enqueue_nd_range_kernel(self.queue, self.kernel_celf_score, (global_size,), (self.local_work_size,))
             if _profile_on: _kernel_events.append(event)
@@ -1382,11 +1410,11 @@ class GPUEngine:
         _host_enqueue_s += time.perf_counter() - _enqueue_t0
         _alloc_t0 = time.perf_counter()
         host_gains = np.zeros(n_rules, dtype=np.int32)
-        host_count = np.zeros(1, dtype=np.int32)
+        host_count = np.zeros(1, dtype=np.int32) if record_hits else None
         _host_alloc_s += time.perf_counter() - _alloc_t0
         gain_event = cl.enqueue_copy(self.queue, host_gains, self._celf_gains_buf, is_blocking=False)
         if _profile_on: _read_events.append(gain_event)
-        if do_record:
+        if record_hits:
             event = cl.enqueue_copy(self.queue, host_count, self._celf_hit_count_buf, is_blocking=False)
             if _profile_on: _read_events.append(event)
             # One queue synchronization covers stats plus every queued word chunk.
@@ -1406,14 +1434,14 @@ class GPUEngine:
             progress_callback(n_words_total, n_words_total)
         self._celf_release_pending_clear_buffers()
         hit_slots = []
-        if do_record:
+        if record_hits:
             n_hits = min(max(0, int(host_count[0])), self._celf_target_count)
             self._celf_last_hit_count = n_hits
             if n_rules == 1:
                 self._celf_last_single_cache = (
                     chains[0], int(host_gains[0]), self._celf_active_version, None, n_hits
                 )
-            if record_hits and n_hits:
+            if n_hits:
                 _alloc_t0 = time.perf_counter()
                 host_slots = np.zeros(n_hits, dtype=np.int32)
                 _host_alloc_s += time.perf_counter() - _alloc_t0
@@ -1468,7 +1496,7 @@ class GPUEngine:
             stats["h2d_gpu_s"] += _event_seconds(_h2d_events)
             stats["fill_gpu_s"] += _event_seconds(_fill_events)
             stats["readback_gpu_s"] += _event_seconds(_read_events)
-            if do_record:
+            if do_exact:
                 stats["exact_record_s"] += _event_seconds(_kernel_events)
             _now = time.perf_counter()
             if _now - getattr(self, "_celf_profile_last_log", 0.0) >= 10.0:
@@ -1538,6 +1566,10 @@ class GPUEngine:
         """Restore the GPU active bitmap after a rejected speculative CELF attempt."""
         if not getattr(self, "_celf_active_buf", None):
             raise RuntimeError("CELF target table has not been initialized")
+        # Ensure async slot uploads/kernels from the discarded run have
+        # completed before releasing their host-side staging arrays. The fresh
+        # active bitmap copy is then ordered after all prior queue work.
+        self.queue.finish()
         self._celf_release_pending_clear_buffers()
         cl.enqueue_copy(self.queue, self._celf_active_buf, self._celf_occupied_host).wait()
         self._celf_active_version = getattr(self, "_celf_active_version", 0) + 1

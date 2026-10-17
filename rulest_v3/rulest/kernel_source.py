@@ -212,29 +212,59 @@ int apply(const unsigned char *rs, int rl,
             int pos = pv;
             if (pos < *ol) {{ *ol = pos; changed = 1; }}
         }} else if (cmd == 'z' && pv >= 0) {{
+            // Reference (common.py): `if n>0 and w: w = [w[0]]*n + w`.
+            // *ol==0 was previously unguarded, reading out[0] out of the
+            // written range (stale/garbage stack contents -- nondeterministic
+            // across launches, the root cause of CELF exact-batch vs.
+            // recording-scan mismatches on candidates that reach this op).
             int n = pv;
-            if (n>0 && *ol+n <= MAX_OUTPUT_LEN) {{
+            if (n>0 && *ol>0 && *ol+n <= MAX_OUTPUT_LEN) {{
                 unsigned char f = out[0];
                 for (int i = *ol+n-1; i >= n; i--) out[i] = out[i-n];
                 for (int i = 0; i < n; i++) out[i] = f;
                 *ol += n; changed = 1;
             }}
         }} else if (cmd == 'Z' && pv >= 0) {{
+            // Reference: `if n>0 and w: w = w + [w[-1]]*n`. Same *ol==0 guard
+            // as 'z' above -- out[*ol-1] previously underflowed when empty.
             int n = pv;
-            if (n>0 && *ol+n <= MAX_OUTPUT_LEN) {{
+            if (n>0 && *ol>0 && *ol+n <= MAX_OUTPUT_LEN) {{
                 unsigned char l = out[*ol-1];
                 for (int i = 0; i < n; i++) out[*ol+i] = l;
                 *ol += n; changed = 1;
             }}
         }} else if (cmd == 'y' && pv >= 0) {{
+            // Reference: `if n>0: w = w[:n] + w`, i.e. PREPEND the first
+            // min(n, len(w)) characters. The previous version appended
+            // `out[i]` for i in [0,n) at the *end* of the string (wrong
+            // operation: prepend vs append) and, whenever n > *ol, read
+            // out[i] for i >= *ol -- past the characters this chain had
+            // actually written, into whatever was left in that GPU
+            // work-item's private stack slot by an unrelated, earlier
+            // candidate/word. That garbage differs between the fast
+            // upper-bound pass, the batched exact pass and the later
+            // singleton recording scan (different dispatches reuse that
+            // stack memory differently), so the same candidate could
+            // silently produce different output strings -- and therefore a
+            // different target-table hit -- in each pass. That is exactly
+            // the batch/recorded gain mismatch CELF was tripping on.
             int n = pv;
-            if (n>0 && *ol+n <= MAX_OUTPUT_LEN) {{
-                for (int i = 0; i < n; i++) out[*ol+i] = out[i];
-                *ol += n; changed = 1;
+            int k = (n < *ol) ? n : *ol;
+            if (k>0 && *ol+k <= MAX_OUTPUT_LEN) {{
+                for (int i = *ol-1; i >= 0; i--) out[i+k] = out[i];
+                // out[0..k-1] already hold the original prefix untouched by
+                // the shift above (every shift target index is >= k), which
+                // is exactly the prepended copy required.
+                *ol += k; changed = 1;
             }}
         }} else if (cmd == 'Y' && pv >= 0) {{
+            // Reference: `if n>0 and len(w)>=n: w = w + w[-n:]`. The previous
+            // version only checked *ol+n <= MAX_OUTPUT_LEN, so n > *ol made
+            // it read out[*ol-n+i], i.e. a negative/underflowed index --
+            // again a nondeterministic out-of-range stack read instead of
+            // the correct Python no-op.
             int n = pv;
-            if (n>0 && *ol+n <= MAX_OUTPUT_LEN) {{
+            if (n>0 && n <= *ol && *ol+n <= MAX_OUTPUT_LEN) {{
                 for (int i = 0; i < n; i++) out[*ol+i] = out[*ol-n+i];
                 *ol += n; changed = 1;
             }}
@@ -460,9 +490,9 @@ inline int celf_find_target_slot(
 
 // Every (base word, candidate chain) work item applies the same chain DSL as
 // the main search kernel, then performs exact target-table lookup on the GPU.
-// Every scoring mode deduplicates exact target IDs with a compact per-candidate
-// bitmap. Batched scores are exact current marginal gains; stale heap values
-// remain admissible upper bounds after the active target set shrinks.
+// score_mode selects raw-hit upper bounds (mode 0) or unique-target marginals
+// with a per-candidate bitmap (modes 1/2); only mode 2 records winning slots.
+// Stale heap values remain admissible upper bounds after the active set shrinks.
 __kernel void celf_score_chains_gpu(
     __global const uchar *bw, __global const int *bo, __global const int *bl,
     __global const uchar *rs, __global const int *ro, __global const int *rl,
@@ -475,7 +505,7 @@ __kernel void celf_score_chains_gpu(
     __global int *hit_slots, __global int *hit_count,
     const int nw, const int nc, const int word_start, const int mcd,
     const uint table_mask, const int bitmap_words,
-    const int record_hits)
+    const int score_mode)
 {{
     int gid = (int)get_global_id(0);
     int total = nw * nc;
@@ -522,24 +552,25 @@ __kernel void celf_score_chains_gpu(
     int target_id = slot_target_ids[slot];
     if (target_id < 0) return;
 
-    // Fast batch mode is an admissible upper bound: count every matching
-    // base-word output. Duplicate outputs can overcount but cannot undercount
-    // unique active targets. This avoids per-hit bitmap atomics in large batches.
-    if (!record_hits) {{
+    // score_mode 0: fast raw-hit upper bound (duplicates may overcount).
+    // score_mode 1: exact distinct-target gain per candidate, no hit-slot output.
+    // score_mode 2: exact singleton gain plus target-slot recording for winner.
+    if (score_mode == 0) {{
         atomic_inc((volatile __global int *)(gains + ci));
         return;
     }}
 
-    // Exact singleton mode deduplicates target IDs and records one slot per
-    // distinct active target in the same pass.
+    // Exact modes deduplicate target IDs with one bitmap row per candidate.
     __global uint *seen_rule = seen + ci * bitmap_words;
     uint seen_word = ((uint)target_id) >> 5;
     uint seen_mask = 1U << (((uint)target_id) & 31U);
     uint previous = (uint)atomic_or((volatile __global int *)(seen_rule + seen_word), (int)seen_mask);
     if ((previous & seen_mask) != 0U) return;
     atomic_inc((volatile __global int *)(gains + ci));
-    int out_idx = atomic_inc((volatile __global int *)hit_count);
-    if (out_idx >= 0) hit_slots[out_idx] = slot;
+    if (score_mode == 2) {{
+        int out_idx = atomic_inc((volatile __global int *)hit_count);
+        if (out_idx >= 0) hit_slots[out_idx] = slot;
+    }}
 }}
 
 __kernel void celf_clear_active_slots(
