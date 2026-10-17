@@ -478,6 +478,111 @@ def test_dead_seeds_use_the_cheap_exact_batch_path_not_a_recording_scan():
     assert singleton_calls == [4]
 
 
+def test_immediate_winner_costs_a_single_one_candidate_seed_call():
+    """Regression test for the "200 rules/s ceiling, phase ~5 minutes
+    longer" symptom: on an ORDINARY (non-duplicate-heavy) pool, where the
+    single top-of-heap candidate is already each round's true winner, each
+    round must cost exactly one `score_exact_batch_fn` call scoring exactly
+    ONE candidate -- not a full `rescore_batch_size`-sized call.
+
+    An earlier version of the seed-batching optimization always probed a
+    full `rescore_batch_size` candidates every round regardless of whether
+    the top candidate alone would have won immediately. That is a pure win
+    on a duplicate-heavy pool (see the dead-run test below) but a pure loss
+    here: it turned one cheap 1-candidate GPU dispatch per round into a
+    wasted `rescore_batch_size`-candidate one on every round of an otherwise
+    healthy run, which is exactly what the reported slowdown and 200
+    rules/s ceiling match.
+    """
+    # Five candidates with distinct, non-overlapping true coverage and raw
+    # upper bounds that already rank them in true-gain order -- i.e. no
+    # duplicate-inflation at all, so the heap's top candidate is always
+    # immediately correct.
+    rules = [f"r{i}" for i in range(5)]
+    true_sets = [{10 * i} for i in range(5)]
+    upper_bounds = [50, 40, 30, 20, 10]
+
+    exact_batch_calls = []
+    singleton_calls = []
+
+    def score_one(i, covered):
+        singleton_calls.append(i)
+        return true_sets[i] - set(np.flatnonzero(covered))
+
+    def score_bounds(indices, covered):
+        return [upper_bounds[i] for i in indices]
+
+    def score_exact_batch(indices, covered):
+        exact_batch_calls.append(tuple(indices))
+        covered_ids = set(np.flatnonzero(covered))
+        return [len(true_sets[i] - covered_ids) for i in indices]
+
+    selected, covered = _celf_select_from_upper_bounds(
+        rules, upper_bounds, 41, score_one, budget=None,
+        score_batch_fn=score_bounds, score_exact_batch_fn=score_exact_batch,
+        rescore_batch_size=32,  # a large configured batch ceiling
+    )
+
+    assert [name for name, _ in selected] == rules
+    # Round 1's seed probe is a single candidate (the point of this test).
+    # The remaining four candidates' raw bounds (40/30/20/10) still look
+    # like they could beat that round's winner (gain 1), so the PRE-EXISTING
+    # stale-bound-refresh path (unrelated to seed probing, already present
+    # before this fix) legitimately tightens and exact-scores all of them
+    # together in that same round -- a real, useful batched call, not
+    # wasted work. After that, every candidate's bound is already exact, so
+    # every later round's seed probe goes back to costing exactly one call.
+    assert exact_batch_calls == [(0,), (1, 2, 3, 4), (1,), (2,), (3,), (4,)], exact_batch_calls
+    # Crucially: never a 32-candidate probe. Only the first round pays for
+    # more than one candidate, and that one call is the legitimate
+    # stale-bound-refresh pass, not a seed over-fetch.
+    assert all(len(call) <= 4 for call in exact_batch_calls)
+
+
+def test_long_dead_run_is_cleared_in_logarithmically_many_probes():
+    """Companion to the immediate-winner test above: a long run of dead
+    (zero true gain) candidates at the top of the heap must still be
+    cleared efficiently, via a doubling probe size, rather than reverting
+    to one GPU call per dead candidate.
+    """
+    # Eight candidates with inflated (duplicate-heavy) raw upper bounds, all
+    # of which happen to have zero true gain, followed by one real winner
+    # with a much lower raw bound -- a long dead run at the top of the heap.
+    rules = [f"dead{i}" for i in range(8)] + ["winner"]
+    true_sets = [set() for _ in range(8)] + [{0}]
+    upper_bounds = [100 - 10 * i for i in range(8)] + [1]
+
+    exact_batch_calls = []
+    singleton_calls = []
+
+    def score_one(i, covered):
+        singleton_calls.append(i)
+        return true_sets[i] - set(np.flatnonzero(covered))
+
+    def score_bounds(indices, covered):
+        return [upper_bounds[i] for i in indices]
+
+    def score_exact_batch(indices, covered):
+        exact_batch_calls.append(tuple(indices))
+        covered_ids = set(np.flatnonzero(covered))
+        return [len(true_sets[i] - covered_ids) for i in indices]
+
+    selected, covered = _celf_select_from_upper_bounds(
+        rules, upper_bounds, 1, score_one, budget=None,
+        score_batch_fn=score_bounds, score_exact_batch_fn=score_exact_batch,
+        rescore_batch_size=8,
+    )
+
+    assert selected == [("winner", 1)]
+    assert int(covered.sum()) == 1
+    # Doubling probe (1, 2, 4, then whatever remains) instead of either 8
+    # single-candidate calls or one fixed 8-candidate call every time.
+    assert exact_batch_calls == [(0,), (1, 2), (3, 4, 5, 6), (7, 8)], exact_batch_calls
+    assert len(exact_batch_calls) < 8, "must clear the dead run in fewer than one call per dead candidate"
+    # Still exactly one recording scan: the real winner's.
+    assert singleton_calls == [8]
+
+
 def test_batched_exact_rescoring_matches_reference_on_randomized_coverage():
     import random
 
