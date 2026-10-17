@@ -12,6 +12,7 @@ import os
 import time
 import threading
 import multiprocessing as mp
+import queue as queue_module
 from collections import Counter
 
 import numpy as np
@@ -85,6 +86,14 @@ def _gpu_worker_entry(device_spec, params, cmd_q, res_q, hb_q):
                         eng.queue.finish()
                         bf = bf_np
                     result = bf
+                elif method == '__getattr__':
+                    # Only scalar CELF workspace metadata is exposed to the
+                    # parent process. Never try to proxy live OpenCL buffers,
+                    # kernels, queues, or other process-local GPU objects.
+                    name = args[0]
+                    if name not in {'_celf_seen_words', '_celf_batch_capacity'}:
+                        raise AttributeError(f"Remote GPU attribute is not exposed: {name}")
+                    result = getattr(eng, name)
                 else:
                     fn = getattr(eng, method)
                     result = fn(*args, **kwargs)
@@ -230,8 +239,10 @@ class ProcessEngineProxy:
         self._kill()
 
     # -- generic RPC --------------------------------------------------------
-    def _call(self, method, *args, **kwargs):
+    def _call(self, method, *args, _raise_on_error=False, **kwargs):
         if self.disabled or self._proc is None:
+            if _raise_on_error:
+                raise RuntimeError(f"GPU worker is unavailable during '{method}'")
             return None
         with self._lock:
             self._call_id += 1
@@ -241,27 +252,42 @@ class ProcessEngineProxy:
             except Exception as e:
                 log_warn(f"[GPU]  Failed to send '{method}' to worker: {e}")
                 self._kill()
+                if _raise_on_error:
+                    raise RuntimeError(f"Failed to send '{method}' to GPU worker") from e
                 return None
             while True:
                 try:
-                    tag, status, payload = self._res_q.get(timeout=1.0)
+                    reply = self._res_q.get(timeout=1.0)
+                except queue_module.Empty:
+                    reply = None
+                except Exception as e:
+                    if _raise_on_error:
+                        self._kill()
+                        raise RuntimeError(f"Could not receive reply for '{method}' from GPU worker") from e
+                    reply = None
+                if reply is not None:
+                    tag, status, payload = reply
                     if tag != call_id:
                         continue  # stale reply from an earlier, since-abandoned call
                     if status == 'ok':
                         return payload
                     log_warn(f"[GPU]  Worker error in '{method}': {payload}")
+                    if _raise_on_error:
+                        raise RuntimeError(f"GPU worker failed in '{method}': {payload}")
                     return None
-                except Exception:
-                    pass
                 if self._proc is None or not self._proc.is_alive():
                     log_warn(f"[GPU]  Worker process died during '{method}' — dropping device")
                     self._kill()
+                    if _raise_on_error:
+                        raise RuntimeError(f"GPU worker died during '{method}'")
                     return None
                 last_beat = self._last_heartbeat or 0
                 if time.time() - last_beat > _WORKER_HANG_TIMEOUT:
                     log_warn(f"[GPU]  Worker unresponsive for {_WORKER_HANG_TIMEOUT}s during "
                              f"'{method}' — killing device (driver hang)")
                     self._kill()
+                    if _raise_on_error:
+                        raise RuntimeError(f"GPU worker became unresponsive during '{method}'")
                     return None
 
     # -- GPUEngine-compatible surface --------------------------------------
@@ -353,6 +379,56 @@ class ProcessEngineProxy:
         # evaluate_chains_for_ga() below — avoids re-encoding the wordlist (and
         # re-sending it across the process boundary) every generation.
         return self._call('set_base_words', words)
+
+    # CELF greedy-selection API. These calls deliberately stay on this one
+    # worker for the whole selection run so its target table, active bitmap,
+    # candidate pool, and hit-slot cache remain resident on the same GPU.
+    @property
+    def _celf_seen_words(self):
+        return int(self._call('__getattr__', '_celf_seen_words', _raise_on_error=True))
+
+    @property
+    def _celf_batch_capacity(self):
+        return int(self._call('__getattr__', '_celf_batch_capacity', _raise_on_error=True))
+
+    def celf_initialize_target_table(self, target_words):
+        return self._call('celf_initialize_target_table', target_words, _raise_on_error=True)
+
+    def celf_prepare_candidate_pool(self, candidate_rules):
+        return self._call('celf_prepare_candidate_pool', candidate_rules, _raise_on_error=True)
+
+    def celf_score_chains_gpu(self, chains, record_hits=False, progress_callback=None):
+        # `progress_callback` is a parent-process closure and must not be
+        # pickled across multiprocessing queues. The GPU method's own result
+        # is returned synchronously; progress reporting remains at the caller.
+        result = self._call(
+            'celf_score_chains_gpu', chains, record_hits=record_hits,
+            _raise_on_error=True,
+        )
+        if result is None:
+            raise RuntimeError('GPU worker returned no CELF score result')
+        return result
+
+    def celf_take_cached_single_score(self, chain):
+        return self._call('celf_take_cached_single_score', chain, _raise_on_error=True)
+
+    def celf_target_ids_for_slots(self, slots):
+        result = self._call('celf_target_ids_for_slots', slots, _raise_on_error=True)
+        if result is None:
+            raise RuntimeError('GPU worker returned no CELF target IDs')
+        return result
+
+    def celf_clear_target_ids(self, target_ids):
+        return self._call('celf_clear_target_ids', target_ids, _raise_on_error=True)
+
+    def celf_release_target_table(self):
+        return self._call('celf_release_target_table', _raise_on_error=True)
+
+    def celf_report_profile(self):
+        return self._call('celf_report_profile', _raise_on_error=True)
+
+    def celf_profile_summary(self):
+        return self._call('celf_profile_summary', _raise_on_error=True)
 
     def evaluate_chains_for_ga(self, chains):
         r = self._call('evaluate_chains_for_ga', chains)

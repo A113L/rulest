@@ -611,25 +611,31 @@ def select_rules_by_marginal_coverage(
         log_warn("[CELF] No candidate rules fit the GPU chain limits")
         return [], empty_mask
 
-    restore_depth, effective_depth = _widen_depth(gpu_engine, rules, max_depth)
+    # CELF maintains one resident target table/bitmap, so select one engine
+    # once and use it consistently for depth changes, scoring, and cleanup.
+    # In multi-GPU mode this is a ProcessEngineProxy; it explicitly exposes
+    # the CELF RPC surface rather than pretending to be a local GPUEngine.
+    selection_engine = _resolve_single_engine(gpu_engine)
+    restore_depth, effective_depth = _widen_depth(selection_engine, rules, max_depth)
     rules = [rule for rule in rules if len(rule.split()) <= effective_depth]
     if not rules:
-        _restore_depth(gpu_engine, restore_depth)
+        _restore_depth(selection_engine, restore_depth)
         return [], empty_mask
 
     scorer = None
     try:
         scorer = _GpuExactScorer(
-            gpu_engine, base_words, unique_targets, pair_batch_size, rules
+            selection_engine, base_words, unique_targets, pair_batch_size, rules
         )
         upper_bounds = [0] * len(rules)
-        seen_words = int(gpu_engine._celf_seen_words)
-        scratch_limit = max(4, int(gpu_engine.params.get("CELF_SEEN_SCRATCH_MB", 32))) * 1024 * 1024
+        celf_engine = scorer.gpu_engine
+        seen_words = int(celf_engine._celf_seen_words)
+        scratch_limit = max(4, int(celf_engine.params.get("CELF_SEEN_SCRATCH_MB", 32))) * 1024 * 1024
         max_by_scratch = max(1, scratch_limit // max(4, seen_words * 4))
-        configured_batch = max(1, int(gpu_engine.params.get("CELF_RULE_BATCH_SIZE", 32)))
+        configured_batch = max(1, int(celf_engine.params.get("CELF_RULE_BATCH_SIZE", 32)))
         rule_batch_size = min(
             configured_batch, max_by_scratch,
-            max(1, int(getattr(gpu_engine, "_celf_batch_capacity", configured_batch))),
+            max(1, int(getattr(celf_engine, "_celf_batch_capacity", configured_batch))),
         )
 
         # See the comment on the CELF recompute bar above: leave/dynamic_ncols/
@@ -716,4 +722,4 @@ def select_rules_by_marginal_coverage(
                 scorer.close()
             except Exception as exc:
                 log_warn(f"[CELF] Could not release GPU target table: {exc}")
-        _restore_depth(gpu_engine, restore_depth)
+        _restore_depth(selection_engine, restore_depth)
