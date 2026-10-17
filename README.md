@@ -15,6 +15,7 @@
 - [Requirements](#-requirements)
 - [Installation](#-installation)
 - [Usage](#-usage)
+  - [Short Flags — every option, one letter](#-short-flags--every-option-one-letter)
   - [run_rulest.py — Full Reference](#run_rulestpy--full-reference)
 - [Architecture (v3)](#-architecture-v3)
   - [Package Layout](#package-layout)
@@ -26,6 +27,7 @@
 - [Stage 3 — Genetic Algorithm](#-stage-3--genetic-algorithm)
 - [Rule Selection — Frequency vs. Greedy (CELF)](#-rule-selection--frequency-vs-greedy-celf)
 - [Functional Minimization](#-functional-minimization)
+- [Profiling (`--profile` / `-p`)](#-profiling---profile---p)
 - [Rule Categories](#-rule-categories)
 - [GPU Command Support](#-gpu-command-support)
 - [Configuration Constants](#-configuration-constants)
@@ -60,6 +62,8 @@ v3 takes the entire v2 engine — Stages 0–3, the Bloom filter (including shar
 
 1. **Splits it into a proper Python package** (`rulest/`) instead of one large script, with a thin `run_rulest.py` entry point.
 2. **Adds a new post-processing stage**: greedy marginal-coverage rule selection (CELF), as an alternative to plain frequency sorting.
+3. **Normalizes every CLI flag with a single-letter short form** (e.g. `--select-budget` ⇔ `-b`), so nothing takes more than one letter to type.
+4. **Adds opt-in profiling** (`--profile` / `-p`): a per-stage wall-clock + GPU-event breakdown table for tuning, covering every stage (0–3, Bloom build, minimization, selection/CELF) in one place.
 
 Multi-GPU support (process-isolated workers, adaptive load balancing) and Bloom filter sharding were already present in v2; v3 carries them over into the new package layout unchanged. Stage 0–3 behavior and the default (frequency-sorted) output are also unchanged from v2 — v3 is a strict superset.
 
@@ -69,12 +73,14 @@ Multi-GPU support (process-isolated workers, adaptive load balancing) and Bloom 
 
 | Change | Description |
 |---|---|
-| **Modular package** | The single 210 KB `rulest_v2.py` file is now the `rulest/` package (14 modules — see [Package Layout](#package-layout)) with `run_rulest.py` as the entry point. Behavior of Stages 0–3 and frequency-based output is unchanged in default mode. |
+| **Modular package** | The single 210 KB `rulest_v2.py` file is now the `rulest/` package (14+ modules — see [Package Layout](#package-layout)) with `run_rulest.py` as the entry point. Behavior of Stages 0–3 and frequency-based output is unchanged in default mode. |
 | **Greedy marginal-coverage selection (CELF)** (`rulest/selection.py`) | New optional post-processing stage: `--select-mode greedy` evaluates every candidate rule's *exact* set of recovered target words (GPU bloom prefilter + exact verification kernel) and runs a lazy-greedy (Cost-Effective Lazy Forward) set-cover selection, so the kept ruleset maximizes the union of recovered passwords for a given rule budget instead of just summing per-rule hit counts. |
 | **Budget sweeps** | `--select-budgets 64,250,1500,...` cuts the same ordering (greedy or frequency) at multiple sizes in one run, writing `<output>.<budget>.txt` for each — useful for plotting recovery-vs-budget without re-running coverage evaluation. |
 | **Exact recovery reporting** | `--exact-recovery` reports the exact count of distinct target words recovered by the selected ruleset against the real target wordlist (not bloom-filter estimates). |
 | **Cost-aware selection** | `--select-cost-alpha` lets greedy selection discount deeper (more expensive) chains: `gain(r) = new_recovery(r) / depth(r)**alpha`. |
-| **Unit test suite** | `tests/` (pytest) now covers rule-pool synchronization across GPUs, selection/CELF logic, minimization, common utilities, I/O helpers, and exact multi-GPU output parity. |
+| **Normalized short flags** | Every long flag also has a single-letter short form (`rulest/cli.py`), e.g. `--select-budget` ⇔ `-b`, `--max-depth` ⇔ `-m`, `--genetic` ⇔ `-g`. See [Short Flags](#-short-flags--every-option-one-letter). |
+| **Profiling** (`rulest/profiling.py`) | `--profile` / `-p` prints a unified per-stage wall-clock breakdown (STAGE 0–3, Bloom build, minimization, selection) at the end of the run, with GPU-event detail (host alloc/enqueue, kernel, H2D/D2H, sync wait) folded into each stage's row — the same accounting the CELF selector already used internally, now available for every stage. See [Profiling](#-profiling---profile---p). |
+| **Unit test suite** | `tests/` (pytest) now covers rule-pool synchronization across GPUs, selection/CELF logic, functional minimization, common utilities, I/O helpers, the profiling module, and exact multi-GPU output parity. |
 
 ---
 
@@ -120,6 +126,24 @@ python -c "import pyopencl; print(pyopencl.get_platforms())"
 
 ## 🚀 Usage
 
+### 🔑 Short Flags — every option, one letter
+
+Every flag below has a one-letter short form alongside its long name — exactly how `-o`/`--output` already worked — so nothing takes more than a single letter to type. Long and short forms are fully interchangeable and can be mixed freely on the same command line:
+
+```bash
+# These two invocations are identical:
+python run_rulest.py base.txt target.txt --select-mode greedy --select-budget 50000 --max-depth 3 --profile
+python run_rulest.py base.txt target.txt -M greedy -b 50000 -m 3 -p
+```
+
+A handful of flags deliberately have **no** short form, to keep the alphabet from being spent on options nobody types from memory:
+
+- `--bloom-no-shard` and `--allow-reject-rules` — rare/advanced switches.
+- `--depth2-chains` through `--depth10-chains` — nine numbered per-depth overrides; one letter each would eat most of the alphabet for a family you'd normally only set once via a config/wrapper script, not type by hand.
+- The six `--token-strip-*` tuning parameters (`--token-strip-min-stem`, `-max-prefix`, `-max-suffix`, `-min-leet-amb`, `-workers`, `-chunk-size`) — rarely adjusted individually; the Stage 0 on/off switch itself (`--token-strip` / `-T`) does have a short form.
+
+Short forms are listed in the **Short** column of every table below, and in `python run_rulest.py --help`.
+
 ### `run_rulest.py` — Full Reference
 
 ```
@@ -135,56 +159,55 @@ usage: run_rulest.py [options] base_wordlist target_wordlist
 
 #### Core Arguments
 
-| Flag | Default | Description |
-|---|---|---|
-| `-o`, `--output` | `rulest_output.txt` | Output file path |
-| `--device` | best GPU | Device index, name substring, `"all"` to run every detected GPU in parallel, or a comma-separated index list (e.g. `"0,1"`) to run only those GPUs in parallel |
-| `--list-devices` | — | Print all available OpenCL devices and exit |
-| `--max-depth` | `2` | Maximum rule chain depth (1–31; depths >31 capped with a warning) |
-| `--target-hours` | `0.5` | Time budget in hours; controls chain generation budget for Stage 2 and Stage 3 |
-| `--max-chains` | unlimited | Hard cap on total chains generated |
-| `--bloom-mb` | dynamic | Override Bloom filter size (MB); 0 = auto-scale |
-| `--bloom-no-shard` | off | Force a single unsharded Bloom buffer even above the ~512 MB auto-shard threshold |
-| `--seed-rules` | None | File of user-supplied rules/chains |
-| `--depth2-chains` through `--depth10-chains` | dynamic | Per-depth chain budget overrides |
-| `--allow-reject-rules` | off | Include rejection rules (normally excluded as GPU-incompatible) |
-| `--no-builtin-seeds` | off | Disable the built-in seed families (Stage S) |
-| `--debug` | off | Enable verbose output |
+| Short | Flag | Default | Description |
+|---|---|---|---|
+| `-o` | `--output` | `rulest_output.txt` | Output file path |
+| `-d` | `--device` | best GPU | Device index, name substring, `"all"` to run every detected GPU in parallel, or a comma-separated index list (e.g. `"0,1"`) to run only those GPUs in parallel |
+| `-L` | `--list-devices` | — | Print all available OpenCL devices and exit |
+| `-m` | `--max-depth` | `2` | Maximum rule chain depth (1–31; depths >31 capped with a warning) |
+| `-t` | `--target-hours` | `0.5` | Time budget in hours; controls chain generation budget for Stage 2 and Stage 3 |
+| `-c` | `--max-chains` | unlimited | Hard cap on total chains generated |
+| `-B` | `--bloom-mb` | dynamic | Override Bloom filter size (MB); 0 = auto-scale |
+| — | `--bloom-no-shard` | off | Force a single unsharded Bloom buffer even above the ~512 MB auto-shard threshold |
+| `-r` | `--seed-rules` | None | File of user-supplied rules/chains |
+| — | `--depth2-chains` through `--depth10-chains` | dynamic | Per-depth chain budget overrides |
+| — | `--allow-reject-rules` | off | Include rejection rules (normally excluded as GPU-incompatible) |
+| `-n` | `--no-builtin-seeds` | off | Disable the built-in seed families (Stage S) |
+| `-D` | `--debug` | off | Enable verbose output |
+| `-p` | `--profile` | off | Enable profiling: print the unified per-stage wall-clock + GPU-event breakdown table at the end of the run. See [Profiling](#-profiling---profile---p). |
 
 #### Stage 0 — Token-Strip Arguments
 
-| Flag | Default | Description |
-|---|---|---|
-| `--token-strip` | off | Enable Stage 0 CPU exact-match pre-pass |
-| `--token-strip-min-stem` | `4` | Minimum stem length after token decoding |
-| `--token-strip-max-prefix` | `4` | Maximum boundary characters stripped from the start |
-| `--token-strip-max-suffix` | `4` | Maximum boundary characters stripped from the end |
-| `--token-strip-min-leet-amb` | `3` | Maximum ambiguous leet positions per word |
-| `--token-strip-workers` | `0` | Worker processes for Stage 0 (`0` = all cores) |
-| `--token-strip-chunk-size` | `0` | Words per worker chunk (`0` = auto) |
+| Short | Flag | Default | Description |
+|---|---|---|---|
+| `-T` | `--token-strip` | off | Enable Stage 0 CPU exact-match pre-pass |
+| — | `--token-strip-min-stem` | `4` | Minimum stem length after token decoding |
+| — | `--token-strip-max-prefix` | `4` | Maximum boundary characters stripped from the start |
+| — | `--token-strip-max-suffix` | `4` | Maximum boundary characters stripped from the end |
+| — | `--token-strip-min-leet-amb` | `3` | Maximum ambiguous leet positions per word |
+| — | `--token-strip-workers` | `0` | Worker processes for Stage 0 (`0` = all cores) |
+| — | `--token-strip-chunk-size` | `0` | Words per worker chunk (`0` = auto) |
 
 #### Genetic Algorithm Arguments
 
-| Flag | Default | Description |
-|---|---|---|
-| `--genetic` | off | Enable Stage 3 genetic algorithm rule evolution |
-| `--genetic-generations` | `50` | Maximum GA generations |
-| `--genetic-pop` | `200` | GA population size |
-| `--genetic-elite` | `0.15` | Fraction of top individuals carried unchanged each generation (must be strictly between 0 and 1) |
+| Short | Flag | Default | Description |
+|---|---|---|---|
+| `-g` | `--genetic` | off | Enable Stage 3 genetic algorithm rule evolution |
+| `-G` | `--genetic-generations` | `50` | Maximum GA generations |
+| `-P` | `--genetic-pop` | `200` | GA population size |
+| `-E` | `--genetic-elite` | `0.15` | Fraction of top individuals carried unchanged each generation (must be strictly between 0 and 1) |
 
 #### Rule Selection (post-processing) Arguments — 🆕 v3
 
-| Flag | Default | Description |
-|---|---|---|
-| `--select-mode` | `frequency` | `frequency`: sort by raw GPU hit count (v2 behaviour). `greedy`: lazy-greedy (CELF) marginal-coverage selection against the real target wordlist — maximizes the union of recovered words per rule budget instead of summed per-rule score. |
-| `--select-budget` | `0` | Max rules to keep with `--select-mode greedy` (`0` = run to saturation, i.e. until no remaining rule adds new coverage) |
-| `--select-budgets` | None | Comma-separated budgets (e.g. `"64,250,1500,10000,25000,50000,150000"`); emits extra files `<output>.<budget>.txt` cut from the same ordering, for either select mode |
-| `--select-cost-alpha` | `0.0` | `gain(r) = new_recovery(r) / depth(r)**alpha`. `0` (default) = pure marginal coverage; `>0` favors shorter/cheaper chains among rules with similar marginal gain |
-| `--exact-recovery` | off | Report exact distinct target-word recovery after greedy selection (reporting only — greedy coverage is already exact, resolved through the verification kernel before CELF selection) |
-| `--local-search` | off | Enable 1-swap local search (requires `--select-mode greedy`) |
-| `--local-search-swaps N` | `3000` | Max swap attempts |
-| `--local-search-pool N` | `15000` | Size of the residual-candidate pool |
-| `--local-search-refresh N` | 3 | Stop local search once this many consecutive full passes over the selected set |
+| Short | Flag | Default | Description |
+|---|---|---|---|
+| `-M` | `--select-mode` | `frequency` | `frequency`: sort by raw GPU hit count (v2 behaviour). `greedy`: lazy-greedy (CELF) marginal-coverage selection against the real target wordlist — maximizes the union of recovered words per rule budget instead of summed per-rule score. |
+| `-b` | `--select-budget` | `0` | Max rules to keep with `--select-mode greedy` (`0` = run to saturation, i.e. until no remaining rule adds new coverage) |
+| `-s` | `--select-budgets` | None | Comma-separated budgets (e.g. `"64,250,1500,10000,25000,50000,150000"`); emits extra files `<output>.<budget>.txt` cut from the same ordering, for either select mode |
+| `-a` | `--select-cost-alpha` | `0.0` | `gain(r) = new_recovery(r) / depth(r)**alpha`. `0` (default) = pure marginal coverage; `>0` favors shorter/cheaper chains among rules with similar marginal gain |
+| `-e` | `--exact-recovery` | off | Report exact distinct target-word recovery after greedy selection (reporting only — greedy coverage is already exact, resolved through the verification kernel before CELF selection) |
+
+> `-M` is capitalized because lowercase `-m` is already `--max-depth`; `-B` (bloom) is likewise capitalized since lowercase `-b` is reserved for `--select-budget`. Short flags are case-sensitive throughout — `-e` (`--exact-recovery`) and `-E` (`--genetic-elite`) are two different options.
 
 ---
 
@@ -208,6 +231,7 @@ The single-file v2 engine is now the `rulest` package:
 | `rulest/genetic.py` | Stage 3 genetic algorithm |
 | `rulest/extractor.py` | Pipeline orchestrator (`GPUExtractor`) |
 | `rulest/selection.py` | 🆕 Coverage evaluation + greedy (CELF) rule selection |
+| `rulest/profiling.py` | 🆕 Unified per-stage wall-clock + GPU-event profiling (`--profile` / `-p`) |
 | `rulest/io_utils.py` | Wordlist loading |
 | `rulest/worker_state.py` | Per-worker-process runtime state |
 | `rulest/cli.py` | Argument parsing, pipeline invocation, output/report writing |
@@ -234,7 +258,9 @@ SELECT — 🆕 frequency sort (default) OR greedy CELF marginal-coverage select
 GPU-safe, Hashcat-compatible .rule output file(s)
 ```
 
-On a multi-GPU run (`--device all` or an explicit index list), Stages 1, S, 2, and 3 are each split across the available `GPUEngine` / `ProcessEngineProxy` instances by `MultiGPUEngine` and merged before minimization and selection, which remain single-process steps.
+Every stage above, plus the Bloom filter build, minimization, and selection, reports its own wall-clock time (and, for GPU stages, a detailed host/GPU-event breakdown) when run with `--profile` / `-p` — see [Profiling](#-profiling---profile---p).
+
+On a multi-GPU run (`--device all` or an explicit index list), Stages 1, S, 2, and 3 are each split across the available `GPUEngine` / `ProcessEngineProxy` instances by `MultiGPUEngine` and merged before minimization and selection, which remain single-process steps. The detailed GPU-event breakdown in `--profile` output is only available for in-process (single-GPU) engine calls; multi-GPU runs still get the coarse per-stage wall-clock row, just without the nested GPU-event detail line.
 
 ---
 
@@ -242,7 +268,7 @@ On a multi-GPU run (`--device all` or an explicit index list), Stages 1, S, 2, a
 
 > Carried over from v2 — the mechanics below are unchanged, just reorganized into `rulest/multi_gpu.py` and `rulest/gpu_worker.py`.
 
-`--device` accepts:
+`--device` / `-d` accepts:
 
 | Value | Behavior |
 |---|---|
@@ -273,7 +299,7 @@ The Bloom filter is still always built **on the GPU** using the `atomic_or`-base
 
 **Sharding:** once the required filter size exceeds roughly 512 MB, the filter is automatically split into multiple shards (`BLOOM_NUM_SHARDS`) instead of requiring one oversized OpenCL allocation, which some drivers reject or handle poorly. Each shard is built and queried independently; hit results are merged transparently. Use `--bloom-no-shard` to force a single unsharded buffer (useful for debugging or when you know your driver handles large single allocations fine).
 
-Filter size is still selected automatically based on available VRAM (override with `--bloom-mb`):
+Filter size is still selected automatically based on available VRAM (override with `--bloom-mb` / `-B`):
 
 | Available VRAM | Auto bloom size |
 |---|---|
@@ -285,7 +311,7 @@ Filter size is still selected automatically based on available VRAM (override wi
 
 ## 🌱 Built-in Seed Families (A–M)
 
-Unchanged from v2. Thirteen deterministically generated seed families run as **Stage S**, a dedicated GPU extraction pass between Stage 1 and Stage 2, independent of `--max-depth` and the random-chain time budget. Disable with `--no-builtin-seeds`.
+Unchanged from v2. Thirteen deterministically generated seed families run as **Stage S**, a dedicated GPU extraction pass between Stage 1 and Stage 2, independent of `--max-depth` and the random-chain time budget. Disable with `--no-builtin-seeds` / `-n`.
 
 | Family | Description |
 |---|---|
@@ -309,13 +335,13 @@ Depth-1 seeds are skipped (already covered by Stage 1). All multi-rule seed chai
 
 ## 🔤 Stage 0 — Token-Strip Rule Extraction
 
-Unchanged from v2. An optional CPU-only pre-pass (`--token-strip`) that runs **6 extraction modes** (letter, digit, reverse, delete-edge, dup/fold, insert) per target word, reverse-engineering exact Hashcat rule chains by decomposing each password into a base stem plus boundary/transform tokens, and verifying the chain reproduces the original word via `py_apply_chain`. Single-rule discoveries feed Stage 1; multi-rule chains feed Stage S and Stage 2.
+Unchanged from v2. An optional CPU-only pre-pass (`--token-strip` / `-T`) that runs **6 extraction modes** (letter, digit, reverse, delete-edge, dup/fold, insert) per target word, reverse-engineering exact Hashcat rule chains by decomposing each password into a base stem plus boundary/transform tokens, and verifying the chain reproduces the original word via `py_apply_chain`. Single-rule discoveries feed Stage 1; multi-rule chains feed Stage S and Stage 2.
 
 ---
 
 ## 🧬 Stage 3 — Genetic Algorithm
 
-Unchanged from v2. An optional evolutionary search (`--genetic`) that runs after Stage 2, with a dedicated time reservation of 20% of `--target-hours` (minimum 120 s). Fitness is novelty-weighted (2× bonus for chains not already found by Stage 1/S/2), with tournament selection, one-point crossover, mutation, and a stagnation guard that refreshes the bottom 30% of the population after 5 flat generations. In multi-GPU runs, each generation's population evaluation is split across GPUs by the same `MultiGPUEngine` used for Stages 1/S/2.
+Unchanged from v2. An optional evolutionary search (`--genetic` / `-g`) that runs after Stage 2, with a dedicated time reservation of 20% of `--target-hours` (minimum 120 s). Fitness is novelty-weighted (2× bonus for chains not already found by Stage 1/S/2), with tournament selection, one-point crossover, mutation, and a stagnation guard that refreshes the bottom 30% of the population after 5 flat generations. In multi-GPU runs, each generation's population evaluation is split across GPUs by the same `MultiGPUEngine` used for Stages 1/S/2.
 
 ---
 
@@ -329,7 +355,7 @@ v2 (and v3's default `--select-mode frequency`) sorts candidate rules purely by 
 
 ### Greedy marginal-coverage selection
 
-`--select-mode greedy` replaces frequency sorting with a two-step process:
+`--select-mode greedy` (`-M greedy`) replaces frequency sorting with a two-step process:
 
 1. **Coverage evaluation** (`evaluate_full_coverage`) — every candidate rule is evaluated against the real target wordlist. The GPU Bloom filter is used as a cheap prefilter, but every bloom-positive `(rule, base_word)` pair is then resolved through an **exact verification kernel**, mapping it to a specific target-word id. This produces `C(r)`: the exact set of distinct target words rule `r` actually recovers — with Bloom false positives excluded, so the optimization objective matches real recovery.
 
@@ -337,14 +363,16 @@ v2 (and v3's default `--select-mode frequency`) sorts candidate rules purely by 
 
 2. **Lazy greedy / CELF selection** (`select_rules_by_marginal_coverage`) — rules are picked one at a time by the largest **new** coverage they add to the running union, using the Cost-Effective Lazy Forward heuristic to avoid recomputing every rule's marginal gain at every step. This maximizes the union of recovered target passwords for a given rule budget — the classic (1 − 1/e) near-optimal guarantee for submodular set-cover greedy selection.
 
+   Internally, every batch of CELF GPU scoring calls is timed in detail (host allocation, host enqueue, GPU kernel, H2D/D2H transfer, synchronization wait) — the same accounting `--profile` now exposes for every other GPU stage too.
+
 ### Budget control
 
-| Flag | Effect |
-|---|---|
-| `--select-budget N` | Stop greedy selection after `N` rules (0 = run to saturation — keep going until no remaining rule adds any new coverage) |
-| `--select-budgets "64,250,1500,..."` | In addition to the main output, cut the **same** ordering (greedy or frequency) at each listed size and write `<output>.<budget>.txt` for each, without re-running coverage evaluation per size |
-| `--select-cost-alpha A` | Reweight marginal gain as `new_recovery(r) / depth(r)**A`; `0` (default) is pure coverage, `>0` favors shorter/cheaper chains when gains are similar |
-| `--exact-recovery` | Add an exact recovery count/percentage to the output header — reporting only, since greedy coverage is already computed exactly |
+| Flag | Short | Effect |
+|---|---|---|
+| `--select-budget N` | `-b N` | Stop greedy selection after `N` rules (0 = run to saturation — keep going until no remaining rule adds any new coverage) |
+| `--select-budgets "64,250,1500,..."` | `-s "64,250,1500,..."` | In addition to the main output, cut the **same** ordering (greedy or frequency) at each listed size and write `<output>.<budget>.txt` for each, without re-running coverage evaluation per size |
+| `--select-cost-alpha A` | `-a A` | Reweight marginal gain as `new_recovery(r) / depth(r)**A`; `0` (default) is pure coverage, `>0` favors shorter/cheaper chains when gains are similar |
+| `--exact-recovery` | `-e` | Add an exact recovery count/percentage to the output header — reporting only, since greedy coverage is already computed exactly |
 
 ### Compatibility
 
@@ -356,7 +384,64 @@ v2 (and v3's default `--select-mode frequency`) sorts candidate rules purely by 
 
 Unchanged from v2. After extraction, a signature-based pass applies every candidate rule to a fixed, built-in probe set via a pure-Python interpreter (`py_apply_chain`), groups rules with identical output signatures, and keeps only the highest-hit representative per group. Runs beyond `MINIMIZE_DISK_THRESHOLD` (500,000 raw candidates) automatically switch from the in-memory path to a SQLite-backed disk path to avoid OOM.
 
-Minimization runs **before** rule selection — `--select-mode greedy` selects from the already-deduplicated candidate pool.
+Minimization runs **before** rule selection — `--select-mode greedy` selects from the already-deduplicated candidate pool. With `--profile`, minimization gets its own row (`Minimization (dedup)`) in the profiling table, showing wall time and a `rule/s` throughput figure.
+
+---
+
+## 📊 Profiling (`--profile` / `-p`)
+
+`--profile` (short: `-p`) turns on a unified, opt-in profiling report printed once at the end of the run — built for **tuning**, not for normal day-to-day use, since the detailed GPU-event accounting adds a small amount of per-call overhead. Without `--profile`, nothing changes: the run behaves exactly as before.
+
+### What it shows
+
+Every stage of the pipeline — STAGE 0 (Token-Strip), the Bloom filter build, STAGE 1, STAGE S, STAGE 2, STAGE 3 (genetic), minimization, and rule selection (CELF) — gets one row in a single table at the end of the run, sorted slowest-first:
+
+```
+[PROFILE] Per-stage wall-clock breakdown (for tuning)
+  STAGE 2 — Rule Chain Search      33:00   55.0%  (9,343.4 chain/s)
+    gpu calls=5,400; host alloc=21.000s; host enqueue=38.000s; GPU kernel=1740.000s; H2D=14.000s; D2H=76.000s; synchronization wait=1790.000s; avg kernel/call=322.22ms
+  STAGE 3 — Genetic Algorithm      12:40   21.1%  (0.1 gen/s)
+    gpu calls=3,100; host alloc=3.500s; host enqueue=9.000s; GPU kernel=680.000s; H2D=5.000s; D2H=22.000s; synchronization wait=694.000s; avg kernel/call=219.35ms
+  STAGE 1 — Single Rule Search     06:50   11.4%  (8,707,317.1 combo/s)
+    gpu calls=850; host alloc=4.100s; host enqueue=8.900s; GPU kernel=362.000s; H2D=3.200s; D2H=18.400s; synchronization wait=370.000s; avg kernel/call=425.88ms
+  STAGE S — Seed Extraction        04:20    7.2%  (5,153.8 chain/s)
+    gpu calls=210; host alloc=2.000s; host enqueue=4.300s; GPU kernel=228.000s; H2D=1.800s; D2H=9.100s; synchronization wait=233.000s; avg kernel/call=1085.71ms
+  Selection (CELF greedy)          03:00    5.0%  (233.3 candidate/s)
+    gpu calls=1,284; host alloc=1.210s; host enqueue=3.840s; GPU kernel=152.900s; H2D=6.330s; D2H=12.590s; synchronization wait=174.360s; avg kernel/call=119.08ms
+  Minimization (dedup)             02:20    3.9%  (1,642.9 rule/s)
+  STAGE 0 — Token-Strip            01:35    2.6%  (8,947.4 word/s)
+  Bloom filter build               00:12    0.3%  (100,000.0 word/s)
+  Untracked / overhead             00:00    0.0%
+  Total wall time                1:00:00  100.0%
+```
+
+Each row shows wall-clock time, % of the total run, and (where applicable) a throughput figure in items/s. GPU-heavy stages get an extra indented line with the same breakdown the CELF selector already tracked internally:
+
+- **host alloc** — time spent allocating/uploading OpenCL buffers on the CPU side
+- **host enqueue** — time spent issuing kernel/copy commands (non-blocking)
+- **GPU kernel** — actual kernel execution time, from GPU profiling events
+- **H2D / D2H** — host→device and device→host transfer time
+- **synchronization wait** — time blocked on `queue.finish()`, waiting for the GPU
+
+A wait time much larger than the kernel time is the classic signal of batch-size/queue-depth overhead rather than genuine compute cost — a good first thing to look at when tuning `CHAINS_PER_BATCH` / `WORD_SUB_BATCH` / `WORDS_PER_BATCH`. Stages that are purely CPU-side (STAGE 0, Minimization) only ever show the plain wall-clock row, with no GPU-event line.
+
+A stage that was skipped (e.g. STAGE S with `--no-builtin-seeds`, or STAGE 2 with `--max-depth 1`) still gets a row, annotated with the reason instead of a duration, so you can see at a glance that it didn't run rather than wondering why it's missing.
+
+### Scope and limitations
+
+- **Single-GPU runs** get the full breakdown, including the nested GPU-event line, for every stage.
+- **Multi-GPU runs** (`--device all` or a comma list) still get the coarse per-stage wall-clock row for every stage, but the nested GPU-event detail line is only populated for whatever ran in-process — work dispatched to a `ProcessEngineProxy` worker in another OS process doesn't report back the detailed breakdown (the coarse timing is unaffected either way).
+- Enabling `--profile` also turns on `RULEST_CELF_PROFILE=1` internally, the finer-grained accounting the CELF selector has always supported — you no longer need to know there were two separate switches.
+
+### Equivalent environment variables
+
+For scripted or wrapped launches that don't go through `argparse`, either of these has the same effect as `--profile` / `-p`:
+
+```bash
+RULEST_PROFILE=1 python run_rulest.py base.txt target.txt ...
+# or, equivalently:
+RULEST_CELF_PROFILE=1 python run_rulest.py base.txt target.txt ...
+```
 
 ---
 
@@ -402,10 +487,10 @@ Defined in `rulest/common.py` (and `rulest/gpu_engine.py` for GPU-sizing constan
 
 | Constant | Default | Description |
 |---|---|---|
-| `VERBOSE` | `False` | Print per-rule validation messages and category counts; set at runtime via `--debug` |
+| `VERBOSE` | `False` | Print per-rule validation messages and category counts; set at runtime via `--debug` / `-D` |
 | `VRAM_USAGE_FACTOR` | `0.55` | Fraction of device global memory to treat as free VRAM |
 | `BLOOM_HASH_FUNCTIONS` | `4` | Number of FNV-1a hash functions in the Bloom filter |
-| `BLOOM_FILTER_MAX_MB` | `256` | Maximum Bloom filter allocation (MB); override at runtime with `--bloom-mb` |
+| `BLOOM_FILTER_MAX_MB` | `256` | Maximum Bloom filter allocation (MB); override at runtime with `--bloom-mb` / `-B` |
 | `HOT_RULE_RATIO` | `0.6` | Fraction of Stage 2 chains biased toward hot rules |
 | `EXTENSION_RATIO` | `0.3` | Fraction of Stage 2 budget allocated to seed extension |
 | `TIME_SAFETY_FACTOR` | `0.9` | Multiplier applied to time-budget combo estimates |
@@ -419,13 +504,13 @@ Defined in `rulest/common.py` (and `rulest/gpu_engine.py` for GPU-sizing constan
 | `MINIMIZE_DISK_BATCH_SIZE` | `10,000` | Rows per batch in the SQLite minimization path |
 | `BLOOM_NUM_SHARDS` | auto | Number of Bloom filter shards (carried over from v2); auto-computed above the ~512 MB single-buffer threshold, forced to 1 with `--bloom-no-shard` |
 
-> Stage 3 GA parameters (`--genetic-pop`, `--genetic-generations`, `--genetic-elite`) and Stage-selection parameters (`--select-budget`, `--select-cost-alpha`) are CLI-only and have no corresponding module-level constants.
+> Stage 3 GA parameters (`--genetic-pop`, `--genetic-generations`, `--genetic-elite`) and Stage-selection parameters (`--select-budget`, `--select-cost-alpha`) are CLI-only and have no corresponding module-level constants. `--profile` is likewise CLI-only (and its `RULEST_PROFILE`/`RULEST_CELF_PROFILE` env-var equivalents) — it only controls what gets printed, not any extraction behavior.
 
 ---
 
 ## 📄 Output Format
 
-`rulest_output.txt` (or your specified `-o` path). Header format for `--select-mode frequency` (default):
+`rulest_output.txt` (or your specified `-o`/`--output` path). Header format for `--select-mode frequency` (default):
 
 ```
 # rulest — GPU-Compatible Hashcat Rules Engine (optimized)
@@ -467,6 +552,7 @@ With `--select-mode greedy`, the header additionally includes the selection mode
 - The identity rule (`:`) is always written first for Hashcat compatibility.
 - With `--select-budgets`, additional files `<output>.<budget>.txt` are written for each requested size, each with its own header.
 - Encoding is `utf-8`.
+- The `--profile` table (if enabled) is printed to the console only — it is never written into the output rule file(s).
 
 ---
 
@@ -474,28 +560,30 @@ With `--select-mode greedy`, the header additionally includes the selection mode
 
 | Goal | Recommendation |
 |---|---|
-| Maximize coverage in fixed time | Increase `--target-hours` |
-| Use every GPU in the machine | `--device all` |
-| Use specific fast GPUs only | `--device 0,1,3` (avoid mixing in slow/mismatched devices) |
+| Find out what's actually slow before tuning anything else | `--profile` / `-p` — read the slowest row in the breakdown table first |
+| Maximize coverage in fixed time | Increase `--target-hours` / `-t` |
+| Use every GPU in the machine | `--device all` / `-d all` |
+| Use specific fast GPUs only | `--device 0,1,3` / `-d 0,1,3` (avoid mixing in slow/mismatched devices) |
 | Avoid Bloom sharding overhead | `--bloom-no-shard` (only if your driver handles large single allocations well) |
-| Get the most diverse ruleset for a fixed rule count | `--select-mode greedy --select-budget N` |
-| Compare recovery at several rule-budget sizes without re-running | `--select-mode greedy --select-budgets "100,1000,10000,50000"` |
-| Prefer shorter/cheaper chains in greedy selection | Raise `--select-cost-alpha` (e.g. `0.5`) |
-| Confirm real recovery % (not bloom estimate) | Add `--exact-recovery` |
-| Skip built-in seed families | `--no-builtin-seeds` |
-| Reduce VRAM pressure | Lower `--max-chains` or use `--depth2-chains` / `--depth3-chains` |
+| Get the most diverse ruleset for a fixed rule count | `--select-mode greedy --select-budget N` (`-M greedy -b N`) |
+| Compare recovery at several rule-budget sizes without re-running | `--select-mode greedy --select-budgets "100,1000,10000,50000"` (`-M greedy -s "..."`) |
+| Prefer shorter/cheaper chains in greedy selection | Raise `--select-cost-alpha` / `-a` (e.g. `0.5`) |
+| Confirm real recovery % (not bloom estimate) | Add `--exact-recovery` / `-e` |
+| Skip built-in seed families | `--no-builtin-seeds` / `-n` |
+| Reduce VRAM pressure | Lower `--max-chains` / `-c`, or use `--depth2-chains` / `--depth3-chains` |
 | Force deep chain exploration | Set `--depth4-chains 50000 --depth5-chains 10000` explicitly |
-| Bootstrap from prior results | Pass previous output to `--seed-rules` for iterative refinement |
-| Enable token-strip pre-pass | Add `--token-strip` — most effective for structured targets (leet speak, capitalized words, boundary digits) |
-| Enable evolutionary search | Add `--genetic` with `--max-depth 3` or higher |
-| Speed up GA per generation | Lower `--genetic-pop` |
-| Improve GA convergence quality | Raise `--genetic-pop` and `--genetic-generations` |
+| Bootstrap from prior results | Pass previous output to `--seed-rules` / `-r` for iterative refinement |
+| Enable token-strip pre-pass | Add `--token-strip` / `-T` — most effective for structured targets (leet speak, capitalized words, boundary digits) |
+| Enable evolutionary search | Add `--genetic` / `-g` with `--max-depth 3` / `-m 3` or higher |
+| Speed up GA per generation | Lower `--genetic-pop` / `-P` |
+| Improve GA convergence quality | Raise `--genetic-pop` / `-P` and `--genetic-generations` / `-G` |
+| Check whether host-side overhead (alloc/enqueue/wait) or the GPU kernel itself dominates a stage | `--profile` and compare that stage's `GPU kernel=` time to its `synchronization wait=` time |
 
 ---
 
 ## ✅ Testing
 
-Unit tests are included under `tests/` (pytest), covering rule-pool synchronization across GPUs, greedy/CELF selection logic, functional minimization, common utilities, I/O helpers, and exact-output parity for multi-GPU runs vs. single-GPU runs.
+Unit tests are included under `tests/` (pytest), covering rule-pool synchronization across GPUs, greedy/CELF selection logic, functional minimization, common utilities, I/O helpers, the profiling module (`test_profiling.py`), and exact-output parity for multi-GPU runs vs. single-GPU runs.
 
 ```bash
 pip install -r requirements-dev.txt
@@ -509,11 +597,15 @@ pytest
 **Classic v2-equivalent behaviour (default, single GPU, frequency sort):**
 ```bash
 python run_rulest.py rockyou.txt target.txt --max-depth 2 -o rules.txt
+# short-flag form:
+python run_rulest.py rockyou.txt target.txt -m 2 -o rules.txt
 ```
 
 **Run on every detected GPU:**
 ```bash
 python run_rulest.py rockyou.txt target.txt --device all --max-depth 3 --target-hours 2.0 -o rules.txt
+# short-flag form:
+python run_rulest.py rockyou.txt target.txt -d all -m 3 -t 2.0 -o rules.txt
 ```
 
 **Run on two specific GPUs only:**
@@ -525,6 +617,8 @@ python run_rulest.py rockyou.txt target.txt --device 0,2 --max-depth 3 -o rules.
 ```bash
 python run_rulest.py base.txt target.txt -o rules.txt \
     --select-mode greedy --select-budget 50000
+# short-flag form:
+python run_rulest.py base.txt target.txt -o rules.txt -M greedy -b 50000
 ```
 
 **Greedy selection with a budget sweep and exact recovery reporting:**
@@ -550,6 +644,9 @@ python run_rulest.py rockyou.txt target.txt \
     --genetic --genetic-pop 300 --genetic-generations 75 \
     --select-mode greedy --select-budget 100000 \
     -o full_pipeline.txt
+# short-flag form:
+python run_rulest.py rockyou.txt target.txt \
+    -d all -T -m 4 -t 2.0 -g -P 300 -G 75 -M greedy -b 100000 -o full_pipeline.txt
 ```
 
 **Large target — bloom sharding handled automatically (behavior carried over from v2):**
@@ -565,9 +662,21 @@ python run_rulest.py base.txt large_target.txt \
     -o large_bloom_unsharded.txt
 ```
 
+**Tune a run with the full profiling breakdown:**
+```bash
+python run_rulest.py base.txt target.txt \
+    --device all --max-depth 4 --target-hours 1.0 \
+    --genetic --select-mode greedy --select-budget 50000 \
+    --profile -o rules.txt
+# short-flag form:
+python run_rulest.py base.txt target.txt -d all -m 4 -t 1.0 -g -M greedy -b 50000 -p -o rules.txt
+```
+
 **List available OpenCL devices:**
 ```bash
 python run_rulest.py --list-devices
+# short-flag form:
+python run_rulest.py -L
 ```
 
 ### 💡 Pro Tips
@@ -576,6 +685,7 @@ python run_rulest.py --list-devices
 - `--select-mode greedy` is most valuable when you need a **small, deployable** ruleset (e.g. for repeated cracking runs) rather than the largest possible candidate pool — it trades exhaustive coverage for maximum coverage-per-rule.
 - Start with `--select-budgets` during experimentation to see the recovery curve before committing to a single budget.
 - On mixed-vendor multi-GPU systems, let the adaptive load balancer calibrate for a stage or two before judging split quality — the first stage after startup defaults to equal shares.
+- Run once with `--profile` before changing any tuning constants — the breakdown table tells you which stage is actually worth tuning, instead of guessing.
 
 ---
 
