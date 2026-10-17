@@ -1,10 +1,61 @@
+import pytest
+
 import numpy as np
 from rulest.selection import (
     _TargetFingerprintIndex,
     _celf_select_from_upper_bounds,
     _fingerprint64,
     _splitmix64,
+    _resolve_single_engine,
 )
+
+
+class _FakeSingleEngine:
+    """Stands in for a plain GPUEngine/ProcessEngineProxy: no `.engines`
+    attribute at all, so _resolve_single_engine must pass it through
+    unchanged."""
+    pass
+
+
+class _FakeMultiGPUEngine:
+    """Stands in for MultiGPUEngine: duck-typed by having an `.engines`
+    list, the only thing _resolve_single_engine actually looks at."""
+    def __init__(self, engines):
+        self.engines = engines
+
+
+class _FakeDevice:
+    def __init__(self, name):
+        self.name = name
+
+
+class _FakeSubEngine:
+    def __init__(self, name):
+        self.device = _FakeDevice(name)
+
+
+def test_resolve_single_engine_passes_through_a_plain_engine_unchanged():
+    eng = _FakeSingleEngine()
+    assert _resolve_single_engine(eng) is eng
+
+
+def test_resolve_single_engine_unwraps_multi_gpu_to_its_first_engine():
+    primary = _FakeSubEngine("NVIDIA GeForce RTX 3060 Ti")
+    other = _FakeSubEngine("Intel(R) UHD Graphics 630")
+    multi = _FakeMultiGPUEngine([primary, other])
+    assert _resolve_single_engine(multi) is primary
+
+
+def test_resolve_single_engine_raises_a_clear_error_when_no_gpu_survived():
+    # This is the scenario from the field crash: every device became
+    # unresponsive during an earlier stage and was pruned, leaving
+    # MultiGPUEngine.engines empty. Previously this fell through to
+    # AttributeError: 'MultiGPUEngine' object has no attribute
+    # 'set_base_words' deep inside _GpuExactScorer.__init__ instead of a
+    # clear, actionable message right here.
+    multi = _FakeMultiGPUEngine([])
+    with pytest.raises(RuntimeError, match="No GPU device is available"):
+        _resolve_single_engine(multi)
 
 
 def test_fingerprint_collision_requires_exact_string_match():
