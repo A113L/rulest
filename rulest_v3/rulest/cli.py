@@ -188,10 +188,21 @@ def main():
         token_strip_chunk_size=args.token_strip_chunk_size,
     )
     depth_overrides = {f'depth{i}_override': getattr(args, f'depth{i}_chains') for i in range(2,11)}
+    # Greedy CELF selection (below) still needs one live GPU from this same
+    # pool: it runs after extract_rules() returns, on extractor.gpu_engine
+    # directly (CELF is single-GPU only -- see _resolve_single_engine in
+    # selection.py -- but it reuses whichever device survived extraction
+    # rather than opening a second one). So a MultiGPUEngine must NOT be
+    # shut down here when selection is still going to use it: doing so
+    # used to terminate every worker process right after Stage 0-3 and
+    # leave Selection holding a dead engine, surfacing later as either a
+    # hang or an unrelated-looking AttributeError deep in _GpuExactScorer.
+    # Non-greedy ('frequency') mode never touches the GPU again, so it's
+    # still safe -- and good practice -- to free the pool immediately.
     try:
         raw_counts = extractor.extract_rules(base_words, target_words, **depth_overrides)
     finally:
-        if isinstance(extractor.gpu_engine, MultiGPUEngine):
+        if isinstance(extractor.gpu_engine, MultiGPUEngine) and args.select_mode != 'greedy':
             extractor.gpu_engine.shutdown()
     # Keep keyboard listener alive through minimize + coverage + CELF +
     # local-search so [p]/[r]/[q] work on every stage, not only STAGE 0–3.
@@ -246,21 +257,30 @@ def main():
                 if r != ':': f.write(f"{r}\n")
 
     if args.select_mode == 'greedy':
+        if isinstance(extractor.gpu_engine, MultiGPUEngine) and not extractor.gpu_engine.engines:
+            log_error("[GPU]  No GPU device is available for selection -- every GPU "
+                      "became unresponsive during extraction. Re-run with a single, "
+                      "healthy --device.")
+            sys.exit(1)
         candidate_rules = [r for r in final_counts if r != ':']
         n_target = len(set(target_words))
         budget = args.select_budget if args.select_budget > 0 else None
 
-        with stage_profiler.track("Selection (CELF greedy)", unit="candidate") as _selt:
-            selected, covered_mask = select_rules_by_marginal_coverage(
-                extractor.gpu_engine,
-                base_words,
-                target_words,
-                candidate_rules,
-                args.max_depth,
-                budget=budget,
-                cost_alpha=args.select_cost_alpha,
-            )
-            _selt.set_count(len(candidate_rules))
+        try:
+            with stage_profiler.track("Selection (CELF greedy)", unit="candidate") as _selt:
+                selected, covered_mask = select_rules_by_marginal_coverage(
+                    extractor.gpu_engine,
+                    base_words,
+                    target_words,
+                    candidate_rules,
+                    args.max_depth,
+                    budget=budget,
+                    cost_alpha=args.select_cost_alpha,
+                )
+                _selt.set_count(len(candidate_rules))
+        finally:
+            if isinstance(extractor.gpu_engine, MultiGPUEngine):
+                extractor.gpu_engine.shutdown()
 
         ordered_rules = [rule for rule, _gain in selected]
         top_selected = list(selected)

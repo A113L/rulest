@@ -456,11 +456,45 @@ def _celf_select_from_upper_bounds(
         raise RuntimeError("CELF gain accounting disagrees with covered bitmap")
     return selected, covered
 
+def _resolve_single_engine(gpu_engine):
+    """CELF selection runs on exactly ONE GPU -- unlike Stage 1/2/Seed
+    extraction, it never fans a round's work out across several engines
+    (there is only one active hash table / target bitmap, and CELF's
+    round-to-round state has to live in one place). A MultiGPUEngine from
+    `--device all`/an explicit multi-device list is accepted transparently
+    by using its first surviving engine, rather than requiring the caller
+    to know to unwrap it -- and if every device became unresponsive during
+    an earlier stage (so MultiGPUEngine.engines is empty), this raises a
+    clear, actionable RuntimeError here instead of letting a MultiGPUEngine
+    fall through to .set_base_words()/.celf_*() calls it never implements,
+    which previously surfaced as a confusing
+    `AttributeError: 'MultiGPUEngine' object has no attribute 'set_base_words'`
+    three frames below the real cause.
+    """
+    engines = getattr(gpu_engine, 'engines', None)
+    if engines is None:
+        return gpu_engine  # already a single GPUEngine/ProcessEngineProxy
+    if not engines:
+        raise RuntimeError(
+            "[CELF]  No GPU device is available for selection -- every GPU "
+            "became unresponsive during an earlier stage. Re-run with a "
+            "single, healthy --device."
+        )
+    if len(engines) > 1:
+        primary = engines[0]
+        name = primary.device.name.strip() if getattr(primary, 'device', None) else "device 0"
+        log_warn(
+            f"[CELF]  Selection runs on a single GPU ({name}); the other "
+            f"{len(engines) - 1} device(s) stay idle for this stage."
+        )
+    return engines[0]
+
+
 class _GpuExactScorer:
     """Thin adapter around the GPU-resident target table and exact-match kernels."""
 
     def __init__(self, gpu_engine, base_words, target_words, pair_batch_size, candidate_rules):
-        self.gpu_engine = gpu_engine
+        self.gpu_engine = _resolve_single_engine(gpu_engine)
         self.base_words = base_words
         self.targets = target_words if isinstance(target_words, list) else list(target_words)
         self.pair_batch_size = max(1, int(pair_batch_size))
