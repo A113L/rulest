@@ -478,6 +478,59 @@ def test_dead_seeds_use_the_cheap_exact_batch_path_not_a_recording_scan():
     assert singleton_calls == [4]
 
 
+def test_seed_candidates_are_exact_scored_together_not_one_gpu_call_each():
+    """Regression test for the `synchronization wait` / 67-76% wall-time
+    symptom: with `score_exact_batch_fn` available, an entire batch of
+    top-of-heap seed candidates must be exact-scored in ONE
+    `score_exact_batch_fn` call (one GPU dispatch), not one call per
+    candidate. Before this fix, every round always popped and exact-scored
+    exactly one seed at a time -- correct, but each round paid for its own
+    GPU launch + blocking synchronization even when score_exact_batch_fn
+    could have resolved several of them together.
+    """
+    # Eight candidates with inflated (duplicate-heavy) raw upper bounds, all
+    # of which happen to have zero true gain, followed by one real winner
+    # with a much lower raw bound -- i.e. a long dead run at the top of the
+    # heap, exactly the shape that used to burn one GPU call per dead seed.
+    rules = [f"dead{i}" for i in range(8)] + ["winner"]
+    true_sets = [set() for _ in range(8)] + [{0}]
+    upper_bounds = [100 - 10 * i for i in range(8)] + [1]
+
+    exact_batch_calls = []
+    singleton_calls = []
+
+    def score_one(i, covered):
+        singleton_calls.append(i)
+        return true_sets[i] - set(np.flatnonzero(covered))
+
+    def score_bounds(indices, covered):
+        return [upper_bounds[i] for i in indices]
+
+    def score_exact_batch(indices, covered):
+        exact_batch_calls.append(tuple(indices))
+        covered_ids = set(np.flatnonzero(covered))
+        return [len(true_sets[i] - covered_ids) for i in indices]
+
+    selected, covered = _celf_select_from_upper_bounds(
+        rules, upper_bounds, 1, score_one, budget=None,
+        score_batch_fn=score_bounds, score_exact_batch_fn=score_exact_batch,
+        rescore_batch_size=8,
+    )
+
+    assert selected == [("winner", 1)]
+    assert int(covered.sum()) == 1
+    # All 8 dead candidates share the same batch_size=8 ceiling as the
+    # winner's bound (1), so the heap holds exactly 9 positive-bound
+    # entries and the first seed-batch pop takes all 8 dead ones together.
+    assert len(exact_batch_calls) == 2, (
+        f"expected one batched call for all 8 dead seeds plus one for the "
+        f"winner, got {exact_batch_calls}"
+    )
+    assert len(exact_batch_calls[0]) == 8
+    # Still exactly one recording scan: the real winner's.
+    assert singleton_calls == [8]
+
+
 def test_batched_exact_rescoring_matches_reference_on_randomized_coverage():
     import random
 
