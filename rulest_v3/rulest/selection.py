@@ -307,6 +307,7 @@ def _celf_select_from_upper_bounds(
     batch_rescored = 0
     recovered = 0
     current_batch_size = 1
+    seed_probe_size = 1
     progress_enabled = bool(sys.stderr.isatty())
     last_refresh = [0.0]
     t0 = time.monotonic()
@@ -416,20 +417,105 @@ def _celf_select_from_upper_bounds(
             if bound:
                 heapq.heappush(heap, (-priority(bound, index), int(index), bound))
 
+        def score_seed_batch(seed_indices):
+            """Exact-score several top-of-heap candidates TOGETHER as this
+            round's seed probe, instead of scoring the single top candidate
+            alone.
+
+            Coverage is not committed until this round's actual winner is
+            chosen (after the inner while-loop below), so scoring several
+            top-ranked candidates against the same `covered` snapshot up
+            front is exactly as correct as scoring them one at a time across
+            consecutive rounds -- it is a pure trade of GPU dispatch count
+            against per-call work, never a change to which rules end up
+            selected. Losers are pushed back with their now-exact gain,
+            which remains a valid admissible bound in every later round
+            (coverage only shrinks).
+
+            How many candidates to probe with is decided by the caller
+            (`seed_probe_size`, below) -- NOT fixed to `rescore_batch_size`.
+            An earlier version of this function always probed a full
+            `rescore_batch_size`-sized batch every round. That is a net win
+            only when the heap is duplicate-heavy (many consecutive dead
+            candidates at the top); on an ordinary, non-duplicate-heavy run
+            where the very first candidate is already the round's winner,
+            it turned a single cheap 1-candidate GPU call into a wasted
+            `rescore_batch_size`-candidate one on every single round --
+            observed as CELF capping out around 200 rules/s and the whole
+            phase taking several minutes longer. The adaptive doubling in
+            the caller fixes that: this function just scores whatever batch
+            it is given.
+
+            Returns (best_index, best_gain, best_ids=None) for the batch's
+            winner, or (None, 0, None) if every scored candidate was dead
+            (zero exact gain).
+            """
+            nonlocal exact_gain_only
+            exact_gain_only += len(seed_indices)
+            if on_scan_progress is None:
+                gains = score_exact_batch_fn(seed_indices, covered)
+            else:
+                gains = score_exact_batch_fn(seed_indices, covered, report_scan)
+            if len(gains) != len(seed_indices):
+                raise RuntimeError("CELF exact batch scorer returned the wrong number of gains")
+            report_scan()
+            winner_index, winner_gain = None, -1
+            for index, raw_gain in zip(seed_indices, gains):
+                gain = max(0, int(raw_gain))
+                if winner_index is None or gain > winner_gain or (gain == winner_gain and index < winner_index):
+                    if winner_index is not None:
+                        push(winner_index, winner_gain)
+                    winner_index, winner_gain = index, gain
+                else:
+                    push(index, gain)
+            if winner_gain <= 0:
+                return None, 0, None
+            return winner_index, winner_gain, None
+
         while heap and len(selected) < limit:
-            # Start each round with the strongest outstanding bound, but never
-            # assume that its upper bound is the exact gain.
-            _neg_seed_priority, seed_index, _seed_bound = heapq.heappop(heap)
-            seed_index = int(seed_index)
-            # Cheap exact-gain-only check first (see exact_gain()): most
-            # seeds popped off a duplicate-heavy raw-bound heap turn out to
-            # have a losing or zero exact gain, so this avoids paying for a
-            # full hit-recording scan on every single one of them.
-            best_gain, best_ids = exact_gain(seed_index)
-            if best_gain <= 0:
-                # Marginal gain can only shrink; zero-gain candidates are dead.
-                continue
-            best_index = seed_index
+            # Start each round with the strongest outstanding bound(s), but
+            # never assume a raw bound is the exact gain.
+            if score_exact_batch_fn is None:
+                # CPU/legacy fallback: exact-score exactly the single top
+                # candidate, unchanged from the original behaviour.
+                _neg_seed_priority, seed_index, _seed_bound = heapq.heappop(heap)
+                seed_index = int(seed_index)
+                best_gain, best_ids = exact_gain(seed_index)
+                if best_gain <= 0:
+                    # Marginal gain can only shrink; zero-gain candidates are dead.
+                    continue
+                best_index = seed_index
+            else:
+                # Adaptive probe size: start at 1 (the cost of the original
+                # single-seed behaviour) and only double -- capped at
+                # `batch_size` -- when a probe comes back entirely dead
+                # (every candidate in it has zero exact gain). This keeps the
+                # common case (the top-of-heap candidate is already this
+                # round's winner) down to exactly one small GPU call, while
+                # still clearing a long duplicate-heavy run of dead
+                # candidates in O(log(run length)) calls instead of either
+                # one call per dead candidate (the pre-batching behaviour) or
+                # a full `batch_size`-sized call on every single round
+                # (the earlier, too-aggressive version of this fix).
+                probe_size = min(seed_probe_size, batch_size)
+                seed_indices = []
+                while heap and len(seed_indices) < probe_size:
+                    _neg_p, index, _bound = heapq.heappop(heap)
+                    seed_indices.append(int(index))
+                if not seed_indices:
+                    break
+                current_batch_size = len(seed_indices)
+                best_index, best_gain, best_ids = score_seed_batch(seed_indices)
+                if best_index is None:
+                    # Every candidate in this probe was dead; grow the next
+                    # probe and keep going without re-entering the outer
+                    # while loop's bookkeeping.
+                    seed_probe_size = min(seed_probe_size * 2, batch_size)
+                    continue
+                # Found a winner -- most rounds do, on a non-duplicate-heavy
+                # pool -- so reset back down to the cheap 1-candidate probe
+                # for the next round.
+                seed_probe_size = 1
             fresh_this_round = set()
 
             while heap:
