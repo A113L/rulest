@@ -344,6 +344,12 @@ def test_greedy_selection_reads_celf_state_from_the_selected_single_gpu(monkeypa
         def score_gains_batch(self, rules, progress_callback=None):
             return [1] * len(rules)
 
+        def score_exact_gains_batch(self, rules, progress_callback=None):
+            # Exercised by the seed-pop's cheap exact-gain-only check (see
+            # exact_gain() in selection.py), which now runs before any
+            # expensive recording scan, even for a single-candidate round.
+            return [1] * len(rules)
+
         def mark_selected(self, target_ids):
             return None
 
@@ -356,3 +362,224 @@ def test_greedy_selection_reads_celf_state_from_the_selected_single_gpu(monkeypa
     )
     assert selected == [("l", 1)]
     assert int(covered.sum()) == 1
+
+
+def test_batched_exact_rescoring_preserves_greedy_results_and_reduces_singleton_calls():
+    """Contenders that can still win are exact-scored as a batch, while only the
+    seed and final winner need target-ID recording scans."""
+    rules = ["A", "B", "C", "D", "E"]
+    sets = [
+        {0},
+        {1, 2},
+        {1, 2, 3},
+        {3, 4},
+        {5, 6},
+    ]
+    multiplicity = [
+        {0: 10},
+        {1: 5, 2: 5},
+        {1: 4, 2: 4, 3: 4},
+        {3: 2, 4: 2},
+        {5: 1, 6: 1},
+    ]
+    singleton_calls = []
+    exact_batches = []
+
+    def score_one(i, covered):
+        singleton_calls.append(i)
+        return sets[i] - set(np.flatnonzero(covered))
+
+    def score_bounds(indices, covered):
+        covered_ids = set(np.flatnonzero(covered))
+        return [sum(v for t, v in multiplicity[i].items() if t not in covered_ids) for i in indices]
+
+    def score_exact_batch(indices, covered):
+        exact_batches.append(tuple(indices))
+        covered_ids = set(np.flatnonzero(covered))
+        return [len(sets[i] - covered_ids) for i in indices]
+
+    selected, covered = _celf_select_from_upper_bounds(
+        rules, [20, 10, 12, 4, 2], 7, score_one, budget=4,
+        score_batch_fn=score_bounds, score_exact_batch_fn=score_exact_batch,
+        rescore_batch_size=3,
+    )
+
+    expected = []
+    remaining = set(range(len(rules)))
+    covered_ref = set()
+    while remaining and len(expected) < 4:
+        idx = min(remaining, key=lambda i: (-len(sets[i] - covered_ref), i))
+        gain = len(sets[idx] - covered_ref)
+        if gain <= 0:
+            break
+        expected.append((rules[idx], gain))
+        covered_ref |= sets[idx]
+        remaining.remove(idx)
+
+    assert selected == expected
+    assert set(np.flatnonzero(covered)) == covered_ref
+    assert exact_batches, "the optimized exact-batch path should be exercised"
+    # A batch may need a recording pass when it displaces the seed, but not one
+    # full singleton score per competing candidate.
+    assert len(singleton_calls) < 2 * len(selected) + 1
+
+
+def test_dead_seeds_use_the_cheap_exact_batch_path_not_a_recording_scan():
+    """Regression test for the "selected=0 while exact scans climb into the
+    thousands" symptom: when `score_exact_batch_fn` is available, a losing
+    round seed (and a losing "fresh_this_round" re-check) must be resolved
+    through the cheap batched-exact kernel, never through the full
+    recording-scan `score_fn`/`score_one` path. Before this fix, the seed
+    and the fresh-contender re-check always called the expensive singleton
+    recording path directly, so a heap full of duplicate-inflated raw upper
+    bounds that mostly resolve to zero exact gain burned thousands of full
+    GPU wordlist scans with hit recording before anything was ever selected.
+    """
+    # Five candidates whose raw (duplicate-inflated) upper bounds all look
+    # promising, but whose TRUE exact marginal gain is zero for four of
+    # them and small for the fifth -- i.e. a duplicate-heavy pool exactly
+    # like the one described in the bug report.
+    rules = ["dead1", "dead2", "dead3", "dead4", "winner"]
+    true_sets = [set(), set(), set(), set(), {0}]
+    upper_bounds = [50, 40, 30, 20, 1]
+
+    singleton_calls = []
+    exact_batch_calls = []
+
+    def score_one(i, covered):
+        # The expensive path: must be called at most once, for the actual
+        # winner's recording scan.
+        singleton_calls.append(i)
+        return true_sets[i] - set(np.flatnonzero(covered))
+
+    def score_bounds(indices, covered):
+        # Deliberately return the raw (inflated) bounds unchanged, so every
+        # dead candidate still looks like it could beat the eventual winner
+        # after cheap tightening, forcing the exact-batch path to resolve
+        # each one.
+        return [upper_bounds[i] for i in indices]
+
+    def score_exact_batch(indices, covered):
+        exact_batch_calls.append(tuple(indices))
+        covered_ids = set(np.flatnonzero(covered))
+        return [len(true_sets[i] - covered_ids) for i in indices]
+
+    selected, covered = _celf_select_from_upper_bounds(
+        rules, upper_bounds, 1, score_one, budget=None,
+        score_batch_fn=score_bounds, score_exact_batch_fn=score_exact_batch,
+        rescore_batch_size=4,
+    )
+
+    assert selected == [("winner", 1)]
+    assert int(covered.sum()) == 1
+    assert exact_batch_calls, "dead/losing candidates must be resolved via the cheap exact-batch path"
+    # Exactly one recording scan: the real winner's. None of the four dead
+    # seeds/contenders should ever reach the expensive singleton path.
+    assert singleton_calls == [4]
+
+
+def test_batched_exact_rescoring_matches_reference_on_randomized_coverage():
+    import random
+
+    for seed in range(35):
+        rng = random.Random(seed + 1000)
+        n_rules, n_targets = 11, 23
+        rules = [f"R{i}" for i in range(n_rules)]
+        sets = [{t for t in range(n_targets) if rng.random() < 0.3} for _ in rules]
+        multiplicity = [{t: rng.randint(1, 7) for t in sets[i]} for i in range(n_rules)]
+        initial_bounds = [sum(multiplicity[i].values()) + (n_rules - i) for i in range(n_rules)]
+
+        def score_one(i, covered, _sets=sets):
+            return _sets[i] - set(np.flatnonzero(covered))
+
+        def score_bounds(indices, covered, _sets=sets, _mult=multiplicity):
+            covered_ids = set(np.flatnonzero(covered))
+            return [sum(_mult[i][t] for t in _sets[i] if t not in covered_ids) for i in indices]
+
+        def score_exact(indices, covered, _sets=sets):
+            covered_ids = set(np.flatnonzero(covered))
+            return [len(_sets[i] - covered_ids) for i in indices]
+
+        selected, covered = _celf_select_from_upper_bounds(
+            rules, initial_bounds, n_targets, score_one, budget=8,
+            score_batch_fn=score_bounds, score_exact_batch_fn=score_exact,
+            rescore_batch_size=4,
+        )
+
+        expected = []
+        covered_ref = set()
+        remaining = set(range(n_rules))
+        while remaining and len(expected) < 8:
+            idx = min(remaining, key=lambda i: (-len(sets[i] - covered_ref), i))
+            gain = len(sets[idx] - covered_ref)
+            if gain <= 0:
+                break
+            expected.append((rules[idx], gain))
+            covered_ref |= sets[idx]
+            remaining.remove(idx)
+
+        assert selected == expected, f"seed={seed}: {selected} != {expected}"
+        assert set(np.flatnonzero(covered)) == covered_ref
+
+
+def test_gpu_exact_batch_mismatch_restarts_on_safe_singleton_path(monkeypatch):
+    """A GPU batch/record disagreement must restart, never keep suspect gains."""
+    import rulest.selection as selection_module
+
+    class FakeEngine:
+        def __init__(self):
+            self.params = {"CELF_RULE_BATCH_SIZE": 2, "CELF_SEEN_SCRATCH_MB": 4}
+            self._celf_seen_words = 1
+            self._celf_batch_capacity = 2
+            self.device = None
+            self.reset_count = 0
+
+        def celf_reset_active_targets(self):
+            self.reset_count += 1
+
+        def celf_report_profile(self):
+            return None
+
+        def celf_profile_summary(self):
+            return None
+
+        def celf_release_target_table(self):
+            return None
+
+    class FakeScorer:
+        def __init__(self, gpu_engine, base_words, target_words, pair_batch_size, candidate_rules):
+            self.gpu_engine = gpu_engine
+            self.bounds = {"A": 10, "B": 9}
+            self.exact_batch_calls = 0
+
+        def upper_bound_batch(self, rules):
+            return [self.bounds[r] for r in rules]
+
+        def score_gains_batch(self, rules, progress_callback=None):
+            return [self.bounds[r] for r in rules]
+
+        def score_exact_gains_batch(self, rules, progress_callback=None):
+            self.exact_batch_calls += 1
+            # Simulate the reported hardware discrepancy on B: speculative exact
+            # batch says 2, while its recording scan confirms only 1 target.
+            return [2 if r == "B" else 1 for r in rules]
+
+        def score_one_with_targets(self, rule, covered_mask=None, progress_callback=None):
+            return 1, ({"A": {0}, "B": {1}}[rule])
+
+        def mark_selected(self, target_ids):
+            return None
+
+        def close(self):
+            return None
+
+    engine = FakeEngine()
+    monkeypatch.setattr(selection_module, "_GpuExactScorer", FakeScorer)
+    selected, covered = selection_module.select_rules_by_marginal_coverage(
+        engine, ["base"], ["target0", "target1"], ["A", "B"],
+        max_depth=8, budget=1,
+    )
+
+    assert selected == [("A", 1)]
+    assert int(covered.sum()) == 1
+    assert engine.reset_count == 1
