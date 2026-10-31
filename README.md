@@ -367,15 +367,6 @@ If a batched exact rescore ever disagrees with what the committed-winner account
 
 ### Budget control
 
-| Flag | Short | Effect |
-|---|---|---|
-| `--select-budget N` | `-b N` | Stop greedy selection after `N` rules (0 = run to saturation — keep going until no remaining rule adds any new coverage) |
-| `--select-budgets "64,250,1500,..."` | `-s "64,250,1500,..."` | In addition to the main output, cut the **same** greedy ordering at each listed size and write `<output>.<budget>.txt` for each. Because CELF's per-rule marginal gains are disjoint increments of the same coverage union, each prefix's recovery is just the sum of its rules' recorded gains — no re-scoring or coverage recompute needed per size. (In `frequency` mode, `--select-budgets` cuts the same frequency-descending ordering at each size instead, with no recovery percentage reported, since frequency mode never builds the exact-coverage machinery.) |
-| `--select-cost-alpha A` | `-a A` | Reweight marginal gain as `new_recovery(r) / cost(r)`, where `cost(r) = max(1, number of chained operations in r) ** A`; `0` (default) is pure coverage, `>0` favors shorter/cheaper chains when gains are similar |
-| `--exact-recovery` | `-e` | Adds a duplicate "Exact recovery" line to the output header, alongside the "Target recovery" line already written for greedy mode. Both numbers are identical — greedy coverage is always exact (computed via the GPU hash table's exact scans, not an estimate) regardless of this flag; it only controls whether that fact is called out a second time in the header. |
-
-### Compatibility
-
 `--select-mode frequency` (the default) reproduces v2's exact ordering and output format. Nothing about Stages 0–3 changes based on `--select-mode` — selection only affects which rules from the already-extracted, already-minimized pool are written to the final file(s).
 ### Budget control
 
@@ -385,10 +376,6 @@ If a batched exact rescore ever disagrees with what the committed-winner account
 | `--select-budgets "64,250,1500,..."` | `-s "64,250,1500,..."` | In addition to the main output, cut the **same** ordering (greedy or frequency) at each listed size and write `<output>.<budget>.txt` for each, without re-running coverage evaluation per size |
 | `--select-cost-alpha A` | `-a A` | Reweight marginal gain as `new_recovery(r) / depth(r)**A`; `0` (default) is pure coverage, `>0` favors shorter/cheaper chains when gains are similar |
 | `--exact-recovery` | `-e` | Add an exact recovery count/percentage to the output header — reporting only, since greedy coverage is already computed exactly |
-
-### Compatibility
-
-`--select-mode frequency` (the default) reproduces v2's exact ordering and output format. Nothing about Stages 0–3 changes based on `--select-mode` — selection only affects which rules from the already-extracted, already-minimized pool are written to the final file(s).
 
 ---
 
