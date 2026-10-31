@@ -355,16 +355,28 @@ v2 (and v3's default `--select-mode frequency`) sorts candidate rules purely by 
 
 ### Greedy marginal-coverage selection
 
-`--select-mode greedy` (`-M greedy`) replaces frequency sorting with a two-step process:
+`--select-mode greedy` (`-M greedy`) replaces frequency sorting with a GPU-accelerated lazy-greedy (CELF) selection, run entirely against a GPU-resident **exact target hash table** — not the Bloom filter used earlier in the pipeline. Mechanically it's two passes:
 
-1. **Coverage evaluation** (`evaluate_full_coverage`) — every candidate rule is evaluated against the real target wordlist. The GPU Bloom filter is used as a cheap prefilter, but every bloom-positive `(rule, base_word)` pair is then resolved through an **exact verification kernel**, mapping it to a specific target-word id. This produces `C(r)`: the exact set of distinct target words rule `r` actually recovers — with Bloom false positives excluded, so the optimization objective matches real recovery.
+1. **Fast upper-bound pass** (`celf_score_chains_gpu(..., record_hits=False)`) — every candidate rule is scanned once against the target hash table to get a cheap, *admissible* upper bound on its coverage: a raw count of matching base-word outputs. Duplicate outputs can inflate this bound, but it can never be lower than the rule's real distinct-target recovery, which is what makes it safe to use as a CELF upper bound.
 
-   Candidates longer than the GPU kernel's configured `MAX_CHAIN_DEPTH` are excluded up front (not silently truncated), since evaluating a truncated prefix would misattribute coverage to the wrong rule string.
+2. **Lazy-greedy (CELF) selection loop** (`_celf_select_from_upper_bounds`) — a heap keyed on each candidate's (possibly stale) bound repeatedly pops the current best candidate. If its bound still beats every other candidate's bound, it's accepted as-is; otherwise it's re-scored — first via a small *batched exact* rescore (distinct-target counts from the hash table, no target IDs yet) to tighten its bound cheaply, and only the actual round winner gets a full *exact singleton scan* that records hit slots and resolves them to specific target IDs (`celf_target_ids_for_slots`). Those exact target IDs, and only those, are what gets cleared from the remaining uncovered universe (`mark_selected`) before the next round. This is the standard Cost-Effective Lazy Forward heuristic for submodular set-cover greedy selection (the classic (1 − 1/e) near-optimal guarantee), and it means **exact coverage is only computed for the rules that actually matter to the outcome** — not for the whole candidate pool up front.
 
-2. **Lazy greedy / CELF selection** (`select_rules_by_marginal_coverage`) — rules are picked one at a time by the largest **new** coverage they add to the running union, using the Cost-Effective Lazy Forward heuristic to avoid recomputing every rule's marginal gain at every step. This maximizes the union of recovered target passwords for a given rule budget — the classic (1 − 1/e) near-optimal guarantee for submodular set-cover greedy selection.
+   Candidates are not silently dropped for being "too deep": if the deepest candidate rule exceeds the GPU kernel's currently compiled `MAX_CHAIN_DEPTH`, the engine is temporarily recompiled with a wider depth (`_widen_depth`, capped at `MAX_HASHCAT_CHAIN` = 31) to accommodate it, then restored to its original depth once selection finishes. Rules are only excluded up front if they exceed the 31-operation Hashcat chain limit or the GPU chain-string encoding limit (`MAX_CHAIN_STRING_LEN`).
 
-   Internally, every batch of CELF GPU scoring calls is timed in detail (host allocation, host enqueue, GPU kernel, H2D/D2H transfer, synchronization wait) — the same accounting `--profile` now exposes for every other GPU stage too.
+If a batched exact rescore ever disagrees with what the committed-winner accounting expects, selection discards the in-progress run, resets the GPU's active-target bitmap, and automatically retries the whole selection with batched exact rescoring disabled (singleton-only exact scoring), rather than risk a silently incorrect ordering.
 
+### Budget control
+
+| Flag | Short | Effect |
+|---|---|---|
+| `--select-budget N` | `-b N` | Stop greedy selection after `N` rules (0 = run to saturation — keep going until no remaining rule adds any new coverage) |
+| `--select-budgets "64,250,1500,..."` | `-s "64,250,1500,..."` | In addition to the main output, cut the **same** greedy ordering at each listed size and write `<output>.<budget>.txt` for each. Because CELF's per-rule marginal gains are disjoint increments of the same coverage union, each prefix's recovery is just the sum of its rules' recorded gains — no re-scoring or coverage recompute needed per size. (In `frequency` mode, `--select-budgets` cuts the same frequency-descending ordering at each size instead, with no recovery percentage reported, since frequency mode never builds the exact-coverage machinery.) |
+| `--select-cost-alpha A` | `-a A` | Reweight marginal gain as `new_recovery(r) / cost(r)`, where `cost(r) = max(1, number of chained operations in r) ** A`; `0` (default) is pure coverage, `>0` favors shorter/cheaper chains when gains are similar |
+| `--exact-recovery` | `-e` | Adds a duplicate "Exact recovery" line to the output header, alongside the "Target recovery" line already written for greedy mode. Both numbers are identical — greedy coverage is always exact (computed via the GPU hash table's exact scans, not an estimate) regardless of this flag; it only controls whether that fact is called out a second time in the header. |
+
+### Compatibility
+
+`--select-mode frequency` (the default) reproduces v2's exact ordering and output format. Nothing about Stages 0–3 changes based on `--select-mode` — selection only affects which rules from the already-extracted, already-minimized pool are written to the final file(s).
 ### Budget control
 
 | Flag | Short | Effect |
