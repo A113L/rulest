@@ -108,7 +108,7 @@ An OpenCL-capable GPU (NVIDIA, AMD, or Intel) is required. CPU fallback via Open
 ```bash
 # Clone the repository
 git clone https://github.com/A113L/rulest.git
-cd rulest
+cd rulest_v3
 
 # Install dependencies
 pip install -r requirements.txt
