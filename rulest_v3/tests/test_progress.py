@@ -194,6 +194,26 @@ class TestActivityHeartbeatSetDesc:
                 os.close(w)
             os.close(r)
 
+    def test_line_mode_emits_clean_newline_delimited_records(self):
+        r, w = os.pipe()
+        try:
+            hb = ActivityHeartbeat("CELF selection", stream=_PipeStream(w), interval=10, line_mode=True)
+            hb.start()
+            hb.set_desc("CELF selection selected=4/20", force=True)
+            hb.stop()
+            os.close(w)
+            w = -1
+            out = _drain(r).decode()
+            assert "CELF selection | working | elapsed" in out
+            assert "CELF selection selected=4/20" in out
+            assert "done" in out
+            assert "\r" not in out
+            assert "\x1b[K" not in out
+        finally:
+            if w != -1:
+                os.close(w)
+            os.close(r)
+
     def test_set_desc_after_close_is_a_noop(self):
         r, w = os.pipe()
         try:
