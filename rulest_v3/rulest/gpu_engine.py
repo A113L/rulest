@@ -30,6 +30,7 @@ from .devices import estimate_free_vram, get_max_allocation, get_device_by_spec
 from .hashing import fnv1a64_batch, build_indexed_open_addressing_table, table_size_for_count
 from .kernel_source import GPU_KERNEL_TEMPLATE
 from .progress import ActivityHeartbeat  # CELF_PROGRESS_DIAGNOSTICS_PATCH_V2
+from .celf_utils import target_ids_from_seen_words
 from . import hashing as _rulest_hashing
 from .profiling import GpuPhaseProfile
 
@@ -92,6 +93,10 @@ class GPUEngine:
         self._celf_slot_target_ids_host = np.zeros(0, dtype=np.int32)
         self._celf_target_slots_host = np.zeros(0, dtype=np.int32)
         self._celf_targets = []
+        self._celf_candidate_rules = []
+        self._celf_candidate_index = {}
+        self._celf_candidate_count = 0
+        self._celf_last_exact_indices = None
         self._celf_pending_clear_buffers = []
         self._celf_pending_clear_host_arrays = []
         self._celf_clear_slots_buf = None
@@ -100,7 +105,12 @@ class GPUEngine:
             "wall_s": 0.0, "host_enqueue_s": 0.0, "host_alloc_s": 0.0, "wait_wall_s": 0.0,
             "kernel_gpu_s": 0.0, "h2d_gpu_s": 0.0, "fill_gpu_s": 0.0,
             "readback_gpu_s": 0.0, "exact_record_s": 0.0,
+            "winner_bitmap_calls": 0, "winner_bitmap_bytes": 0, "winner_bitmap_wall_s": 0.0,
+            "upper_calls": 0, "upper_candidates": 0, "upper_singletons": 0,
+            "exact_calls": 0, "exact_candidates": 0, "exact_singletons": 0,
+            "record_calls": 0, "record_candidates": 0, "record_singletons": 0,
         }
+        self._celf_last_exact_indices = None
         self._celf_base_words_buf = None
         self._celf_base_offsets_buf = None
         self._celf_base_lengths_buf = None
@@ -1262,6 +1272,7 @@ class GPUEngine:
             self.context, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=depths_np
         )
         self._celf_candidate_index = {chain: i for i, chain in enumerate(chains)}
+        self._celf_candidate_rules = chains
         self._celf_candidate_count = len(chains)
         scratch_limit = max(4, int(self.params.get("CELF_SEEN_SCRATCH_MB", 32))) * 1024 * 1024
         by_scratch = max(1, scratch_limit // max(4, self._celf_seen_words * 4))
@@ -1293,7 +1304,27 @@ class GPUEngine:
                 f"GPU buffer allocation+upload={time.perf_counter() - _pool_alloc_t0:.3f}s"
             )
 
-    def celf_score_chains_gpu(self, chains, record_hits=False, progress_callback=None, exact_counts=False):
+    def celf_score_candidate_indices_gpu(
+        self, candidate_indices, record_hits=False, exact_counts=False,
+    ):
+        """Score candidate-pool indices directly, avoiding repeated rule-string IPC.
+
+        The web/multi-GPU CELF controller already tracks candidates by their
+        stable pool index. Passing int32-sized indices across the worker queue
+        avoids serializing rule strings and performing a reverse dictionary
+        lookup on every one of the many CELF rescoring batches.
+        """
+        return self.celf_score_chains_gpu(
+            None,
+            record_hits=record_hits,
+            exact_counts=exact_counts,
+            candidate_indices=candidate_indices,
+        )
+
+    def celf_score_chains_gpu(
+        self, chains=None, record_hits=False, progress_callback=None,
+        exact_counts=False, candidate_indices=None,
+    ):
         """Score resident candidate sequences with reusable GPU workspace.
 
         Default batches return fast admissible raw-hit upper bounds. `exact_counts`
@@ -1311,11 +1342,35 @@ class GPUEngine:
         _read_events = []
         if getattr(self, "_celf_active_buf", None) is None:
             raise RuntimeError("CELF target table has not been initialized")
-        chains = list(chains)
-        if not chains:
-            return np.zeros(0, dtype=np.int64), []
-        if record_hits and len(chains) != 1:
-            raise ValueError("record_hits=True requires exactly one candidate chain")
+        if candidate_indices is None:
+            chains = list(chains or ())
+            if not chains:
+                return np.zeros(0, dtype=np.int64), []
+            if record_hits and len(chains) != 1:
+                raise ValueError("record_hits=True requires exactly one candidate chain")
+            if not getattr(self, "_celf_candidate_index", None):
+                raise RuntimeError("CELF candidate pool has not been prepared")
+            try:
+                indices = [self._celf_candidate_index[chain] for chain in chains]
+            except KeyError as exc:
+                raise RuntimeError(f"Candidate was not in the prepared CELF pool: {exc}") from exc
+            cache_chain = chains[0] if len(chains) == 1 else None
+        else:
+            if chains:
+                raise ValueError("Pass either chains or candidate_indices, not both")
+            indices = [int(index) for index in candidate_indices]
+            if not indices:
+                return np.zeros(0, dtype=np.int64), []
+            if record_hits and len(indices) != 1:
+                raise ValueError("record_hits=True requires exactly one candidate index")
+            candidate_count = int(getattr(self, "_celf_candidate_count", 0))
+            if any(index < 0 or index >= candidate_count for index in indices):
+                raise ValueError("CELF candidate index is outside the prepared candidate pool")
+            candidate_rules = getattr(self, "_celf_candidate_rules", ())
+            cache_chain = candidate_rules[indices[0]] if len(indices) == 1 else None
+        n_rules = len(indices)
+        if record_hits and n_rules != 1:
+            raise ValueError("record_hits=True requires exactly one candidate")
         if record_hits and exact_counts:
             # Recording mode already includes exact counting.
             exact_counts = False
@@ -1323,19 +1378,17 @@ class GPUEngine:
             raise RuntimeError("CELF candidate pool has not been prepared")
         if not self.context or not self.kernel_celf_score:
             raise RuntimeError("CELF GPU score kernel is unavailable")
-        if len(chains) > self._celf_batch_capacity:
+        if n_rules > self._celf_batch_capacity:
             raise ValueError(
-                f"CELF batch of {len(chains)} exceeds persistent capacity {self._celf_batch_capacity}"
+                f"CELF batch of {n_rules} exceeds persistent capacity {self._celf_batch_capacity}"
             )
-        try:
-            indices = [self._celf_candidate_index[chain] for chain in chains]
-        except KeyError as exc:
-            raise RuntimeError(f"Candidate was not in the prepared CELF pool: {exc}") from exc
-
-        n_rules = len(chains)
         # Modes: 0=raw upper bound, 1=exact counts per candidate, 2=exact + slots.
         do_exact = bool(record_hits or exact_counts)
         score_mode = 2 if record_hits else (1 if exact_counts else 0)
+        # The exact-mode `seen` rows are also the winner's target-ID source.
+        # Keep the candidate order until selection.py has materialized the
+        # winning row; any later score call replaces this mapping.
+        self._celf_last_exact_indices = tuple(indices) if exact_counts and not record_hits else None
         self._celf_last_single_cache = None
         _enqueue_t0 = time.perf_counter()
         _alloc_t0 = time.perf_counter()
@@ -1448,7 +1501,7 @@ class GPUEngine:
             self._celf_last_hit_count = n_hits
             if n_rules == 1:
                 self._celf_last_single_cache = (
-                    chains[0], int(host_gains[0]), self._celf_active_version, None, n_hits
+                    cache_chain, int(host_gains[0]), self._celf_active_version, None, n_hits
                 )
             if n_hits:
                 _alloc_t0 = time.perf_counter()
@@ -1478,7 +1531,7 @@ class GPUEngine:
                 hit_slots = [int(slot) for slot in host_slots]
                 if n_rules == 1:
                     self._celf_last_single_cache = (
-                        chains[0], int(host_gains[0]), self._celf_active_version, hit_slots, n_hits
+                        cache_chain, int(host_gains[0]), self._celf_active_version, hit_slots, n_hits
                     )
         else:
             self._celf_last_hit_count = 0
@@ -1497,6 +1550,10 @@ class GPUEngine:
             stats["batch_calls"] += int(n_rules > 1)
             stats["singleton_calls"] += int(n_rules == 1)
             stats["candidate_scores"] += n_rules
+            mode_name = "record" if record_hits else ("exact" if exact_counts else "upper")
+            stats[f"{mode_name}_calls"] += 1
+            stats[f"{mode_name}_candidates"] += n_rules
+            stats[f"{mode_name}_singletons"] += int(n_rules == 1)
             stats["wall_s"] += time.perf_counter() - _wall_t0
             stats["host_enqueue_s"] += _host_enqueue_s
             stats["host_alloc_s"] += _host_alloc_s
@@ -1538,6 +1595,50 @@ class GPUEngine:
                 host_slots = []
             self._celf_last_single_cache = (cached_chain, gain, version, host_slots, n_hits)
         return int(gain), list(host_slots)
+
+    def celf_seen_target_ids_for_candidate(self, candidate_index):
+        """Materialize one candidate's exact target-ID bitmap from the last batch.
+
+        CELF's exact-count kernel already marks every distinct active target in
+        a compact per-candidate bitmap. Reading this row avoids launching a
+        second full base-word scan solely to collect the winning target IDs.
+        The row is valid only until the next scoring call, so selection invokes
+        this immediately after comparing the batch's exact gains.
+        """
+        batch_indices = self._celf_last_exact_indices
+        if not batch_indices:
+            raise RuntimeError("No exact CELF batch is available for winner materialization")
+        try:
+            batch_row = batch_indices.index(int(candidate_index))
+        except ValueError as exc:
+            raise RuntimeError(
+                f"Candidate {candidate_index} is not present in the most recent exact CELF batch"
+            ) from exc
+        if self._celf_seen_buf is None or self._celf_seen_words <= 0:
+            raise RuntimeError("CELF exact-score bitmap workspace is unavailable")
+
+        started = time.perf_counter()
+        seen_words = int(self._celf_seen_words)
+        host_seen = np.empty(seen_words, dtype=np.uint32)
+        event = cl.enqueue_copy(
+            self.queue,
+            host_seen,
+            self._celf_seen_buf,
+            device_offset=batch_row * seen_words * 4,
+            is_blocking=False,
+        )
+        event.wait()
+
+        target_ids = target_ids_from_seen_words(host_seen, self._celf_target_count)
+
+        stats = self._celf_profile
+        stats["winner_bitmap_calls"] += 1
+        stats["winner_bitmap_bytes"] += int(host_seen.nbytes)
+        stats["winner_bitmap_wall_s"] += time.perf_counter() - started
+        # The batch is now consumed. Clearing the mapping catches accidental
+        # use after a subsequent non-exact operation or a second materialize.
+        self._celf_last_exact_indices = None
+        return target_ids
 
     def celf_clear_last_hit_slots(self):
         """Clear the winning target slots directly from the reusable GPU buffer."""
@@ -1640,12 +1741,28 @@ class GPUEngine:
             "candidates={candidates:,}; wall={wall:.3f}s; host alloc={alloc:.3f}s; host enqueue={enqueue:.3f}s; "
             "GPU kernel={kernel:.3f}s; H2D={h2d:.3f}s; fills={fills:.3f}s; "
             "readback={readback:.3f}s; synchronization wait={wait:.3f}s; "
+            "winner bitmap fetches={bitmap_calls:,} ({bitmap_mb:.1f} MiB, {bitmap_wall:.3f}s); "
+            "modes upper/exact/record calls={upper_calls:,}/{exact_calls:,}/{record_calls:,}, "
+            "candidates={upper_candidates:,}/{exact_candidates:,}/{record_candidates:,}, "
+            "singletons={upper_singletons:,}/{exact_singletons:,}/{record_singletons:,}; "
             "avg wall/call={avg:.2f}ms".format(
                 calls=int(p["calls"]), batch=int(p["batch_calls"]), single=int(p["singleton_calls"]),
                 candidates=int(p["candidate_scores"]), wall=float(p["wall_s"]),
                 alloc=float(p["host_alloc_s"]), enqueue=float(p["host_enqueue_s"]), kernel=float(p["kernel_gpu_s"]),
                 h2d=float(p["h2d_gpu_s"]), fills=float(p["fill_gpu_s"]),
                 readback=float(p["readback_gpu_s"]), wait=float(p["wait_wall_s"]),
+                bitmap_calls=int(p.get("winner_bitmap_calls", 0)),
+                bitmap_mb=float(p.get("winner_bitmap_bytes", 0)) / (1024 * 1024),
+                bitmap_wall=float(p.get("winner_bitmap_wall_s", 0.0)),
+                upper_calls=int(p.get("upper_calls", 0)),
+                exact_calls=int(p.get("exact_calls", 0)),
+                record_calls=int(p.get("record_calls", 0)),
+                upper_candidates=int(p.get("upper_candidates", 0)),
+                exact_candidates=int(p.get("exact_candidates", 0)),
+                record_candidates=int(p.get("record_candidates", 0)),
+                upper_singletons=int(p.get("upper_singletons", 0)),
+                exact_singletons=int(p.get("exact_singletons", 0)),
+                record_singletons=int(p.get("record_singletons", 0)),
                 avg=1000.0 * float(p["wall_s"]) / calls,
             )
         )
@@ -1704,10 +1821,12 @@ class GPUEngine:
         self._celf_bitmap_words = 0
         self._celf_seen_words = 0
         self._celf_candidate_index = {}
+        self._celf_candidate_rules = []
         self._celf_candidate_count = 0
         self._celf_batch_capacity = 0
         self._celf_last_hit_count = 0
         self._celf_last_single_cache = None
+        self._celf_last_exact_indices = None
         self._celf_active_version = getattr(self, "_celf_active_version", 0) + 1
         self._celf_slot_target_ids_host = np.zeros(0, dtype=np.int32)
         self._celf_target_slots_host = np.zeros(0, dtype=np.int32)

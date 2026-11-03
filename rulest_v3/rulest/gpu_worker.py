@@ -409,6 +409,30 @@ class ProcessEngineProxy:
             raise RuntimeError('GPU worker returned no CELF score result')
         return result
 
+    def celf_score_candidate_indices_gpu(self, candidate_indices, record_hits=False, exact_counts=False):
+        """Send compact candidate indices rather than full rule strings to the worker."""
+        call_kwargs = {'record_hits': record_hits, '_raise_on_error': True}
+        if exact_counts:
+            call_kwargs['exact_counts'] = True
+        result = self._call(
+            'celf_score_candidate_indices_gpu',
+            [int(index) for index in candidate_indices],
+            **call_kwargs,
+        )
+        if result is None:
+            raise RuntimeError('GPU worker returned no CELF index-score result')
+        return result
+
+    def celf_seen_target_ids_for_candidate(self, candidate_index):
+        """Fetch a winner's exact IDs from the last exact-score bitmap row."""
+        result = self._call(
+            'celf_seen_target_ids_for_candidate', int(candidate_index),
+            _raise_on_error=True,
+        )
+        if result is None:
+            raise RuntimeError('GPU worker returned no CELF winner bitmap result')
+        return result
+
     def celf_take_cached_single_score(self, chain):
         return self._call('celf_take_cached_single_score', chain, _raise_on_error=True)
 
