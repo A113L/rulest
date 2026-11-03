@@ -3,6 +3,7 @@ import pytest
 import numpy as np
 from rulest.selection import (
     _TargetFingerprintIndex,
+    _GpuExactScorer,
     _celf_select_from_upper_bounds,
     _fingerprint64,
     _splitmix64,
@@ -133,6 +134,78 @@ def test_batch_scores_are_exact_distinct_target_marginals():
     assert int(covered.sum()) == 6
     assert calls
     assert all(1 <= len(batch) <= 2 for batch in calls)
+
+
+def test_exact_batch_winner_ids_are_materialized_without_a_second_score_scan():
+    rules = ["A", "B", "C"]
+    sets = [{0, 1, 2}, {0, 1, 3}, {3, 4}]
+    last_exact_batch = {}
+    materialized = []
+
+    def exact_batch(indices, covered):
+        already = set(np.flatnonzero(covered))
+        last_exact_batch.clear()
+        last_exact_batch.update({i: sets[i] - already for i in indices})
+        return [len(last_exact_batch[i]) for i in indices]
+
+    def materialize(index):
+        materialized.append(index)
+        return set(last_exact_batch[index])
+
+    def score_one(_index, _covered):
+        raise AssertionError("winner should be recovered from the exact batch bitmap, not rescored")
+
+    selected, covered = _celf_select_from_upper_bounds(
+        rules,
+        [3, 3, 2],
+        5,
+        score_one,
+        budget=2,
+        rescore_batch_size=3,
+        score_exact_batch_fn=exact_batch,
+        materialize_exact_ids_fn=materialize,
+    )
+
+    assert selected == [("A", 3), ("C", 2)]
+    assert set(np.flatnonzero(covered)) == {0, 1, 2, 3, 4}
+    assert materialized == [0, 2]
+
+
+def test_gpu_scorer_prefers_compact_candidate_index_api():
+    class IndexEngine:
+        def __init__(self):
+            self.calls = []
+
+        def set_base_words(self, _words):
+            return None
+
+        def celf_initialize_target_table(self, _targets):
+            return None
+
+        def celf_prepare_candidate_pool(self, _rules):
+            return None
+
+        def celf_score_candidate_indices_gpu(self, indices, record_hits=False, exact_counts=False):
+            self.calls.append((tuple(indices), record_hits, exact_counts))
+            return ([10 + int(index) for index in indices], [])
+
+        def celf_seen_target_ids_for_candidate(self, candidate_index):
+            return {int(candidate_index), int(candidate_index) + 100}
+
+        def celf_release_target_table(self):
+            return None
+
+    engine = IndexEngine()
+    scorer = _GpuExactScorer(engine, ["base"], ["target"], 100, ["A", "B", "C"])
+    assert scorer.upper_bound_index_batch([0, 2]) == [10, 12]
+    assert scorer.score_gains_index_batch([1, 2]) == [11, 12]
+    assert scorer.score_exact_gains_index_batch([2, 0]) == [12, 10]
+    assert scorer.materialize_exact_targets(2) == {2, 102}
+    assert engine.calls == [
+        ((0, 2), False, False),
+        ((1, 2), False, False),
+        ((2, 0), False, True),
+    ]
 
 
 def test_ties_are_deterministic():
@@ -377,17 +450,30 @@ def test_greedy_selection_reads_celf_state_from_the_selected_single_gpu(monkeypa
         def upper_bound_batch(self, rules):
             return [1] * len(rules)
 
+        def upper_bound_index_batch(self, indices):
+            return [1] * len(list(indices))
+
         def score_one_with_targets(self, rule, covered_mask=None, progress_callback=None):
             return 1, {0}
 
         def score_gains_batch(self, rules, progress_callback=None):
             return [1] * len(rules)
 
+        def score_gains_index_batch(self, indices, progress_callback=None):
+            return [1] * len(list(indices))
+
         def score_exact_gains_batch(self, rules, progress_callback=None):
             # Exercised by the seed-pop's cheap exact-gain-only check (see
             # exact_gain() in selection.py), which now runs before any
             # expensive recording scan, even for a single-candidate round.
             return [1] * len(rules)
+
+        def score_exact_gains_index_batch(self, indices, progress_callback=None):
+            return [1] * len(list(indices))
+
+        def materialize_exact_targets(self, candidate_index):
+            assert candidate_index == 0
+            return {0}
 
         def mark_selected(self, target_ids):
             return None
@@ -404,8 +490,7 @@ def test_greedy_selection_reads_celf_state_from_the_selected_single_gpu(monkeypa
 
 
 def test_batched_exact_rescoring_preserves_greedy_results_and_reduces_singleton_calls():
-    """Contenders that can still win are exact-scored as a batch, while only the
-    seed and final winner need target-ID recording scans."""
+    """Exact-batch winner bitmaps remove the redundant final singleton scan."""
     rules = ["A", "B", "C", "D", "E"]
     sets = [
         {0},
@@ -423,6 +508,7 @@ def test_batched_exact_rescoring_preserves_greedy_results_and_reduces_singleton_
     ]
     singleton_calls = []
     exact_batches = []
+    latest_exact_ids = {}
 
     def score_one(i, covered):
         singleton_calls.append(i)
@@ -435,12 +521,17 @@ def test_batched_exact_rescoring_preserves_greedy_results_and_reduces_singleton_
     def score_exact_batch(indices, covered):
         exact_batches.append(tuple(indices))
         covered_ids = set(np.flatnonzero(covered))
-        return [len(sets[i] - covered_ids) for i in indices]
+        latest_exact_ids.clear()
+        latest_exact_ids.update({i: sets[i] - covered_ids for i in indices})
+        return [len(latest_exact_ids[i]) for i in indices]
+
+    def materialize_exact_ids(index):
+        return set(latest_exact_ids[index])
 
     selected, covered = _celf_select_from_upper_bounds(
         rules, [20, 10, 12, 4, 2], 7, score_one, budget=4,
         score_batch_fn=score_bounds, score_exact_batch_fn=score_exact_batch,
-        rescore_batch_size=3,
+        rescore_batch_size=3, materialize_exact_ids_fn=materialize_exact_ids,
     )
 
     expected = []
@@ -458,9 +549,9 @@ def test_batched_exact_rescoring_preserves_greedy_results_and_reduces_singleton_
     assert selected == expected
     assert set(np.flatnonzero(covered)) == covered_ref
     assert exact_batches, "the optimized exact-batch path should be exercised"
-    # A batch may need a recording pass when it displaces the seed, but not one
-    # full singleton score per competing candidate.
-    assert len(singleton_calls) < 2 * len(selected) + 1
+    # The exact bitmap from the batch supplies winner IDs; no full winner
+    # recording scan is needed.
+    assert singleton_calls == []
 
 
 def test_dead_seeds_use_the_cheap_exact_batch_path_not_a_recording_scan():
@@ -527,6 +618,7 @@ def test_batched_exact_rescoring_matches_reference_on_randomized_coverage():
         sets = [{t for t in range(n_targets) if rng.random() < 0.3} for _ in rules]
         multiplicity = [{t: rng.randint(1, 7) for t in sets[i]} for i in range(n_rules)]
         initial_bounds = [sum(multiplicity[i].values()) + (n_rules - i) for i in range(n_rules)]
+        latest_exact_ids = {}
 
         def score_one(i, covered, _sets=sets):
             return _sets[i] - set(np.flatnonzero(covered))
@@ -537,12 +629,17 @@ def test_batched_exact_rescoring_matches_reference_on_randomized_coverage():
 
         def score_exact(indices, covered, _sets=sets):
             covered_ids = set(np.flatnonzero(covered))
-            return [len(_sets[i] - covered_ids) for i in indices]
+            latest_exact_ids.clear()
+            latest_exact_ids.update({i: _sets[i] - covered_ids for i in indices})
+            return [len(latest_exact_ids[i]) for i in indices]
+
+        def materialize_exact_ids(index):
+            return set(latest_exact_ids[index])
 
         selected, covered = _celf_select_from_upper_bounds(
             rules, initial_bounds, n_targets, score_one, budget=8,
             score_batch_fn=score_bounds, score_exact_batch_fn=score_exact,
-            rescore_batch_size=4,
+            rescore_batch_size=4, materialize_exact_ids_fn=materialize_exact_ids,
         )
 
         expected = []
@@ -622,3 +719,118 @@ def test_gpu_exact_batch_mismatch_restarts_on_safe_singleton_path(monkeypatch):
     assert selected == [("A", 1)]
     assert int(covered.sum()) == 1
     assert engine.reset_count == 1
+
+
+def test_celf_coalesces_small_exact_challenger_groups_across_bound_batches(monkeypatch):
+    """Avoid one-candidate exact GPU launches when adjacent bound batches
+    each leave only a small number of plausible challengers.
+    """
+    rules = [f"R{i}" for i in range(20)]
+    target_sets = {
+        0: set(range(10)),
+        1: {10}, 2: {11}, 3: {12},
+        4: set(range(13, 22)),
+        8: set(range(22, 30)),
+        12: set(range(30, 37)),
+        16: set(range(37, 43)),
+    }
+    latest_ids = {}
+    exact_batches = []
+    bound_batches = []
+
+    def exact_batch(indices, covered):
+        covered_ids = set(np.flatnonzero(covered))
+        latest_ids.clear()
+        latest_ids.update({int(i): target_sets.get(int(i), set()) - covered_ids for i in indices})
+        exact_batches.append(tuple(int(i) for i in indices))
+        return [len(latest_ids[int(i)]) for i in indices]
+
+    def materialize(index):
+        return set(latest_ids[int(index)])
+
+    def score_one(index, covered):
+        return target_sets.get(int(index), set()) - set(np.flatnonzero(covered))
+
+    def score_bounds(indices, covered):
+        bound_batches.append(tuple(int(i) for i in indices))
+        # Exactly one candidate in each 4-entry stale batch survives the cheap
+        # upper-bound pass. The survivors are all smaller than R0's exact gain.
+        winners = {4, 8, 12, 16}
+        return [20 if int(i) in winners else 0 for i in indices]
+
+    monkeypatch.setenv("RULEST_CELF_EXACT_MICROBATCH", "4")
+    selected, covered = _celf_select_from_upper_bounds(
+        rules,
+        [100 - i for i in range(len(rules))],
+        50,
+        score_one,
+        budget=1,
+        score_batch_fn=score_bounds,
+        score_exact_batch_fn=exact_batch,
+        materialize_exact_ids_fn=materialize,
+        rescore_batch_size=4,
+    )
+
+    assert selected == [("R0", 10)]
+    assert int(covered.sum()) == 10
+    assert bound_batches == [(4, 5, 6, 7), (8, 9, 10, 11), (12, 13, 14, 15), (16, 17, 18, 19)]
+    assert exact_batches == [(0, 1, 2, 3), (4, 8, 12, 16)]
+
+
+def test_celf_exact_microbatch_preserves_cost_alpha_greedy_order(monkeypatch):
+    import random
+
+    monkeypatch.setenv("RULEST_CELF_EXACT_MICROBATCH", "4")
+    for seed in range(12):
+        rng = random.Random(7000 + seed)
+        n_rules, n_targets = 13, 29
+        rules = [f"R{i}" + (" x" * (i % 4)) for i in range(n_rules)]
+        sets = [{t for t in range(n_targets) if rng.random() < 0.32} for _ in rules]
+        multiplicity = [{t: rng.randint(1, 6) for t in sets[i]} for i in range(n_rules)]
+        bounds = [sum(multiplicity[i].values()) + n_rules - i for i in range(n_rules)]
+        latest_ids = {}
+        cost_alpha = 0.7
+
+        def score_one(index, covered):
+            return sets[index] - set(np.flatnonzero(covered))
+
+        def score_bounds(indices, covered):
+            covered_ids = set(np.flatnonzero(covered))
+            return [
+                sum(value for target, value in multiplicity[index].items() if target not in covered_ids)
+                for index in indices
+            ]
+
+        def score_exact(indices, covered):
+            covered_ids = set(np.flatnonzero(covered))
+            latest_ids.clear()
+            latest_ids.update({index: sets[index] - covered_ids for index in indices})
+            return [len(latest_ids[index]) for index in indices]
+
+        def materialize(index):
+            return set(latest_ids[index])
+
+        selected, covered = _celf_select_from_upper_bounds(
+            rules, bounds, n_targets, score_one, budget=9, cost_alpha=cost_alpha,
+            score_batch_fn=score_bounds, score_exact_batch_fn=score_exact,
+            materialize_exact_ids_fn=materialize, rescore_batch_size=4,
+        )
+
+        ref_selected = []
+        ref_covered = set()
+        remaining = set(range(n_rules))
+        while remaining and len(ref_selected) < 9:
+            def ref_key(index):
+                gain = len(sets[index] - ref_covered)
+                cost = max(1, len(rules[index].split())) ** cost_alpha
+                return (-(gain / cost), index)
+            winner = min(remaining, key=ref_key)
+            gain = len(sets[winner] - ref_covered)
+            if gain <= 0:
+                break
+            ref_selected.append((rules[winner], gain))
+            ref_covered.update(sets[winner])
+            remaining.remove(winner)
+
+        assert selected == ref_selected, f"seed={seed}: {selected} != {ref_selected}"
+        assert set(np.flatnonzero(covered)) == ref_covered

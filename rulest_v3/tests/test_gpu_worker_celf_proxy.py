@@ -18,6 +18,10 @@ def test_process_proxy_exposes_celf_methods_and_workspace_metadata(monkeypatch):
             return {"_celf_seen_words": 17, "_celf_batch_capacity": 23}[args[0]]
         if method == "celf_score_chains_gpu":
             return ([5] * len(args[0]), [])
+        if method == "celf_score_candidate_indices_gpu":
+            return ([5] * len(args[0]), [])
+        if method == "celf_seen_target_ids_for_candidate":
+            return {1, 4}
         if method == "celf_target_ids_for_slots":
             return {2, 4}
         if method == "celf_profile_summary":
@@ -47,6 +51,12 @@ def test_process_proxy_exposes_celf_methods_and_workspace_metadata(monkeypatch):
     assert proxy.celf_score_chains_gpu(["rule-a", "rule-b"], exact_counts=True) == ([5, 5], [])
     exact_call = [call for call in calls if call[0] == "celf_score_chains_gpu"][-1]
     assert exact_call[2] == {"record_hits": False, "_raise_on_error": True, "exact_counts": True}
+
+    assert proxy.celf_score_candidate_indices_gpu([7, 3], exact_counts=True) == ([5, 5], [])
+    assert proxy.celf_seen_target_ids_for_candidate(7) == {1, 4}
+    index_call = [call for call in calls if call[0] == "celf_score_candidate_indices_gpu"][-1]
+    assert index_call[1] == ([7, 3],)
+    assert index_call[2] == {"record_hits": False, "_raise_on_error": True, "exact_counts": True}
 
 
 def test_strict_rpc_surfaces_worker_errors_instead_of_swallowing_them():
