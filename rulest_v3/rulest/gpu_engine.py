@@ -20,7 +20,7 @@ from tqdm import tqdm
 
 from .common import (
     log_info, log_warn, log_error, log_debug, bold, green, cyan, _kb,
-    fnv1a_32, HashcatRuleValidator, _fmt_speed,
+    fnv1a_32, HashcatRuleValidator, _fmt_speed, set_global_seed,
     MAX_WORD_LEN, MAX_RULE_LEN, MAX_OUTPUT_LEN, MAX_CHAIN_STRING_LEN,
     MAX_HASHCAT_CHAIN, BLOOM_HASH_FUNCTIONS, HOT_RULE_RATIO,
     MAX_ATTEMPTS_MULTIPLIER, _BLOOM_ALREADY_ON_GPU,
@@ -41,6 +41,15 @@ class _KernelBuildTimeout(Exception):
 class GPUEngine:
     def __init__(self, params):
         self.params = params
+        # Re-applies the run's --seed inside this GPUEngine. Redundant with
+        # cli.main()'s own set_global_seed() call in the single-GPU/main-
+        # process case, but required in multi-GPU mode: each device's
+        # GPUEngine is built from scratch inside its own spawned worker
+        # process (see gpu_worker._gpu_worker_entry), which does not inherit
+        # the parent's already-seeded `random`/numpy RNG state — only
+        # `params` (passed explicitly as a process argument) crosses that
+        # boundary. A no-op when RNG_SEED is None (default/legacy behavior).
+        set_global_seed(params.get('RNG_SEED'))
         self.context = self.queue = self.device = self.program = None
         self.max_work_group_size = 512
         self.local_work_size = params.get('LOCAL_WORK_SIZE', 512)

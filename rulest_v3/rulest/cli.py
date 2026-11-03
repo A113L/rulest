@@ -17,7 +17,7 @@ import numpy as np
 from . import state
 from .common import (
     print_banner, _print_controls, log_info, log_warn, log_error,
-    bold, cyan, green, yellow, red, dim, _kb, safe_worker_count,
+    bold, cyan, green, yellow, red, dim, _kb, safe_worker_count, set_global_seed,
     MAX_HASHCAT_CHAIN, MINIMIZE_DISK_THRESHOLD, BUILTIN_PROBES,
 )
 from .devices import list_devices
@@ -92,6 +92,15 @@ def main():
                            "selection. Greedy coverage is already exact: bloom-positive GPU "
                            "hits are resolved through the exact verification kernel before CELF "
                            "selection, so this flag adds reporting only (no second GPU pass).")
+    ap.add_argument('-S', '--seed', type=int, default=None, metavar='N',
+                    help='RNG seed. With a fixed --seed, repeated runs on the same BASE/TARGET '
+                         'wordlists and the same other flags produce identical output (same rules, '
+                         'same order): the genetic algorithm, chain sampling and any other '
+                         'randomized step become deterministic, and so does Python\'s string-hash-'
+                         'dependent set ordering (this flag re-execs the process once, early, with '
+                         'PYTHONHASHSEED fixed accordingly). Default: unset = a different, random '
+                         'sequence every run, as before. Note GPU floating-point reduction order can '
+                         'in rare cases still vary independently of this flag.')
     ap.add_argument('-D', '--debug', action='store_true')
     ap.add_argument('-p', '--profile', action='store_true',
                     help='Enable profiling: prints a per-stage wall-clock breakdown table '
@@ -102,6 +111,24 @@ def main():
                          'for normal runs, since the CELF side adds a little per-call overhead.')
     args = ap.parse_args()
 
+    if args.seed is not None:
+        # Python randomizes str/bytes hashing per-process (PYTHONHASHSEED),
+        # which changes the iteration order of plain set()s (rule chains are
+        # frequently deduped/collected into a set() before being consumed) —
+        # dicts are insertion-ordered and unaffected, but sets aren't. That
+        # can't be fixed by calling random.seed()/np.random.seed() after the
+        # fact; the interpreter has to start with PYTHONHASHSEED already set.
+        # So: re-exec ourselves, once, with it pinned to a value derived from
+        # --seed, before doing anything else. The guard on os.environ avoids
+        # re-execing forever if it's already set correctly (e.g. the user set
+        # it in their shell, or this *is* the re-exec).
+        _wanted_hashseed = str(args.seed % (2**32))
+        if os.environ.get('PYTHONHASHSEED') != _wanted_hashseed:
+            os.environ['PYTHONHASHSEED'] = _wanted_hashseed
+            os.execv(sys.executable, [sys.executable] + sys.argv)
+        set_global_seed(args.seed)
+
+    state.RNG_SEED = args.seed
     state.ALLOW_REJECT_RULES = args.allow_reject_rules
     state.VERBOSE = args.debug
     # Single switch for every profiling signal in the pipeline: the always-cheap
@@ -130,6 +157,8 @@ def main():
     shard_note = yellow('[sharding forced off]') if args.bloom_no_shard else dim('(auto: shard if >512MB)')
     log_info(f"  depth     : {bold(str(args.max_depth))}  |  hours: {bold(str(args.target_hours))}  |  bloom: {bold(str(args.bloom_mb or 'auto'))}MB  {dim('(GPU-only)')}  {shard_note}")
     if args.seed_rules: log_info(f"  seeds     : {bold(args.seed_rules)}")
+    if args.seed is not None:
+        log_info(f"  rng seed  : {bold(str(args.seed))}  {dim('(deterministic — reruns on the same data will match)')}")
     print()
 
     _EXCL = dim('[time budget: excluded]')
@@ -186,6 +215,7 @@ def main():
         token_strip_min_leet_amb=args.token_strip_min_leet_amb,
         token_strip_workers=args.token_strip_workers,
         token_strip_chunk_size=args.token_strip_chunk_size,
+        rng_seed=args.seed,
     )
     depth_overrides = {f'depth{i}_override': getattr(args, f'depth{i}_chains') for i in range(2,11)}
     # Greedy CELF selection (below) still needs one live GPU from this same

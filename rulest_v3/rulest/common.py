@@ -13,11 +13,47 @@ import string
 import functools
 import shutil
 import threading
+import random
 from collections import defaultdict
 
 from . import state
 
 os.environ.setdefault('PYOPENCL_COMPILER_OUTPUT', '0')
+
+
+def set_global_seed(seed):
+    """Seed every RNG this process touches directly, so that two runs given
+    the same --seed/-S on the same base/target wordlists produce byte-identical
+    output.
+
+    This seeds the stdlib `random` module (used throughout genetic.py and for
+    the hot/valid chain sampling in gpu_engine.py) and numpy's global RNG
+    (used wherever a module does `np.random...` instead of a local
+    `Generator`). It is deliberately idempotent and side-effect-free when
+    ``seed`` is None, so call sites don't need to special-case "no seed was
+    requested".
+
+    Note this only covers *our* randomness. It is not, by itself, a complete
+    determinism guarantee:
+      - Python's hash of str/bytes is randomized per-process (PYTHONHASHSEED),
+        which changes the iteration order of plain `set()`s (dicts are
+        insertion-ordered and unaffected). cli.main() re-execs itself with a
+        fixed PYTHONHASHSEED derived from --seed before this function is ever
+        called, so that part is handled upstream of here, not in this
+        function.
+      - Floating-point reduction order on the GPU (e.g. work-group-size or
+        driver-dependent summation order) can in rare cases differ from one
+        run to the next regardless of any seed; this is a property of the
+        OpenCL driver/hardware, not of rulest's own RNG usage.
+    """
+    if seed is None:
+        return
+    random.seed(seed)
+    try:
+        import numpy as np
+        np.random.seed(seed & 0xFFFFFFFF)
+    except Exception:
+        pass
 
 _WIN_MAX_POOL_WORKERS = 60  # stay safely under the 63-handle ceiling
 
@@ -46,16 +82,51 @@ class KeyboardController:
         self._quit = False
         self._lock = threading.Lock()
         self._thread = None
+        self._control_thread = None
+        self._control_file = os.environ.get('RULEST_CONTROL_FILE')
+        self._control_offset = 0
         self._active = False
 
     def start(self):
-        if not sys.stdin.isatty(): return
-        if not (_HAS_TERMIOS or _HAS_MSVCRT): return
+        if self._active:
+            return
+        has_control_file = bool(self._control_file)
+        has_terminal = sys.stdin.isatty() and (_HAS_TERMIOS or _HAS_MSVCRT)
+        if not (has_control_file or has_terminal):
+            return
         self._active = True
-        self._thread = threading.Thread(target=self._reader, daemon=True, name='kb-listener')
-        self._thread.start()
+        # The web control panel sends p/r/q commands through this file because
+        # subprocess stdin is not an interactive terminal.
+        if has_control_file:
+            self._control_thread = threading.Thread(
+                target=self._reader_control_file, daemon=True, name='control-file-listener'
+            )
+            self._control_thread.start()
+        if has_terminal:
+            self._thread = threading.Thread(target=self._reader, daemon=True, name='kb-listener')
+            self._thread.start()
 
-    def stop(self): self._active = False
+    def stop(self):
+        self._active = False
+
+    def _reader_control_file(self):
+        while self._active:
+            try:
+                with open(self._control_file, 'r', encoding='ascii') as stream:
+                    stream.seek(self._control_offset)
+                    incoming = stream.read()
+                    self._control_offset = stream.tell()
+                for command in incoming.splitlines():
+                    command = command.strip().lower()
+                    if command in ('p', 'r', 'q'):
+                        self._handle(command)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                # A transient file-access issue should not kill the engine's
+                # keyboard/control listener; the next polling cycle retries.
+                pass
+            time.sleep(0.1)
 
     def check_pause(self):
         """Block while paused (unless quit was requested). Call from every

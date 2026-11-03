@@ -31,7 +31,7 @@ class GPUExtractor:
                  genetic=False, genetic_generations=50, genetic_pop=200, genetic_elite=0.15,
                  token_strip=False, token_strip_min_stem=4, token_strip_max_prefix=4,
                  token_strip_max_suffix=4, token_strip_min_leet_amb=3,
-                 token_strip_workers=0, token_strip_chunk_size=0):
+                 token_strip_workers=0, token_strip_chunk_size=0, rng_seed=None):
         self.base_count = base_count
         self.target_count = target_count
         self.user_max_depth = max_depth
@@ -55,6 +55,12 @@ class GPUExtractor:
         self.params = calculate_dynamic_parameters(base_count, target_count, None, target_hours,
                                                    bloom_mb_override=bloom_mb, bloom_no_shard=bloom_no_shard)
         self.params['MAX_CHAIN_DEPTH'] = self.user_max_depth
+        # Carried in `params` (not just `state.RNG_SEED`) because params is
+        # exactly what crosses the process boundary into each multi-GPU
+        # worker (see gpu_worker._gpu_worker_entry) — state.py is a fresh,
+        # un-seeded module import in a spawned child, so that alone wouldn't
+        # reach the workers.
+        self.params['RNG_SEED'] = rng_seed
         self.rules_gen = GPUCompatibleRulesGenerator()
         self.gpu_engine = None
         self.validator = HashcatRuleValidator()

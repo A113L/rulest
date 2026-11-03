@@ -332,10 +332,14 @@ class ActivityHeartbeat:
     of this phase's output and visually inconsistent with the `[CELF] ...`
     heartbeats immediately before and after it.
     """
-    def __init__(self, desc, *, stream=None, interval=0.5):
+    def __init__(self, desc, *, stream=None, interval=0.5, line_mode=False):
         self.desc = str(desc)
         self.stream = stream or sys.stdout
         self.interval = max(0.25, float(interval))
+        # In web/server mode, carriage-return terminal updates can interleave
+        # with normal print() output (for example CELF PROFILE summaries). A
+        # newline-delimited heartbeat is easier for log collectors to preserve.
+        self.line_mode = bool(line_mode)
         self.started = time.monotonic()
         self._stop = threading.Event()
         self._thread = None
@@ -344,9 +348,18 @@ class ActivityHeartbeat:
         self._spinner = 0
         self._last_render = 0.0
 
+    def _emit(self, label, elapsed, frame=None, final=False):
+        spinner = f"{frame} " if frame else ""
+        duration = _cyan(_duration(elapsed))
+        if self.line_mode:
+            _write(self.stream, f"{self.desc} | {spinner}{label} | elapsed {duration}\n")
+        else:
+            suffix = "\n" if final else ""
+            _write(self.stream, f"\r{self.desc} | {spinner}{label} | elapsed {duration}\x1b[K{suffix}")
+
     def start(self):
         self._last_render = time.monotonic()
-        _write(self.stream, f"\r{self.desc} | {_cyan('working')} | elapsed 00:00\x1b[K")
+        self._emit(_cyan('working'), 0.0)
         self._thread = threading.Thread(target=self._run, name="celf-hashmap-heartbeat", daemon=True)
         self._thread.start()
         return self
@@ -371,7 +384,7 @@ class ActivityHeartbeat:
             self._last_render = now
             elapsed = now - self.started
             frame = "|/-\\"[self._spinner % 4]
-            _write(self.stream, f"\r{self.desc} | {frame} {_cyan('working')} | elapsed {_cyan(_duration(elapsed))}\x1b[K")
+            self._emit(_cyan('working'), elapsed, frame=frame)
 
     def _run(self):
         frames = "|/-\\"
@@ -382,7 +395,7 @@ class ActivityHeartbeat:
                 frame = frames[self._spinner % len(frames)]
                 self._spinner += 1
                 self._last_render = time.monotonic()
-                _write(self.stream, f"\r{self.desc} | {frame} {_cyan('working')} | elapsed {_cyan(_duration(elapsed))}\x1b[K")
+                self._emit(_cyan('working'), elapsed, frame=frame)
 
     def stop(self):
         with self._lock:
@@ -391,7 +404,7 @@ class ActivityHeartbeat:
         self._stop.set()
         if self._thread is not None and self._thread.is_alive():
             self._thread.join(timeout=max(0.6, self.interval * 2))
-        _write(self.stream, f"\r{self.desc} | {_green('done')} | elapsed {_cyan(_duration(time.monotonic() - self.started))}\x1b[K\n")
+        self._emit(_green('done'), time.monotonic() - self.started, final=True)
 
     def __enter__(self): return self.start()
     def __exit__(self, exc_type, exc, tb): self.stop()
