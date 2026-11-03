@@ -1,0 +1,209 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#0c0e13">
+  <title>RULEST — Control Center · Cleanlooks</title>
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg?v=rule-hash-mark-2">
+  <link rel="stylesheet" href="/styles.css?v=auth-password-1">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <a class="brand" href="#top" aria-label="Rulest home">
+        <span class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 44 44" role="img" focusable="false">
+            <rect x="1" y="1" width="42" height="42" rx="11" fill="#17221b" stroke="#405633" />
+            <path d="M17 10 13.5 34 M29 10 25.5 34 M9.5 18.5H35 M8 27H33.5" fill="none" stroke="#b8f36b" stroke-width="3.1" stroke-linecap="round" />
+            <circle cx="34.5" cy="31.5" r="3" fill="#b8f36b" />
+          </svg>
+        </span>
+        <span class="brand-copy"><strong>RULEST</strong><small>CONTROL CENTER</small></span>
+      </a>
+      <div class="side-label">WORKSPACE</div>
+      <a class="nav-item active" href="#workspace"><span class="nav-icon">◫</span> Run workspace</a>
+      <a class="nav-item" href="#live-log"><span class="nav-icon">⌁</span> Live activity</a>
+      <a class="nav-item" href="#tuning"><span class="nav-icon">⚙</span> Engine tuning</a>
+      <div class="sidebar-bottom">
+        <div class="gpu-card">
+          <div class="gpu-top"><span class="pulse-dot"></span><span>LOCAL ENGINE</span><span class="gpu-tag">READY</span></div>
+          <p>Runs on your machine</p>
+          <small>OpenCL · GPU accelerated</small>
+        </div>
+        <div class="side-foot"><span class="version-dot"></span> Rulest UI <b>v1.3</b><br><span>Password protected · LAN access</span></div>
+      </div>
+    </aside>
+
+    <main class="main-content" id="top">
+      <header class="topbar">
+        <div class="breadcrumb"><span>Workspace</span><i>/</i><strong>New run</strong></div>
+        <div class="topbar-right"><span class="secure-label"><span class="lock-icon">⌑</span> PASSWORD SESSION</span><button id="change-password-button" class="account-button" type="button">Change password</button><button id="logout-button" class="account-button logout-button" type="button">Log out ↗</button><span class="avatar">R</span></div>
+      </header>
+
+      <section class="page-heading" id="workspace">
+        <div><div class="eyebrow">GPU RULE ENGINE <span class="eyebrow-line"></span> CONFIGURATION</div><h1>Run workspace<span class="title-period">.</span></h1><p>Configure your search, launch the engine and monitor every stage in real time.</p></div>
+        <div class="heading-badge"><span class="badge-orbit">✳</span><div><b>Precision mode</b><small>Every parameter in your control</small></div></div>
+      </section>
+
+      <section class="metrics-grid" aria-label="Run metrics">
+        <article class="metric-card"><div class="metric-label">ENGINE STATUS <span class="metric-icon">◉</span></div><div class="metric-value" id="metric-status">Idle</div><div class="metric-note"><span class="status-dot"></span><span id="status-note">Ready to configure</span></div></article>
+        <article class="metric-card"><div class="metric-label">ACTIVE STAGE <span class="metric-icon">⌁</span></div><div class="metric-value metric-stage" id="metric-stage">—</div><div class="metric-note">Live pipeline phase</div></article>
+        <article class="metric-card"><div class="metric-label">ELAPSED TIME <span class="metric-icon">◷</span></div><div class="metric-value" id="metric-elapsed">00:00</div><div class="metric-note">Wall-clock runtime</div></article>
+        <article class="metric-card"><div class="metric-label">OUTPUT FILES <span class="metric-icon">▤</span></div><div class="metric-value" id="metric-outputs">0</div><div class="metric-note">Generated in this run</div></article>
+      </section>
+
+      <div class="content-grid">
+        <div class="primary-column">
+          <section class="panel input-panel">
+            <div class="panel-heading"><div><span class="section-index">01</span><h2>Input files</h2><p>Upload wordlists directly — no local paths required.</p></div><span class="required-pill">2 REQUIRED</span></div>
+            <div class="upload-grid">
+              <div class="upload-card" data-upload="base">
+                <div class="upload-head"><div class="file-icon base-icon">B</div><div><h3>Base wordlist</h3><small>Source words · BASE</small></div><span class="required-star">*</span></div>
+                <label class="drop-zone" for="base-file"><span class="upload-cloud">↑</span><strong>Choose a file <em>or drop it here</em></strong><small>TXT, wordlist or plain text</small><input id="base-file" type="file"></label>
+                <div class="file-state" id="base-state"><span class="file-state-dot"></span><span>No file selected</span></div>
+                <div class="upload-progress"><span id="base-progress"></span></div>
+              </div>
+              <div class="upload-card" data-upload="target">
+                <div class="upload-head"><div class="file-icon target-icon">T</div><div><h3>Target wordlist</h3><small>Target words · TARGET</small></div><span class="required-star">*</span></div>
+                <label class="drop-zone" for="target-file"><span class="upload-cloud">↑</span><strong>Choose a file <em>or drop it here</em></strong><small>TXT, wordlist or plain text</small><input id="target-file" type="file"></label>
+                <div class="file-state" id="target-state"><span class="file-state-dot"></span><span>No file selected</span></div>
+                <div class="upload-progress"><span id="target-progress"></span></div>
+              </div>
+            </div>
+            <div class="optional-upload-row">
+              <div class="optional-copy"><span class="optional-icon">＋</span><div><b>Custom seed rules <span>OPTIONAL</span></b><small>Upload a Hashcat rules file to extend the seed pool.</small></div></div>
+              <label class="secondary-upload" for="seed-file">＋ Add rules file<input id="seed-file" type="file"></label>
+            </div>
+            <div class="seed-file-state" id="seed-state">No custom seed rules uploaded</div>
+          </section>
+
+          <section class="panel" id="tuning">
+            <div class="panel-heading"><div><span class="section-index">02</span><h2>Engine configuration</h2><p>Fine-tune search depth, runtime and GPU memory behaviour.</p></div><button class="text-button" id="reset-defaults" type="button">↺ Reset defaults</button></div>
+            <div class="form-grid three-col">
+              <label class="field"><span>Maximum depth <i>?</i></span><div class="input-suffix"><input type="number" min="1" max="31" value="2" id="max_depth"><b>levels</b></div><small>Maximum rule chain depth (1–31).</small></label>
+              <label class="field"><span>Target runtime</span><div class="input-suffix"><input type="number" min="0.01" step="0.05" value="0.5" id="target_hours"><b>hours</b></div><small>Time budget for the search.</small></label>
+              <label class="field"><span>Maximum chains</span><div class="input-suffix"><input type="number" min="0" step="1" value="0" id="max_chains"><b>chains</b></div><small>0 = engine default / unlimited.</small></label>
+              <label class="field"><span>Bloom filter size</span><div class="input-suffix"><input type="number" min="0" step="1" value="0" id="bloom_mb"><b>MB</b></div><small>0 = automatic GPU sizing.</small></label>
+              <label class="field"><span>GPU device</span><input type="text" id="device" list="device-options" placeholder="Auto-select best GPU"><datalist id="device-options"><option value="all">All detected GPUs</option></datalist><small>Leave blank for auto · use all, an index, name or list.</small><button class="inline-detect" id="detect-devices" type="button">⌁ Detect GPUs</button></label>
+              <label class="field"><span>Output filename</span><input type="text" id="output_name" value="rulest_output.txt"><small>Saved in the run output folder.</small></label>
+            </div>
+            <section class="gpu-diagnostic" id="gpu-diagnostic" data-state="unknown" aria-live="polite">
+              <div class="gpu-diagnostic-head">
+                <span class="gpu-diagnostic-icon" id="gpu-diagnostic-icon">⌁</span>
+                <div class="gpu-diagnostic-copy"><b id="gpu-diagnostic-summary">GPU status not checked</b><small id="gpu-diagnostic-action">GPU detection runs automatically when the Control Center opens.</small></div>
+                <span class="gpu-count-badge" id="gpu-count-badge">NOT CHECKED</span>
+              </div>
+              <details class="gpu-diagnostic-details" id="gpu-diagnostic-details">
+                <summary>Open detailed diagnostics</summary>
+                <pre id="gpu-diagnostic-report">No diagnostic report yet.</pre>
+                <button class="small-ghost" id="copy-gpu-report" type="button">Copy diagnostic report</button>
+              </details>
+            </section>
+            <div class="toggle-row compact-toggle"><div><b>Disable Bloom sharding</b><small>Force one Bloom filter shard, even for large filters.</small></div><label class="switch"><input type="checkbox" id="bloom_no_shard"><span></span></label></div>
+            <div class="toggle-row compact-toggle"><div><b>Allow reject rules</b><small>Allow rules which intentionally reject candidate words.</small></div><label class="switch"><input type="checkbox" id="allow_reject_rules"><span></span></label></div>
+            <div class="toggle-row compact-toggle"><div><b>Disable built-in seeds</b><small>Skip the built-in numeric and pattern seed families (A–M).</small></div><label class="switch"><input type="checkbox" id="no_builtin_seeds"><span></span></label></div>
+            <div class="subsection depth-overrides"><div class="subsection-title"><div><h3>Per-depth chain limits</h3><p>Override automatically calculated chain counts for individual depths.</p></div><span class="subtle-tag">OPTIONAL OVERRIDES</span></div><div class="depth-grid" id="depth-grid"></div></div>
+          </section>
+
+          <section class="panel stage-panel" id="token-stage-panel">
+            <div class="panel-heading"><div><span class="section-index">03</span><h2>Stage 0 · Token Strip</h2><p>CPU exact-match extraction for core and insertion patterns.</p></div><div class="stage-enable-control"><span class="stage-state-pill" id="token-state" data-enabled="false">DISABLED</span><label class="stage-enable-toggle"><input type="checkbox" id="token_strip" aria-label="Enable Stage 0 Token Strip"><span class="stage-toggle-track" aria-hidden="true"></span><span class="stage-toggle-caption">Enable Stage 0</span></label></div></div>
+            <div class="stage-options" id="token-options">
+              <label class="field"><span>Minimum stem length</span><input type="number" min="1" value="4" id="token_strip_min_stem"></label>
+              <label class="field"><span>Maximum prefix length</span><input type="number" min="0" value="4" id="token_strip_max_prefix"></label>
+              <label class="field"><span>Maximum suffix length</span><input type="number" min="0" value="4" id="token_strip_max_suffix"></label>
+              <label class="field"><span>Minimum leet ambiguity</span><input type="number" min="0" value="3" id="token_strip_min_leet_amb"></label>
+              <label class="field"><span>Worker processes</span><input type="number" min="0" value="0" id="token_strip_workers"><small>0 = auto-detect CPU count.</small></label>
+              <label class="field"><span>Chunk size</span><input type="number" min="0" value="0" id="token_strip_chunk_size"><small>0 = engine default.</small></label>
+            </div>
+            <div class="stage-disabled-note" id="token-note">Stage 0 is OFF. Turn on <b>Enable Stage 0</b> above to include Token Strip in the run.</div>
+          </section>
+
+          <section class="panel stage-panel" id="genetic-stage-panel">
+            <div class="panel-heading"><div><span class="section-index">04</span><h2>Genetic algorithm</h2><p>Optional evolutionary search for additional rule candidates.</p></div><div class="stage-enable-control"><span class="stage-state-pill" id="genetic-state" data-enabled="false">DISABLED</span><label class="stage-enable-toggle"><input type="checkbox" id="genetic" aria-label="Enable Genetic Algorithm"><span class="stage-toggle-track" aria-hidden="true"></span><span class="stage-toggle-caption">Enable Genetic</span></label></div></div>
+            <div class="stage-options three-col" id="genetic-options">
+              <label class="field"><span>Generations</span><input type="number" min="1" value="50" id="genetic_generations"></label>
+              <label class="field"><span>Population size</span><input type="number" min="1" value="200" id="genetic_pop"></label>
+              <label class="field"><span>Elite ratio</span><div class="input-suffix"><input type="number" min="0.01" max="0.99" step="0.01" value="0.15" id="genetic_elite"><b>0–1</b></div></label>
+            </div>
+            <div class="stage-disabled-note" id="genetic-note">Genetic search is OFF. Turn on <b>Enable Genetic</b> above to include Stage 3. Genetic search requires <b>Maximum depth ≥ 2</b>.</div>
+          </section>
+
+          <section class="panel">
+            <div class="panel-heading"><div><span class="section-index">05</span><h2>Rule selection</h2><p>Choose how final rules are ranked and trimmed.</p></div><span class="subtle-tag">POST-PROCESSING</span></div>
+            <div class="form-grid three-col">
+              <label class="field"><span>Selection mode</span><select id="select_mode"><option value="frequency">Frequency · GPU hit count</option><option value="greedy">Greedy · Marginal coverage</option></select><small>Greedy evaluates exact target coverage.</small></label>
+              <label class="field"><span>Selection budget</span><div class="input-suffix"><input type="number" min="0" value="0" id="select_budget"><b>rules</b></div><small>0 = continue to saturation (greedy mode).</small></label>
+              <label class="field"><span>Cost alpha</span><input type="number" min="0" step="0.1" value="0" id="select_cost_alpha"><small>Higher values favour shorter chains.</small></label>
+              <label class="field field-wide"><span>Additional budget sweep</span><input type="text" id="select_budgets" placeholder="100, 1000, 10000"><small>Comma-separated rule budgets; emits separate prefix files.</small></label>
+            </div>
+            <div class="toggle-row compact-toggle"><div><b>Report exact recovery</b><small>Explicitly report distinct target-word recovery in greedy mode.</small></div><label class="switch"><input type="checkbox" id="exact_recovery"><span></span></label></div>
+          </section>
+
+          <section class="panel advanced-panel">
+            <button class="advanced-trigger" id="advanced-trigger" type="button" aria-expanded="false"><div><span class="section-index">06</span><div><h2>Diagnostics & profiling</h2><p>Logging, detailed timing and troubleshooting flags.</p></div></div><span class="chevron">⌄</span></button>
+            <div class="advanced-content" id="advanced-content">
+              <div class="toggle-row"><div><b>Debug logging</b><small>Enable verbose diagnostic messages.</small></div><label class="switch"><input type="checkbox" id="debug"><span></span></label></div>
+              <div class="toggle-row"><div><b>Stage profiling</b><small>Print a per-stage wall-clock breakdown and GPU-event accounting.</small></div><label class="switch"><input type="checkbox" id="profile"><span></span></label></div>
+            </div>
+          </section>
+
+          <div class="launch-bar"><div><span class="launch-check">✓</span><div><b>Rule engine standing by</b><small>Configure your inputs and parameters, then launch a rule search.</small></div></div><button id="start-run" class="primary-button" type="button"><span>Launch engine</span><b>↗</b></button></div>
+        </div>
+
+        <aside class="secondary-column">
+          <section class="panel run-panel" id="activity">
+            <div class="panel-heading"><div><span class="side-panel-kicker">LIVE MONITOR</span><h2>Run activity</h2></div><span class="live-pill" id="live-pill"><span></span> STANDBY</span></div>
+            <div class="run-stage"><div class="run-stage-icon">⌁</div><div class="run-stage-copy"><small>ACTIVE PHASE · LIVE</small><b id="current-stage">Waiting for a run</b><p id="current-stage-detail">Start a run to see the active processing phase.</p></div></div>
+            <div class="progress-head"><span>PHASE PROGRESS</span><b id="progress-label">—</b></div>
+            <div class="progress-track"><span id="phase-progress"></span></div>
+            <div class="monitor-details"><div><small>RUNTIME</small><b id="monitor-runtime">00:00</b></div><div><small>PROCESS ID</small><b id="monitor-pid">—</b></div></div>
+            <div class="control-buttons"><button id="pause-run" type="button" disabled>Ⅱ <span>Pause</span></button><button id="resume-run" type="button" disabled>▶ <span>Resume</span></button><button id="stop-run" type="button" disabled>■ <span>Save & stop</span></button></div>
+            <div class="control-hint">Pause / resume / stop are handled by the engine at its next safe checkpoint.</div>
+          </section>
+
+          <section class="panel outputs-panel">
+            <div class="panel-heading"><div><span class="side-panel-kicker">ARTIFACTS</span><h2>Output files</h2></div><span class="output-count" id="output-count">0</span></div>
+            <div id="output-list" class="output-list"><div class="empty-output"><span>▤</span><b>No outputs yet</b><small>Generated rulesets will appear here.</small></div></div>
+          </section>
+
+          <section class="panel notes-panel">
+            <div class="notes-icon">✦</div><h3>Quick notes</h3>
+            <div class="note-row"><span>01</span><p>Leave Bloom filter size at <b>0</b> to let the engine estimate GPU memory automatically.</p></div>
+            <div class="note-row"><span>02</span><p>Use <b>Greedy</b> selection when coverage matters more than raw hit frequency.</p></div>
+            <div class="note-row"><span>03</span><p>Temporary server copies are automatically deleted when the run completes or is stopped. Generated results and logs are kept.</p></div>
+          </section>
+        </aside>
+      </div>
+
+      <section class="panel log-panel" id="live-log" tabindex="-1" aria-label="Live engine log">
+        <div class="panel-heading log-heading"><div><span class="side-panel-kicker">ENGINE OUTPUT</span><h2>Live log</h2><p>Continuous output from the active RULEST process.</p></div><div class="log-actions"><span class="log-live"><i></i> LIVE STREAM</span><button id="wrap-log" class="small-ghost" type="button" aria-pressed="true">Wrap: ON</button><button id="expand-log" class="small-ghost" type="button" aria-expanded="false">Expand</button><button id="download-log" class="small-ghost" type="button">↓ Export log</button></div></div>
+        <div class="log-clear-row">
+          <div class="log-clear-copy"><b>Log history</b><small>Clear the visible stream and truncate the server-side <code>engine.log</code> file. New events will continue to appear.</small></div>
+          <button id="clear-log" class="clear-logs-action" type="button" title="Clear visible logs and truncate the saved engine.log" aria-label="Clear log history">
+            <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 5.5h12M8 5.5V3.8h4v1.7m-6.2 0 .7 10.2h6.9l.7-10.2M8.4 8.2v5.1m3.2-5.1v5.1" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            <span>Clear log history</span>
+          </button>
+        </div>
+        <div class="terminal-window" id="terminal-window"><div class="terminal-top"><div class="terminal-dots"><i></i><i></i><i></i></div><span>rulest-engine / stdout</span><span class="terminal-right">UTF-8 <b>·</b> REAL TIME</span></div><div class="terminal-body" id="log-output"><div class="terminal-placeholder"><span>⌁</span><b>Waiting for engine output</b><small>Start a run to stream live progress and diagnostics.</small></div></div><div class="terminal-foot"><span><i></i> CONNECTED TO LOCAL ENGINE</span><span id="log-line-count">0 EVENTS</span></div></div>
+      </section>
+      <footer class="page-footer"><span>RULEST CONTROL CENTER <b>·</b> LOCAL GPU RULE ENGINE</span><span>BUILT FOR FOCUS <i>✳</i></span></footer>
+    </main>
+  </div>
+  <dialog class="password-dialog" id="password-dialog">
+    <form id="password-form" method="dialog">
+      <div class="dialog-eyebrow">ACCOUNT SECURITY</div>
+      <h2>Change password</h2>
+      <p>Changing your password will sign out other browsers and devices.</p>
+      <label for="current-password">Current password</label><input id="current-password" type="password" autocomplete="current-password" required>
+      <label for="new-password">New password</label><input id="new-password" type="password" autocomplete="new-password" minlength="12" required>
+      <small>Use at least 12 characters.</small>
+      <label for="confirm-new-password">Confirm new password</label><input id="confirm-new-password" type="password" autocomplete="new-password" minlength="12" required>
+      <div class="dialog-error" id="password-change-error" role="alert"></div>
+      <div class="dialog-actions"><button class="small-ghost" id="cancel-password-change" type="button">Cancel</button><button class="primary-button" id="submit-password-change" type="submit">Update password</button></div>
+    </form>
+  </dialog>
+  <div class="toast" id="toast" role="status"></div>
+  <script src="/app.js?v=auth-password-2-celf-live"></script>
+</body>
+</html>

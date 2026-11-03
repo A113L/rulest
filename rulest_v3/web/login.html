@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#0c0e13">
+  <title>RULEST — Secure Access</title>
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg">
+  <style>
+    :root{color-scheme:dark;--bg:#0c0e13;--panel:#141820;--line:#252d38;--text:#edf2e9;--muted:#929d91;--lime:#b8f36b;--red:#ff8585}
+    *{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;padding:28px;background:radial-gradient(ellipse at 50% 0%,#1c2920 0,transparent 48%),var(--bg);color:var(--text);font:15px/1.5 Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif}
+    .shell{width:min(100%,440px)}.brand{display:flex;align-items:center;gap:12px;margin:0 0 30px 4px}.mark{width:46px;height:46px}.brand strong{display:block;font-size:18px;letter-spacing:.16em}.brand small{display:block;color:#8f9b8c;font-size:10px;letter-spacing:.2em;font-weight:700;margin-top:2px}
+    .card{background:linear-gradient(145deg,#171d25,#11151c);border:1px solid #2a3540;border-radius:18px;padding:34px;box-shadow:0 28px 90px #0008}.eyebrow{display:flex;align-items:center;gap:9px;color:var(--lime);font-size:10px;letter-spacing:.17em;font-weight:800}.eyebrow:before{content:"";height:1px;width:24px;background:var(--lime)}h1{font-size:29px;letter-spacing:-.04em;margin:12px 0 7px}.intro{margin:0 0 27px;color:var(--muted);font-size:13px}
+    label{display:block;color:#c6d0c4;font-size:12px;font-weight:700;margin:0 0 8px}.input-wrap{position:relative}input{width:100%;height:48px;border-radius:9px;border:1px solid #34404a;background:#0c1117;color:var(--text);font:inherit;padding:0 48px 0 14px;outline:none}input:focus{border-color:var(--lime);box-shadow:0 0 0 3px #b8f36b1c}.reveal{position:absolute;right:8px;top:7px;height:34px;padding:0 9px;border:0;background:transparent;color:#9da99c;cursor:pointer;font-size:11px;font-weight:800}.field{margin-bottom:18px}.hint{color:#849085;font-size:11px;margin:7px 0 0}.submit{width:100%;height:48px;border:0;border-radius:9px;background:var(--lime);color:#11170e;font-weight:900;letter-spacing:.02em;cursor:pointer;margin-top:6px}.submit:disabled{opacity:.55;cursor:wait}.error{display:none;background:#3a2023;border:1px solid #794147;color:#ffb8b8;padding:10px 12px;border-radius:8px;font-size:12px;margin:0 0 16px}.error.show{display:block}.foot{display:flex;align-items:center;justify-content:center;gap:8px;color:#738074;font-size:11px;margin:20px 0 0}.dot{width:6px;height:6px;border-radius:50%;background:var(--lime);box-shadow:0 0 10px #b8f36b66}.notice{margin-top:20px;border:1px solid #303a32;background:#141b16;border-radius:9px;padding:12px;color:#99a696;font-size:11px}.hidden{display:none!important}
+    @media(max-width:520px){.card{padding:26px 22px}h1{font-size:25px}}
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <div class="brand">
+      <svg class="mark" viewBox="0 0 44 44" aria-hidden="true"><rect x="1" y="1" width="42" height="42" rx="11" fill="#17221b" stroke="#405633"/><path d="M17 10 13.5 34 M29 10 25.5 34 M9.5 18.5H35 M8 27H33.5" fill="none" stroke="#b8f36b" stroke-width="3.1" stroke-linecap="round"/><circle cx="34.5" cy="31.5" r="3" fill="#b8f36b"/></svg>
+      <span><strong>RULEST</strong><small>CONTROL CENTER</small></span>
+    </div>
+    <section class="card">
+      <div class="eyebrow">SECURE WORKSPACE</div>
+      <h1 id="title">Sign in to RULEST<span style="color:var(--lime)">.</span></h1>
+      <p class="intro" id="intro">Enter your application password to access the rule engine.</p>
+      <form id="auth-form">
+        <div class="error" id="error" role="alert"></div>
+        <div class="field">
+          <label for="password" id="password-label">Application password</label>
+          <div class="input-wrap"><input id="password" name="password" type="password" required autocomplete="current-password" autofocus><button class="reveal" type="button" data-reveal="password">SHOW</button></div>
+          <p class="hint hidden" id="password-hint">Use at least 12 characters. A unique passphrase is recommended.</p>
+        </div>
+        <div class="field hidden" id="confirm-field">
+          <label for="confirm-password">Confirm password</label>
+          <div class="input-wrap"><input id="confirm-password" name="confirm-password" type="password" autocomplete="new-password"><button class="reveal" type="button" data-reveal="confirm-password">SHOW</button></div>
+        </div>
+        <button class="submit" id="submit" type="submit">Sign in <span aria-hidden="true">→</span></button>
+      </form>
+      <div class="notice" id="notice">Sessions expire after 12 hours. Five incorrect sign-in attempts temporarily lock access from that network address.</div>
+    </section>
+    <div class="foot"><span class="dot"></span> Password-protected · Local network access</div>
+  </main>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  let setup = false;
+  const showError = message => { $('error').textContent = message; $('error').classList.add('show'); };
+  document.querySelectorAll('[data-reveal]').forEach(button => button.addEventListener('click', () => {
+    const input = $(button.dataset.reveal); input.type = input.type === 'password' ? 'text' : 'password';
+    button.textContent = input.type === 'password' ? 'SHOW' : 'HIDE';
+  }));
+  async function initialize() {
+    try {
+      const response = await fetch('/api/auth/me', { cache: 'no-store' });
+      const data = await response.json();
+      if (data.authenticated) { location.replace('/'); return; }
+      setup = !!data.setup_required;
+      if (setup) {
+        $('title').textContent = 'Create your password.';
+        $('intro').textContent = 'Set the administrator password for this RULEST installation. There is no default password.';
+        $('password-label').textContent = 'Create application password';
+        $('password').autocomplete = 'new-password';
+        $('password').minLength = 12;
+        $('password-hint').classList.remove('hidden');
+        $('confirm-field').classList.remove('hidden');
+        $('submit').innerHTML = 'Create password <span aria-hidden="true">→</span>';
+        $('notice').textContent = 'Only a salted PBKDF2 password hash is stored. Complete this one-time setup from a trusted device before sharing the LAN address.';
+      }
+    } catch (error) { showError('Could not reach the RULEST server. Refresh the page or check the server process.'); }
+  }
+  $('auth-form').addEventListener('submit', async event => {
+    event.preventDefault(); $('error').classList.remove('show');
+    const password = $('password').value;
+    if (setup && password.length < 12) { showError('Choose a password with at least 12 characters.'); return; }
+    if (setup && password !== $('confirm-password').value) { showError('The passwords do not match.'); return; }
+    $('submit').disabled = true;
+    $('submit').textContent = setup ? 'Creating password…' : 'Signing in…';
+    try {
+      const response = await fetch(setup ? '/api/auth/setup' : '/api/auth/login', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password })
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || 'Authentication failed.');
+      location.replace('/');
+    } catch (error) {
+      showError(error.message);
+      $('submit').disabled = false;
+      $('submit').innerHTML = setup ? 'Create password <span aria-hidden="true">→</span>' : 'Sign in <span aria-hidden="true">→</span>';
+    }
+  });
+  initialize();
+})();
+</script>
+</body>
+</html>
