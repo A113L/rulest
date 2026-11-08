@@ -24,6 +24,8 @@ import os
 import sys
 from types import SimpleNamespace
 
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from rulest.gpu_engine import GPUEngine
@@ -160,6 +162,10 @@ class _FakeEvolverNoRulePoolBypass:
         return hit_words
 
 
+@pytest.mark.skipif(
+    not hasattr(selection, "evaluate_full_coverage"),
+    reason="legacy evaluate_full_coverage path was replaced by current CELF selection",
+)
 class TestEvaluateFullCoverageResyncsRulePoolPerBatch:
     """End-to-end (minus the real GPU) reproduction of the original crash:
     batch 2 introduces tokens that weren't part of batch 1, and batch 1's
@@ -221,6 +227,10 @@ class TestEvaluateFullCoverageResyncsRulePoolPerBatch:
             )
 
 
+@pytest.mark.skipif(
+    not hasattr(selection, "evaluate_full_coverage"),
+    reason="legacy evaluate_full_coverage path was replaced by current CELF selection",
+)
 class TestEvaluateFullCoverageExcludesOverLengthCandidates:
     """Regression test for the second production crash:
     KeyError("] $3 $0 $1 $0 $2 $0 $3") — a candidate longer than max_depth

@@ -48,3 +48,21 @@ if __name__ == "__main__":
     import pytest
     print(f"Running {__file__} directly — use `pytest {__file__}` for full output.\n")
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+def test_release_run_references_is_forwarded_to_each_engine():
+    class RefEngine:
+        def __init__(self):
+            self.released = 0
+
+        def release_run_references(self):
+            self.released += 1
+
+    manager = MultiGPUEngine({})
+    first, second = RefEngine(), RefEngine()
+    manager.engines = [first, second]
+
+    manager.release_run_references()
+
+    assert first.released == 1
+    assert second.released == 1

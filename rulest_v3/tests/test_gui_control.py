@@ -18,11 +18,11 @@ def test_build_command_maps_all_cli_options(tmp_path, monkeypatch):
     monkeypatch.setattr(app, "UPLOADS_META", uploads)
     options = {
         "output_name": "rules.txt", "device": "0,1", "max_depth": 4,
-        "target_hours": 1.5, "max_chains": 200, "bloom_mb": 512,
+        "target_hours": 1.5, "max_chains": 200, "rng_seed": "123456789", "bloom_mb": 512,
         "bloom_no_shard": True, "allow_reject_rules": True, "no_builtin_seeds": True,
         "token_strip": True, "token_strip_min_stem": 5, "token_strip_max_prefix": 2,
         "token_strip_max_suffix": 3, "token_strip_min_leet_amb": 4,
-        "token_strip_workers": 6, "token_strip_chunk_size": 10000,
+        "token_strip_workers": 6, "token_strip_chunk_size": 10000, "token_strip_bloom_mb": -1,
         "genetic": True, "genetic_generations": 70, "genetic_pop": 300,
         "genetic_elite": 0.2, "select_mode": "greedy", "select_budget": 800,
         "select_budgets": "100,500", "select_cost_alpha": 0.5,
@@ -33,7 +33,7 @@ def test_build_command_maps_all_cli_options(tmp_path, monkeypatch):
     assert output == "rules.txt"
     expected = [
         "--device", "0,1", "--max-depth", "4", "--target-hours", "1.5",
-        "--max-chains", "200", "--bloom-mb", "512", "--seed-rules",
+        "--max-chains", "200", "--seed", "123456789", "--bloom-mb", "512", "--token-strip-bloom-mb", "-1", "--seed-rules",
         str(uploads["seed"]["path"]), "--depth2-chains", "12", "--depth10-chains", "99",
         "--select-mode", "greedy", "--select-budget", "800", "--select-budgets", "100,500",
     ]
@@ -98,6 +98,9 @@ def test_optional_stage_switches_are_explicit_in_the_gui():
     js = (web_dir / "app.js").read_text(encoding="utf-8")
 
     assert 'id="token_strip"' in html
+    assert 'id="token_strip_bloom_mb"' in html
+    assert "Base Bloom size" in html
+    assert "token_strip_bloom_mb" in js
     assert 'aria-label="Enable Stage 0 Token Strip"' in html
     assert "Enable Stage 0" in html
     assert 'id="genetic"' in html
@@ -430,3 +433,52 @@ def test_clear_logs_http_endpoint_resets_other_browser_sessions(tmp_path, monkey
         server.shutdown()
         server.server_close()
         thread.join(timeout=3)
+
+
+def test_build_command_omits_optional_rng_seed_when_blank(tmp_path, monkeypatch):
+    monkeypatch.setattr(app, "UPLOADS_META", {
+        "base": {"path": tmp_path / "base.txt", "name": "base.txt", "size": 1},
+        "target": {"path": tmp_path / "target.txt", "name": "target.txt", "size": 1},
+        "seed": None,
+    })
+    command, _ = app.build_command({"output_name": "rules.txt", "rng_seed": ""}, tmp_path)
+    assert "--seed" not in command
+
+
+def test_build_command_rejects_invalid_rng_seed_values(tmp_path, monkeypatch):
+    monkeypatch.setattr(app, "UPLOADS_META", {
+        "base": {"path": tmp_path / "base.txt", "name": "base.txt", "size": 1},
+        "target": {"path": tmp_path / "target.txt", "name": "target.txt", "size": 1},
+        "seed": None,
+    })
+    for invalid in ("-1", "1.5", "not-a-seed", "4294967296", True):
+        try:
+            app.build_command({"output_name": "rules.txt", "rng_seed": invalid}, tmp_path)
+        except ValueError as exc:
+            assert "RNG seed" in str(exc)
+        else:
+            raise AssertionError(f"Invalid RNG seed was accepted: {invalid!r}")
+
+
+def test_rng_seed_is_available_in_web_ui_and_explained_in_readme():
+    root = Path(app.__file__).resolve().parent
+    html = (root / "web" / "index.html").read_text(encoding="utf-8")
+    js = (root / "web" / "app.js").read_text(encoding="utf-8")
+    readme = (root / "README.md").read_text(encoding="utf-8")
+
+    assert 'id="rng_seed"' in html
+    assert 'max="4294967295"' in html
+    assert "rng_seed: ''" in js
+    assert "RNG seed must be an integer" in js
+    assert "Repeatable runs (RNG seed)" in readme
+    assert "GPU/OpenCL" in readme or "GPU/OpenCL" in readme.replace(" ", "")
+
+
+def test_build_command_accepts_zero_rng_seed(tmp_path, monkeypatch):
+    monkeypatch.setattr(app, "UPLOADS_META", {
+        "base": {"path": tmp_path / "base.txt", "name": "base.txt", "size": 1},
+        "target": {"path": tmp_path / "target.txt", "name": "target.txt", "size": 1},
+        "seed": None,
+    })
+    command, _ = app.build_command({"output_name": "rules.txt", "rng_seed": 0}, tmp_path)
+    assert command[command.index("--seed") + 1] == "0"

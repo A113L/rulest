@@ -82,3 +82,34 @@ def test_strict_rpc_surfaces_worker_errors_instead_of_swallowing_them():
     proxy._last_heartbeat = 1e20  # prevent heartbeat timeout during this unit test
     with pytest.raises(RuntimeError, match="simulated CELF setup failure"):
         proxy._call("celf_initialize_target_table", [], _raise_on_error=True)
+
+
+def test_proxy_terminate_waits_for_graceful_worker_shutdown(monkeypatch):
+    proxy = ProcessEngineProxy({}, "0")
+
+    class FakeQueue:
+        def __init__(self):
+            self.items = []
+
+        def put(self, item):
+            self.items.append(item)
+
+    class FakeProcess:
+        def __init__(self):
+            self.join_timeout = None
+
+        def join(self, timeout=None):
+            self.join_timeout = timeout
+
+    proc = FakeProcess()
+    cmd_q = FakeQueue()
+    proxy._proc = proc
+    proxy._cmd_q = cmd_q
+    killed = []
+    monkeypatch.setattr(proxy, "_kill", lambda: killed.append(True))
+
+    proxy.terminate()
+
+    assert cmd_q.items == [(None, "__shutdown__", (), {})]
+    assert proc.join_timeout == 5.0
+    assert killed == [True]

@@ -1,6 +1,7 @@
 """Unit tests for rulest.io_utils.load_wordlist."""
 import os
 import sys
+import multiprocessing as mp
 
 import pytest
 
@@ -14,6 +15,10 @@ def _write(tmp_path, name, data: bytes):
     p = tmp_path / name
     p.write_bytes(data)
     return str(p)
+
+
+def _spawn_read_shared_wordlist(words):
+    return len(words), words[0], words[-1], list(words[1:3])
 
 
 class TestLoadWordlist:
@@ -57,9 +62,60 @@ class TestLoadWordlist:
         words = load_wordlist(path)
         assert len(words) == 1
 
-    def test_returns_list_type(self, tmp_path):
+    def test_returns_shared_memory_sequence(self, tmp_path):
+        from rulest.io_utils import SharedWordList
         path = _write(tmp_path, 'words.txt', b"a\nb\n")
-        assert isinstance(load_wordlist(path), list)
+        words = load_wordlist(path)
+        try:
+            assert isinstance(words, SharedWordList)
+            assert list(words) == ["a", "b"]
+            assert words._data_shm.name
+            assert words._offsets_shm.name
+        finally:
+            words.close()
+
+
+    def test_numpy_flatten_uses_packed_ram_and_lazy_slices(self, tmp_path):
+        path = _write(tmp_path, 'words.txt', b"alpha\nbeta\ngamma\n")
+        words = load_wordlist(path)
+        try:
+            flat, offsets, lengths = words.numpy_flatten()
+            assert bytes(flat) == b"alphabetagamma"
+            assert offsets.tolist() == [0, 5, 9]
+            assert lengths.tolist() == [5, 4, 5]
+
+            flat2, offsets2, lengths2 = words[1:].numpy_flatten()
+            assert bytes(flat2) == b"betagamma"
+            assert offsets2.tolist() == [0, 4]
+            assert lengths2.tolist() == [4, 5]
+            del flat, offsets, lengths, flat2, offsets2, lengths2
+        finally:
+            words.close()
+
+
+    def test_wordlist_pickle_attaches_shared_memory_in_spawn(self, tmp_path):
+        path = _write(tmp_path, 'words.txt', b"alpha\nbeta\ngamma\n")
+        words = load_wordlist(path)
+        try:
+            ctx = mp.get_context("spawn")
+            with ctx.Pool(1) as pool:
+                result = pool.apply(_spawn_read_shared_wordlist, (words,))
+            assert result == (3, "alpha", "gamma", ["beta", "gamma"])
+        finally:
+            words.close()
+
+    def test_retains_compact_membership_index_for_stage0(self, tmp_path):
+        from rulest.tokenstrip_hashset import FlatHashSet64
+        path = _write(tmp_path, 'words.txt', b"alpha\nbeta\nalpha\n")
+        words = load_wordlist(path, retain_membership_index=True)
+        try:
+            assert isinstance(words.membership_index, FlatHashSet64)
+            assert "alpha" in words.membership_index
+            assert "beta" in words.membership_index
+            assert "missing" not in words.membership_index
+            assert words.membership_index.shared_name
+        finally:
+            words.close()
 
 
 if __name__ == "__main__":
