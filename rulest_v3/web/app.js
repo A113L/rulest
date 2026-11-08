@@ -11,10 +11,10 @@ let toastTimer = null;
 let currentStatus = 'idle';
 
 const defaults = {
-  max_depth: 2, target_hours: 0.5, max_chains: 0, bloom_mb: 0, device: '', output_name: 'rulest_output.txt',
+  max_depth: 2, target_hours: 0.5, max_chains: 0, rng_seed: '', bloom_mb: 0, device: '', output_name: 'rulest_output.txt',
   bloom_no_shard: false, allow_reject_rules: false, no_builtin_seeds: false,
   token_strip: false, token_strip_min_stem: 4, token_strip_max_prefix: 4,
-  token_strip_max_suffix: 4, token_strip_min_leet_amb: 3, token_strip_workers: 0, token_strip_chunk_size: 0,
+  token_strip_max_suffix: 4, token_strip_min_leet_amb: 3, token_strip_workers: 0, token_strip_chunk_size: 0, token_strip_bloom_mb: 0,
   genetic: false, genetic_generations: 50, genetic_pop: 200, genetic_elite: 0.15,
   select_mode: 'frequency', select_budget: 0, select_budgets: '', select_cost_alpha: 0, exact_recovery: false,
   debug: false, profile: false,
@@ -298,6 +298,11 @@ async function startRun() {
   if (!uploadState.base || !uploadState.target) { toast('Upload both BASE and TARGET wordlists first.', true); return; }
   const config = collectConfig();
   if (!config.output_name.trim()) { toast('Enter an output filename.', true); return; }
+  const rngSeedText = String(config.rng_seed ?? '').trim();
+  if (rngSeedText !== '' && (!/^[0-9]{1,10}$/.test(rngSeedText) || !Number.isSafeInteger(Number(rngSeedText)) || Number(rngSeedText) > 4294967295)) {
+    toast('RNG seed must be an integer from 0 to 4294967295, or left blank for a random run.', true);
+    return;
+  }
   const numericRanges = [
     ['target_hours', 0.000001, Infinity, 'Target runtime must be greater than zero.'],
     ['max_chains', 0, Infinity, 'Maximum chains cannot be negative.'],
@@ -313,6 +318,8 @@ async function startRun() {
     ['token_strip_workers', 0, Infinity, 'Worker processes cannot be negative.'],
     ['token_strip_chunk_size', 0, Infinity, 'Chunk size cannot be negative.'],
   ];
+  const tokenBloomMb = Number(config.token_strip_bloom_mb);
+  if (!Number.isInteger(tokenBloomMb) || tokenBloomMb < -1) { toast('Base Bloom size must be -1 (auto), 0 (exact), or a positive number of MB.', true); return; }
   if (Number(config.max_depth) < 1 || Number(config.max_depth) > 31) { toast('Maximum depth must be between 1 and 31.', true); return; }
   if (config.genetic && Number(config.max_depth) < 2) { toast('Genetic Algorithm requires Maximum depth ≥ 2. Increase Maximum depth or switch Genetic off.', true); return; }
   if (Number(config.genetic_elite) <= 0 || Number(config.genetic_elite) >= 1 || !Number.isFinite(Number(config.genetic_elite))) { toast('Elite ratio must be between 0 and 1.', true); return; }

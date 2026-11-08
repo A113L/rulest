@@ -6,7 +6,7 @@
   <meta name="theme-color" content="#0c0e13">
   <title>RULEST — Control Center · Cleanlooks</title>
   <link rel="icon" type="image/svg+xml" href="/favicon.svg?v=rule-hash-mark-2">
-  <link rel="stylesheet" href="/styles.css?v=auth-password-1">
+  <link rel="stylesheet" href="/styles.css?v=auth-password-1-rng-seed-1">
 </head>
 <body>
   <div class="app-shell">
@@ -31,7 +31,7 @@
           <p>Runs on your machine</p>
           <small>OpenCL · GPU accelerated</small>
         </div>
-        <div class="side-foot"><span class="version-dot"></span> Rulest UI <b>v1.3</b><br><span>Password protected · LAN access</span></div>
+        <div class="side-foot"><span class="version-dot"></span> Rulest UI <b>v1.4</b><br><span>Password protected · LAN access</span></div>
       </div>
     </aside>
 
@@ -84,6 +84,7 @@
               <label class="field"><span>Maximum depth <i>?</i></span><div class="input-suffix"><input type="number" min="1" max="31" value="2" id="max_depth"><b>levels</b></div><small>Maximum rule chain depth (1–31).</small></label>
               <label class="field"><span>Target runtime</span><div class="input-suffix"><input type="number" min="0.01" step="0.05" value="0.5" id="target_hours"><b>hours</b></div><small>Time budget for the search.</small></label>
               <label class="field"><span>Maximum chains</span><div class="input-suffix"><input type="number" min="0" step="1" value="0" id="max_chains"><b>chains</b></div><small>0 = engine default / unlimited.</small></label>
+              <label class="field"><span>RNG seed <em>OPTIONAL</em></span><input type="number" min="0" max="4294967295" step="1" inputmode="numeric" placeholder="Random (unset)" id="rng_seed"><small>Reuse the same seed with identical inputs and settings to repeat randomized steps. GPU reduction order may still vary rarely. Range: 0–4294967295.</small></label>
               <label class="field"><span>Bloom filter size</span><div class="input-suffix"><input type="number" min="0" step="1" value="0" id="bloom_mb"><b>MB</b></div><small>0 = automatic GPU sizing.</small></label>
               <label class="field"><span>GPU device</span><input type="text" id="device" list="device-options" placeholder="Auto-select best GPU"><datalist id="device-options"><option value="all">All detected GPUs</option></datalist><small>Leave blank for auto · use all, an index, name or list.</small><button class="inline-detect" id="detect-devices" type="button">⌁ Detect GPUs</button></label>
               <label class="field"><span>Output filename</span><input type="text" id="output_name" value="rulest_output.txt"><small>Saved in the run output folder.</small></label>
@@ -115,6 +116,7 @@
               <label class="field"><span>Minimum leet ambiguity</span><input type="number" min="0" value="3" id="token_strip_min_leet_amb"></label>
               <label class="field"><span>Worker processes</span><input type="number" min="0" value="0" id="token_strip_workers"><small>0 = auto-detect CPU count.</small></label>
               <label class="field"><span>Chunk size</span><input type="number" min="0" value="0" id="token_strip_chunk_size"><small>0 = engine default.</small></label>
+              <label class="field"><span>Base Bloom size</span><div class="input-suffix"><input type="number" step="1" value="0" id="token_strip_bloom_mb"><b>MB</b></div><small>0 = exact shared hash table. &gt;0 = Bloom filter of this size. −1 = automatic low-memory mode.</small></label>
             </div>
             <div class="stage-disabled-note" id="token-note">Stage 0 is OFF. Turn on <b>Enable Stage 0</b> above to include Token Strip in the run.</div>
           </section>
@@ -204,6 +206,6 @@
     </form>
   </dialog>
   <div class="toast" id="toast" role="status"></div>
-  <script src="/app.js?v=auth-password-2-celf-live"></script>
+  <script src="/app.js?v=auth-password-2-celf-live-rng-seed-1"></script>
 </body>
 </html>
