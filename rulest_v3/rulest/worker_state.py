@@ -10,4 +10,3 @@ keep it here and always mutate via attribute access, e.g.
 `worker_state.p0_worker_base_set = ...`, never `global p0_worker_base_set`.
 """
 p0_worker_base_set = set()
-p0_worker_base_by_len = {}

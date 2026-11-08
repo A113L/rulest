@@ -64,6 +64,12 @@ def main():
     pt.add_argument('--token-strip-min-leet-amb', type=int, default=3)
     pt.add_argument('--token-strip-workers', type=int, default=0)
     pt.add_argument('--token-strip-chunk-size', type=int, default=0)
+    pt.add_argument('--token-strip-bloom-mb', type=int, default=0,
+                    help='Stage 0 base membership: 0 = exact set[str] (default), '
+                         '>0 = Bloom filter of this many MB, <0 = auto '
+                         '(exact for small bases, ~8 bits/item Bloom for large). '
+                         'False positives only cost CPU; every hit is still '
+                         'verified by the rule chain.')
     ga = ap.add_argument_group('Genetic Algorithm')
     ga.add_argument('-g', '--genetic', action='store_true')
     ga.add_argument('-G', '--genetic-generations', type=int, default=50)
@@ -166,7 +172,14 @@ def main():
 
     if args.token_strip:
         _inj = green('→ STAGE S sbd → STAGE 2') if not args.no_builtin_seeds else yellow('→ STAGE 1 only → STAGE 2')
-        log_info(f"  {bold(cyan('STAGE 0'))}  : {green('enabled')} — CPU exact-match (core+insert)  min-stem={args.token_strip_min_stem}  prefix={args.token_strip_max_prefix}  suffix={args.token_strip_max_suffix}  leet-amb={args.token_strip_min_leet_amb}  workers={safe_worker_count(args.token_strip_workers or mp.cpu_count())}  {_inj}  {_EXCL}")
+        bloom_desc = args.token_strip_bloom_mb
+        if bloom_desc == 0:
+            bloom_desc = 'exact'
+        elif bloom_desc < 0:
+            bloom_desc = 'auto'
+        else:
+            bloom_desc = f'{bloom_desc}MB'
+        log_info(f"  {bold(cyan('STAGE 0'))}  : {green('enabled')} — CPU exact-match (core+insert)  min-stem={args.token_strip_min_stem}  prefix={args.token_strip_max_prefix}  suffix={args.token_strip_max_suffix}  leet-amb={args.token_strip_min_leet_amb}  workers={safe_worker_count(args.token_strip_workers or mp.cpu_count())}  bloom={bloom_desc}  {_inj}  {_EXCL}")
     else:
         log_info(f"  {bold(dim('STAGE 0'))}  : {red('disabled')}")
 
@@ -195,7 +208,13 @@ def main():
         log_info(f"  {bold(dim('SELECT'))}  : {dim('frequency')} — sort by raw GPU hit count (--select-mode greedy to enable)")
     print()
 
-    base_words = load_wordlist(args.base_wordlist)
+    # Keep both corpora resident in Shared Memory.  The base loader retains
+    # its compact membership table when Stage 0 is enabled, so Windows spawn
+    # workers attach to one table rather than receiving a pickled Python set.
+    base_words = load_wordlist(
+        args.base_wordlist,
+        retain_membership_index=bool(args.token_strip and args.token_strip_bloom_mb == 0),
+    )
     target_words = load_wordlist(args.target_wordlist)
     print()
 
@@ -215,6 +234,7 @@ def main():
         token_strip_min_leet_amb=args.token_strip_min_leet_amb,
         token_strip_workers=args.token_strip_workers,
         token_strip_chunk_size=args.token_strip_chunk_size,
+        token_strip_bloom_mb=args.token_strip_bloom_mb,
         rng_seed=args.seed,
     )
     depth_overrides = {f'depth{i}_override': getattr(args, f'depth{i}_chains') for i in range(2,11)}
@@ -293,7 +313,8 @@ def main():
                       "healthy --device.")
             sys.exit(1)
         candidate_rules = [r for r in final_counts if r != ':']
-        n_target = len(set(target_words))
+        # load_wordlist already deduplicates words while loading.
+        n_target = len(target_words)
         budget = args.select_budget if args.select_budget > 0 else None
 
         try:
@@ -449,5 +470,34 @@ def main():
                     f"{r:<42s}  {cyan(str(c))}"
                 )
     print()
+
+    # Explicitly release GPU-side NumPy views before closing the shared
+    # wordlist mappings. Stage 2/3 and CELF can cache a zero-copy flattened
+    # BASE view in GPUEngine._base_words_precomputed.
+    gpu_engine = getattr(extractor, "gpu_engine", None)
+    if gpu_engine is not None:
+        try:
+            release_run_references = getattr(gpu_engine, "release_run_references", None)
+            if release_run_references is not None:
+                release_run_references()
+            else:
+                release_word_cache = getattr(gpu_engine, "release_word_cache", None)
+                if release_word_cache is not None:
+                    release_word_cache()
+        except Exception as exc:
+            log_warn(f"[RAM] Could not release cached GPU word views: {exc}")
+
+    # Both wordlists are no longer needed. Close them deterministically
+    # instead of relying on interpreter-shutdown destructors. target_words
+    # may already have been deleted in frequency mode / after CELF selection.
+    for _name in ("base_words", "target_words"):
+        _wordlist = locals().get(_name)
+        if _wordlist is not None:
+            close_wordlist = getattr(_wordlist, "close", None)
+            if close_wordlist is not None:
+                try:
+                    close_wordlist()
+                except Exception as exc:
+                    log_warn(f"[RAM] Could not close {_name}: {exc}")
 
     _kb.stop()

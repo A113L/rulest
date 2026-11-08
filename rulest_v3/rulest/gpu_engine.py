@@ -81,6 +81,7 @@ class GPUEngine:
         self._bloom_recovery_fn = None
         self._compiled_depth = None   # track compiled MAX_CHAIN_DEPTH
         self._base_words_precomputed = None  # (wf, wo, wl)
+        self._base_words_owner = None  # pins SharedWordList while wf exports its mmap
         self._celf_target_hashes_buf = None
         self._celf_slot_target_ids_buf = None
         self._celf_occupied_buf = None
@@ -482,13 +483,43 @@ class GPUEngine:
         self.bloom_buf = cl.Buffer(self.context, cl.mem_flags.READ_ONLY|cl.mem_flags.COPY_HOST_PTR, hostbuf=bf)
 
     def _flatten(self, items):
+        """Flatten words without a second list of per-word byte objects.
+
+        SharedWordList/contiguous WordListView instances expose the packed RAM
+        buffer directly.  Other iterables use one exact-sized bytearray and
+        fill it in place, avoiding ``enc = [word.encode(...) ...]`` plus
+        ``b''.join(enc)`` which temporarily held two full copies.
+        """
         if not items:
-            return (np.array([], dtype=np.uint8), np.array([], dtype=np.int32), np.array([], dtype=np.int32))
-        enc = [x.encode('latin-1') for x in items]
-        flat = b''.join(enc)
-        offs = [0]; lens = [len(enc[0])]
-        for b in enc[1:]: offs.append(offs[-1]+lens[-1]); lens.append(len(b))
-        return (np.frombuffer(flat, dtype=np.uint8), np.array(offs, dtype=np.int32), np.array(lens, dtype=np.int32))
+            return (
+                np.array([], dtype=np.uint8),
+                np.array([], dtype=np.int32),
+                np.array([], dtype=np.int32),
+            )
+        shared_flatten = getattr(items, "numpy_flatten", None)
+        if shared_flatten is not None:
+            return shared_flatten()
+
+        n = len(items)
+        offsets = np.empty(n, dtype=np.int32)
+        lengths = np.empty(n, dtype=np.int32)
+        total = 0
+        for i, word in enumerate(items):
+            size = len(word.encode("latin-1"))
+            lengths[i] = size
+            total += size
+        if total > 0x7FFFFFFF:
+            raise OverflowError(
+                "GPU word offsets use int32; this wordlist exceeds the 2 GiB limit"
+            )
+        flat = bytearray(total)
+        position = 0
+        for i, word in enumerate(items):
+            encoded = word.encode("latin-1")
+            offsets[i] = position
+            flat[position:position + len(encoded)] = encoded
+            position += len(encoded)
+        return np.frombuffer(flat, dtype=np.uint8), offsets, lengths
 
     def prepare_words_data(self, words):
         wf,wo,wl = self._flatten(words)
@@ -511,7 +542,46 @@ class GPUEngine:
         return self._rules_buf, self._rules_offsets_buf, self._rules_lengths_buf
 
     def set_base_words(self, words):
-        self._base_words_precomputed = self._flatten(words)
+        # Drop the previous packed arrays and their owner before replacing them.
+        self.release_word_cache()
+
+        # _flatten() may return a zero-copy ndarray view over SharedWordList's
+        # mmap. Keep the owning sequence on the engine (not on the ndarray)
+        # until the view is released. WordListView is lazy and refers to its
+        # parent via _words, so retain the underlying closeable owner.
+        owner = words
+        while hasattr(owner, "_words"):
+            owner = owner._words
+        if callable(getattr(owner, "close", None)):
+            self._base_words_owner = owner
+
+        try:
+            self._base_words_precomputed = self._flatten(words)
+        except Exception:
+            self._base_words_owner = None
+            raise
+
+    def release_word_cache(self):
+        """Release cached base-word views before releasing their SharedMemory owner.
+
+        These arrays can directly export a SharedWordList mmap. The order is
+        important: first drop all cached NumPy arrays, then drop the strong
+        reference to the SharedWordList. In a spawned GPU worker this also
+        ensures the worker's attached SharedMemory handles close deterministically.
+        GPU buffers are separate and remain valid until their normal engine shutdown.
+        """
+        self._base_words_precomputed = None
+        self._base_words_owner = None
+
+    def release_run_references(self):
+        """Drop all run-scoped objects that can retain shared wordlists.
+
+        The bloom-recovery callback closes over TARGET words. It is needed while
+        a run is active, but must be cleared before worker shutdown so attached
+        SharedMemory handles are closed while the worker is still alive.
+        """
+        self.release_word_cache()
+        self._bloom_recovery_fn = None
 
     def get_word_batch_data(self, start, end):
         if self._base_words_precomputed is None:
@@ -905,38 +975,89 @@ class GPUEngine:
                 pbar.update(1)
         return counter
 
-    def evaluate_chains_for_ga(self, chains, _profile=None):
-        """Stage 3 (genetic) companion to _run_chains_against_words above. Runs the
-        full chain-batch x word-sub-batch sweep for one engine's slice of chains
-        against whatever base_words were already cached via set_base_words(), and
-        returns {chain_str: set(global_word_index)} for that slice only.
+    def evaluate_chains_for_ga(self, chains, _profile=None, return_counts=False):
+        """Evaluate GA chains and return compact per-chain hit bitmaps or counts.
 
-        This is exposed as a single high-level call (rather than the parent
-        driving get_word_batch_data/_run_chain_kernel/etc one RPC at a time) so
-        that in multi-GPU mode a non-primary engine's ProcessEngineProxy only
-        needs ONE round trip per generation instead of dozens — each of those
-        would otherwise pickle numpy word/result arrays across the process
-        boundary redundantly (worker -> parent -> worker) for no reason, since
-        the parent never needed to see the intermediate word batch at all."""
-        cbs = self.params.get('CHAINS_PER_BATCH', 2000)
-        wsb = self.params.get('WORD_SUB_BATCH', 20000)
+        A Python ``set[int]`` costs many times more RAM than the word index it
+        stores.  With a large target list, retaining one set per chromosome
+        quickly consumed gigabytes and the parent process then pickled those
+        sets back from GPU workers.  A dense bitset uses exactly one bit per
+        active word (about 1.75 MiB per chain for 14 million words) and crosses
+        a worker boundary as a compact NumPy array.
+
+        Bitmap bit *i* represents local word index *i* in the active word view.
+        When return_counts=True, only scalar counts are accumulated and no
+        per-word bitmap is allocated (used by final exact verification).
+        """
+        cbs = max(1, int(self.params.get('CHAINS_PER_BATCH', 2000)))
+        wsb = max(1, int(self.params.get('WORD_SUB_BATCH', 20000)))
         n_words_total = len(self._base_words_precomputed[1]) if getattr(self, '_base_words_precomputed', None) else 0
-        hit_words = defaultdict(set)
+        bitmap_bytes = (n_words_total + 7) // 8
+        # Exact correction only needs counts. Do not allocate a bitmap for each
+        # candidate in that mode: on a large target this would reintroduce the
+        # very O(candidates × words) RAM cost that bitmaps were meant to avoid.
+        hit_words = {
+            chain: (0 if return_counts else np.zeros(bitmap_bytes, dtype=np.uint8))
+            for chain in chains
+        }
+        if not chains or n_words_total <= 0:
+            return hit_words
+
+        total_batches = ((len(chains) + cbs - 1) // cbs) * ((n_words_total + wsb - 1) // wsb)
+        total_pairs = len(chains) * n_words_total
+        log_info(
+            f"[S3]    GPU scan: {len(chains):,} chain(s) × {n_words_total:,} words "
+            f"({total_batches:,} batches; "
+            f"{'count-only, no hit-map allocation' if return_counts else f'{bitmap_bytes:,} bytes/chain hit map'})"
+        )
+        started = time.monotonic()
+        last_report = started
+        completed_batches = 0
+        processed_pairs = 0
         for ci in range(0, len(chains), cbs):
             cb = chains[ci:ci+cbs]
             seqs, depths = self._compute_chain_seqs(cb)
             for wi in range(0, n_words_total, wsb):
                 end = min(wi + wsb, n_words_total)
                 bd = self.get_word_batch_data(wi, end)
-                if bd['num_words'] == 0: continue
-                found = self._run_chain_kernel(bd, cb, (seqs, depths), return_word_idx=True, _profile=_profile)
-                if found:
-                    for local_idx, rule_str in found:
-                        hit_words[rule_str].add(wi + local_idx)
-            # _run_chain_kernel() above already calls _safe_queue_finish()
-            # internally for every sub-batch it launches, so an extra call
-            # here was pure redundant synchronization overhead.
-        return dict(hit_words)
+                if bd['num_words']:
+                    found = self._run_chain_kernel(
+                        bd, cb, (seqs, depths), return_word_idx=True, _profile=_profile
+                    )
+                    if found:
+                        if return_counts:
+                            # Every returned row is one (chain, word) hit.
+                            # Count immediately; retain no per-word IDs.
+                            for _local_idx, rule_str in found:
+                                if rule_str in hit_words:
+                                    hit_words[rule_str] += 1
+                        else:
+                            # Group only this small (kernel-capped) batch, then
+                            # set bits in-place. np.bitwise_or.at correctly
+                            # handles multiple hits landing in the same byte.
+                            grouped = defaultdict(list)
+                            for local_idx, rule_str in found:
+                                if rule_str in hit_words and 0 <= int(local_idx) < (end - wi):
+                                    grouped[rule_str].append(wi + int(local_idx))
+                            for rule_str, indices in grouped.items():
+                                idx = np.asarray(indices, dtype=np.uint32)
+                                byte_idx = idx >> 3
+                                masks = np.left_shift(np.uint8(1), (idx & 7).astype(np.uint8))
+                                np.bitwise_or.at(hit_words[rule_str], byte_idx, masks)
+                processed_pairs += len(cb) * (end - wi)
+                completed_batches += 1
+                now = time.monotonic()
+                if now - last_report >= 3.0 or completed_batches == total_batches:
+                    pct = 100.0 * processed_pairs / max(1, total_pairs)
+                    elapsed = max(0.001, now - started)
+                    log_info(
+                        f"[S3]    GPU scan progress: {processed_pairs:,}/{total_pairs:,} "
+                        f"chain-word pairs ({pct:.1f}%) | batches={completed_batches:,}/{total_batches:,} "
+                        f"| {completed_batches / elapsed:.1f} batches/s"
+                    )
+                    last_report = now
+            # _run_chain_kernel() already synchronizes each word sub-batch.
+        return hit_words
 
     def _compute_chain_seqs(self, chains):
         maxd = self.params['MAX_CHAIN_DEPTH']

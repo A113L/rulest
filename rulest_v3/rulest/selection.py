@@ -11,6 +11,7 @@ import heapq
 import math
 from contextlib import nullcontext
 import os
+from collections import deque
 import sys
 import time
 
@@ -173,6 +174,129 @@ def _celf_auto_rescore_batch(requested, target_count, gpu_engine=None):
     return chosen
 
 
+def _celf_log_interval():
+    """Return a bounded heartbeat interval for server and terminal logging."""
+    try:
+        value = float(os.environ.get("RULEST_CELF_LOG_INTERVAL", "0.5"))
+    except (TypeError, ValueError):
+        value = 0.5
+    return min(10.0, max(0.25, value))
+
+
+def _rolling_rules_rate(samples, count, now, window=5.0):
+    """Smoothed recent candidate/rule throughput, avoiding per-batch spikes."""
+    count = int(count)
+    if not samples or count > samples[-1][1]:
+        samples.append((float(now), count))
+    cutoff = float(now) - max(1.0, float(window))
+    while len(samples) > 2 and samples[1][0] <= cutoff:
+        samples.popleft()
+    first_time, first_count = samples[0]
+    elapsed = float(now) - first_time
+    if elapsed <= 1e-9:
+        return 0.0
+    return max(0.0, (count - first_count) / elapsed)
+
+
+def _format_progress_bar(done, total, width=24):
+    """Render an exact fixed-width progress bar for newline-based web logs."""
+    total = max(1, int(total))
+    done = min(total, max(0, int(done)))
+    fraction = done / total
+    filled = min(width, int(fraction * width))
+    return f"[{('█' * filled)}{('·' * (width - filled))}] {int(round(fraction * 100.0)):3d}%"
+
+
+def _run_initial_upper_bound_pass(scorer, rules, rule_batch_size):
+    """Score every candidate once and stream an exact progress/rate heartbeat.
+
+    Terminal sessions get the normal tqdm bar. In the web server, stderr is a
+    pipe, so a newline-based ActivityHeartbeat reports completed candidate
+    batches, the exact scanned/total count, percentage, speed, average, recent
+    throughput, batch number and ETA to the Live Activity log.
+    """
+    total = len(rules)
+    upper_bounds = [0] * total
+    if total == 0:
+        return upper_bounds
+
+    batch_size = max(1, int(rule_batch_size))
+    is_tty = bool(sys.stderr.isatty())
+    started = time.monotonic()
+    samples = deque([(started, 0)])
+    batch_total = (total + batch_size - 1) // batch_size
+    heartbeat_context = (
+        nullcontext(None) if is_tty else ActivityHeartbeat(
+            "[CELF] Upper-bound pass | initializing",
+            interval=_celf_log_interval(),
+            line_mode=True,
+        )
+    )
+
+    with heartbeat_context as heartbeat, tqdm(
+        total=total,
+        desc=green("[CELF] Upper-bound pass (GPU target-table scan)"),
+        unit="rules",
+        disable=not is_tty,
+        mininterval=0.5,
+    ) as progress:
+        for start in range(0, total, batch_size):
+            chunk = rules[start:start + batch_size]
+            batch_number = start // batch_size + 1
+            batch_started = time.monotonic()
+            index_scorer = getattr(scorer, "upper_bound_index_batch", None)
+            bounds = (
+                index_scorer(range(start, start + len(chunk)))
+                if index_scorer is not None else scorer.upper_bound_batch(chunk)
+            )
+            if len(bounds) != len(chunk):
+                raise RuntimeError(
+                    "CELF upper-bound scorer returned the wrong number of candidates "
+                    f"for batch {batch_number}/{batch_total}"
+                )
+            upper_bounds[start:start + len(chunk)] = [max(0, int(v)) for v in bounds]
+            batch_elapsed = max(time.monotonic() - batch_started, 1e-9)
+            processed = start + len(chunk)
+            now = time.monotonic()
+            batch_rate = len(chunk) / batch_elapsed
+            avg_rate = processed / max(now - started, 1e-9)
+            recent_rate = _rolling_rules_rate(samples, processed, now, window=5.0)
+            eta = (total - processed) / avg_rate if avg_rate > 0 else float("inf")
+            eta_text = f"{eta:.1f}s" if math.isfinite(eta) else "calculating"
+            bar = _format_progress_bar(processed, total)
+            status = (
+                f"[CELF] Upper-bound pass | {bar} | scanned={processed:,}/{total:,} "
+                f"| speed={batch_rate:,.2f} rules/s | avg={avg_rate:,.2f} rules/s "
+                f"| recent={recent_rate:,.2f} rules/s | batch={batch_number:,}/{batch_total:,} "
+                f"({len(chunk):,} rules) | ETA={eta_text} | elapsed={now - started:.1f}s"
+            )
+            if heartbeat is not None:
+                heartbeat.set_desc(status)
+            else:
+                progress.update(len(chunk))
+                progress.set_postfix(
+                    {
+                        "speed": f"{batch_rate:,.0f} rules/s",
+                        "avg": f"{avg_rate:,.0f} rules/s",
+                        "scanned": f"{processed:,}/{total:,}",
+                    },
+                    refresh=False,
+                )
+
+        finished = time.monotonic()
+        avg_rate = total / max(finished - started, 1e-9)
+        final_status = (
+            f"[CELF] Upper-bound pass complete | {_format_progress_bar(total, total)} "
+            f"| scanned={total:,}/{total:,} | avg={avg_rate:,.2f} rules/s "
+            f"| elapsed={finished - started:.1f}s"
+        )
+        if heartbeat is not None:
+            heartbeat.set_desc(final_status, force=True)
+        log_info(final_status)
+
+    return upper_bounds
+
+
 _FNV1A64_OFFSET = 14695981039346656037
 _FNV1A64_PRIME = 1099511628211
 _UINT64_MASK = (1 << 64) - 1
@@ -317,12 +441,22 @@ def _celf_select_from_upper_bounds(
     selected = []
     exact_rescored = 0
     exact_gain_only = 0
+    exact_batch_candidates = 0
+    exact_batches = 0
+    exact_scans = 0
+    exact_record_scans = 0
     batch_rescored = 0
+    upper_bound_candidates = 0
+    upper_bound_batches = 0
     recovered = 0
     current_batch_size = 1
     progress_enabled = bool(sys.stderr.isatty())
     last_refresh = [0.0]
     t0 = time.monotonic()
+    selected_rate_samples = deque([(t0, 0)])
+    upper_rate_samples = deque([(t0, 0)])
+    last_selected_rate = [0.0]
+    last_upper_rate = [0.0]
 
     # RULEST_CELF_INDETERMINATE_PROGRESS_V1
     # leave/dynamic_ncols/ncols/bar_format used to be passed here as if this
@@ -354,17 +488,30 @@ def _celf_select_from_upper_bounds(
             disable=not progress_enabled, mininterval=0.5,
         ) as progress:
             def _status_line():
+                now = time.monotonic()
+                elapsed = max(now - t0, 1e-9)
                 selected_pct = 100.0 * len(selected) / max(1, limit)
                 coverage_pct = 100.0 * recovered / max(1, target_count)
-                elapsed = max(0.0, time.monotonic() - t0)
+                last_selected_rate[0] = _rolling_rules_rate(
+                    selected_rate_samples, len(selected), now, window=5.0
+                )
+                last_upper_rate[0] = _rolling_rules_rate(
+                    upper_rate_samples, upper_bound_candidates, now, window=5.0
+                )
+                average_selected_rate = len(selected) / elapsed
+                average_upper_rate = upper_bound_candidates / elapsed
                 return (
                     f"[CELF] Greedy selection | selected={len(selected):,}/{limit:,} "
-                    f"({selected_pct:.1f}%) | recovered={recovered:,}/{target_count:,} "
-                    f"({coverage_pct:.1f}%) | heap={len(heap):,} "
-                    f"| exact_scans={exact_rescored:,} "
-                    f"| exact_gain_candidates={exact_gain_only:,} "
-                    f"| upper_bound_candidates={batch_rescored:,} "
-                    f"| batch={current_batch_size} | elapsed={elapsed:.0f}s"
+                    f"({selected_pct:.1f}%) | speed={last_selected_rate[0]:,.2f} rules/s "
+                    f"(avg={average_selected_rate:,.2f} rules/s) | recovered={recovered:,}/{target_count:,} "
+                    f"({coverage_pct:.1f}%) | heap={len(heap):,} | exact_scans={exact_scans:,} "
+                    f"| exact_batches={exact_batches:,} | exact_record_scans={exact_record_scans:,} "
+                    f"| exact_gain_candidates={exact_gain_only + exact_batch_candidates:,} "
+                    f"| lazy_upper_bound_candidates={upper_bound_candidates:,} "
+                    f"| lazy_upper_bound_batches={upper_bound_batches:,} "
+                    f"| lazy_upper_bound_speed={last_upper_rate[0]:,.2f} rules/s "
+                    f"(avg={average_upper_rate:,.2f} rules/s) | batch={current_batch_size} "
+                    f"| elapsed={elapsed:.1f}s"
                 )
 
             def report_scan(done=None, total=None):
@@ -373,12 +520,12 @@ def _celf_select_from_upper_bounds(
                     # from the right when the line doesn't fit the terminal, so
                     # keep the useful coverage/selection counters first.
                     postfix = {
-                        "recovered": cyan(f"{recovered:,}"),
                         "selected": cyan(str(len(selected))),
+                        "recovered": cyan(f"{recovered:,}"),
+                        "speed": cyan(f"{last_selected_rate[0]:,.1f} rules/s"),
+                        "upper": cyan(f"{upper_bound_candidates:,}"),
+                        "exact": cyan(f"{exact_scans:,}"),
                         "batch": cyan(str(current_batch_size)),
-                        "exact scans": cyan(f"{exact_rescored:,}"),
-                        "exact gain": cyan(f"{exact_gain_only:,}"),
-                        "batch bounds": cyan(f"{batch_rescored:,}"),
                     }
                     if done is not None and total is not None:
                         postfix["scan words"] = cyan(f"{int(done):,}/{int(total):,}")
@@ -399,8 +546,10 @@ def _celf_select_from_upper_bounds(
                 # recording (one GPU wordlist pass plus synchronous target-ID
                 # readback). The normal GPU path avoids calling this for losing
                 # candidates by using exact batches and winner bitmaps.
-                nonlocal exact_rescored
+                nonlocal exact_rescored, exact_scans, exact_record_scans
                 exact_rescored += 1
+                exact_scans += 1
+                exact_record_scans += 1
                 if on_scan_progress is None:
                     ids = score_fn(index, covered)
                 else:
@@ -427,10 +576,12 @@ def _celf_select_from_upper_bounds(
                 path, exact gains are batched and winner IDs are materialized from
                 the exact bitmap, so losing candidates do not require hit recording.
                 """
-                nonlocal exact_gain_only
+                nonlocal exact_gain_only, exact_scans, exact_batches
                 if score_exact_batch_fn is None:
                     return exact_score(index)
                 exact_gain_only += 1
+                exact_scans += 1
+                exact_batches += 1
                 if on_scan_progress is None:
                     gains = score_exact_batch_fn([index], covered)
                 else:
@@ -536,6 +687,9 @@ def _celf_select_from_upper_bounds(
                     if len(gains) != len(seed_entries):
                         raise RuntimeError("CELF exact batch scorer returned the wrong number of gains")
                     batch_rescored += len(seed_entries)
+                    exact_batch_candidates += len(seed_entries)
+                    exact_scans += len(seed_entries)
+                    exact_batches += 1
                     current_batch_size = len(seed_entries)
                     report_scan()
                     for (index, _bound), raw_gain in zip(seed_entries, gains):
@@ -565,7 +719,8 @@ def _celf_select_from_upper_bounds(
                     more admissible bounds remain). The queue is capped by the same
                     batch size as the resident GPU bitmap workspace.
                     """
-                    nonlocal best_index, best_gain, best_ids, exact_gain_only, current_batch_size
+                    nonlocal best_index, best_gain, best_ids, exact_gain_only, exact_batch_candidates
+                    nonlocal exact_scans, exact_batches, current_batch_size
                     if not pending_exact_entries:
                         return False
                     if not force and len(pending_exact_entries) < exact_microbatch_target:
@@ -582,7 +737,9 @@ def _celf_select_from_upper_bounds(
                     if len(exact_gains) != len(exact_entries):
                         raise RuntimeError("CELF exact batch scorer returned the wrong number of gains")
 
-                    exact_gain_only += len(exact_entries)
+                    exact_batch_candidates += len(exact_entries)
+                    exact_scans += len(exact_entries)
+                    exact_batches += 1
                     current_batch_size = len(exact_entries)
                     for (index, _bound), raw_exact_gain in zip(exact_entries, exact_gains):
                         tightened_exact_gain = max(0, int(raw_exact_gain))
@@ -676,6 +833,12 @@ def _celf_select_from_upper_bounds(
                             raw_bounds = score_batch_fn(batch_indices, covered, report_scan)
                         if len(raw_bounds) != len(batch_entries):
                             raise RuntimeError("CELF batch scorer returned the wrong number of upper bounds")
+                        upper_bound_candidates += len(batch_entries)
+                        upper_bound_batches += 1
+                        upper_rate_samples.append((time.monotonic(), upper_bound_candidates))
+                        now = time.monotonic()
+                        while len(upper_rate_samples) > 2 and upper_rate_samples[1][0] <= now - 5.0:
+                            upper_rate_samples.popleft()
 
                         if score_exact_batch_fn is None:
                             # Compatibility path for callers that only provide bounds.
@@ -708,6 +871,10 @@ def _celf_select_from_upper_bounds(
                 if on_select is not None:
                     on_select(best_ids)
                 selected.append((rules[best_index], len(best_ids)))
+                selection_now = time.monotonic()
+                selected_rate_samples.append((selection_now, len(selected)))
+                while len(selected_rate_samples) > 2 and selected_rate_samples[1][0] <= selection_now - 5.0:
+                    selected_rate_samples.popleft()
                 progress.update(1)
                 report_scan()
 
@@ -944,7 +1111,6 @@ def select_rules_by_marginal_coverage(
         scorer = _GpuExactScorer(
             selection_engine, base_words, unique_targets, pair_batch_size, rules
         )
-        upper_bounds = [0] * len(rules)
         celf_engine = scorer.gpu_engine
         seen_words = int(celf_engine._celf_seen_words)
         scratch_limit = max(4, int(celf_engine.params.get("CELF_SEEN_SCRATCH_MB", 32))) * 1024 * 1024
@@ -955,22 +1121,9 @@ def select_rules_by_marginal_coverage(
             max(1, int(getattr(celf_engine, "_celf_batch_capacity", configured_batch))),
         )
 
-        # See the comment on the CELF recompute bar above: leave/dynamic_ncols/
-        # ncols/bar_format were dead (rulest's ProgressBar ignores them and
-        # computes its own width/format), and `disable` now actually works.
-        with tqdm(
-            total=len(rules), desc=green("[CELF] Upper-bound pass (GPU target-table scan)"),
-            unit="rule", disable=not sys.stderr.isatty(), mininterval=0.5,
-        ) as progress:
-            for start in range(0, len(rules), rule_batch_size):
-                chunk = rules[start:start + rule_batch_size]
-                index_scorer = getattr(scorer, "upper_bound_index_batch", None)
-                bounds = (
-                    index_scorer(range(start, start + len(chunk)))
-                    if index_scorer is not None else scorer.upper_bound_batch(chunk)
-                )
-                upper_bounds[start:start + len(chunk)] = bounds
-                progress.update(len(chunk))
+        # Keep the existing VRAM-sized rule batch, but report exact throughput
+        # and ETA in both terminals and web-server log streams.
+        upper_bounds = _run_initial_upper_bound_pass(scorer, rules, rule_batch_size)
 
         # The exact-rescore batch inside the CELF heap loop stays at a fixed
         # default of 32 — unlike the upper-bound pass's rule_batch_size (and
@@ -984,11 +1137,22 @@ def select_rules_by_marginal_coverage(
         recompute_batch_size = min(recompute_batch_size, rule_batch_size)
         recompute_batch_size = _celf_auto_rescore_batch(recompute_batch_size, target_count, getattr(scorer, 'gpu_engine', None))  # CELF_ADAPTIVE_BATCH_PATCH_V4
         exact_batch_enabled = os.environ.get("RULEST_CELF_EXACT_BATCH", "1").strip().lower() not in {"0", "false", "no", "off"}
+        try:
+            exact_microbatch = max(1, min(
+                recompute_batch_size,
+                int(os.environ.get("RULEST_CELF_EXACT_MICROBATCH", "4")),
+            ))
+        except (TypeError, ValueError):
+            exact_microbatch = min(recompute_batch_size, 4)
+        bitmap_enabled = bool(
+            exact_batch_enabled and callable(getattr(scorer, "materialize_exact_targets", None))
+        )
         log_info(
             f"[CELF] Candidates: {bold(str(len(rules)))}; targets: {bold(str(target_count))}; "
-            f"fast raw-hit upper bounds (duplicates may overcount); lazy heap batch={recompute_batch_size}; "
-            f"batched exact challenger rescoring={'enabled' if exact_batch_enabled else 'disabled'}; "
-            f"winner IDs from exact bitmap={'enabled' if exact_batch_enabled and hasattr(scorer, 'materialize_exact_targets') else 'fallback'}; "
+            f"upper-bound GPU batch={rule_batch_size}; exact seed/challenger workspace={recompute_batch_size}; "
+            f"challenger coalescing threshold={exact_microbatch}; "
+            f"batched exact scoring={'enabled' if exact_batch_enabled else 'disabled'}; "
+            f"winner bitmap readback={'enabled' if bitmap_enabled else 'fallback recording scan'}; "
             f"candidate sequences cached on GPU; SplitMix64 table load <= 50%; coverage matrix: {green('none')}"
         )
 

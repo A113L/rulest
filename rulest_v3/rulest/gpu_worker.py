@@ -39,6 +39,8 @@ def _gpu_worker_entry(device_spec, params, cmd_q, res_q, hb_q):
     executes RPC-style commands sent by the parent over cmd_q/res_q, while
     a background thread pings hb_q so the parent can tell 'still working'
     apart from 'driver wedged'."""
+    eng = None
+    stop_evt = None
     try:
         os.environ['PYOPENCL_COMPILER_OUTPUT'] = '0'
         eng = GPUEngine(params)
@@ -109,6 +111,16 @@ def _gpu_worker_entry(device_spec, params, cmd_q, res_q, hb_q):
             res_q.put(('__init__', 'err', f"worker crashed before init: {e}"))
         except Exception:
             pass
+    finally:
+        if stop_evt is not None:
+            stop_evt.set()
+        # Always release shared-memory-backed NumPy views and target closures
+        # before the process interpreter starts running object finalizers.
+        if eng is not None:
+            try:
+                eng.release_run_references()
+            except Exception:
+                pass
 
 class _RemoteDeviceHandle:
     """Stand-in for a pyopencl Device across the process boundary — callers
@@ -232,10 +244,18 @@ class ProcessEngineProxy:
         if self.disabled or self._proc is None:
             self._kill()
             return
+        # Let the worker consume its shutdown command and run its SharedMemory
+        # cleanup/finalizers. Fall back to a hard kill only if it does not exit.
         try:
             self._cmd_q.put((None, '__shutdown__', (), {}))
         except Exception:
             pass
+        proc = self._proc
+        if proc is not None:
+            try:
+                proc.join(timeout=5.0)
+            except Exception:
+                pass
         self._kill()
 
     # -- generic RPC --------------------------------------------------------
@@ -380,6 +400,14 @@ class ProcessEngineProxy:
         # re-sending it across the process boundary) every generation.
         return self._call('set_base_words', words)
 
+    def release_word_cache(self):
+        """Drop the child process's cached SharedMemory-backed ndarray views."""
+        return self._call('release_word_cache')
+
+    def release_run_references(self):
+        """Drop all run-scoped shared-memory references in the child process."""
+        return self._call('release_run_references')
+
     # CELF greedy-selection API. These calls deliberately stay on this one
     # worker for the whole selection run so its target table, active bitmap,
     # candidate pool, and hit-slot cache remain resident on the same GPU.
@@ -458,8 +486,8 @@ class ProcessEngineProxy:
     def celf_profile_summary(self):
         return self._call('celf_profile_summary', _raise_on_error=True)
 
-    def evaluate_chains_for_ga(self, chains):
-        r = self._call('evaluate_chains_for_ga', chains)
+    def evaluate_chains_for_ga(self, chains, return_counts=False):
+        r = self._call('evaluate_chains_for_ga', chains, return_counts=return_counts)
         return r if r is not None else {}
 
     def _compute_chain_seqs(self, chains):

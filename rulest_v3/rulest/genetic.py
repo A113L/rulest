@@ -6,6 +6,7 @@ to avoid collapsing onto near-duplicate high-scoring chains.
 """
 import os
 import time
+import math
 import shutil
 import random
 import threading
@@ -24,6 +25,31 @@ from .minimize import compute_rule_signature_hash
 from .multi_gpu import MultiGPUEngine
 from .gpu_worker import ProcessEngineProxy
 from .profiling import GpuPhaseProfile
+
+# Lookup table for fast population counts on compact Stage 3 hit bitmaps.
+# Keep the lookup-table initializer compatible with Python 3.8 (int.bit_count arrived later).
+_POPCOUNT8 = np.fromiter((bin(i).count("1") for i in range(256)), dtype=np.uint8, count=256)
+_GA_DEFAULT_MAX_SAMPLE_WORDS = 1_000_000
+_GA_DEFAULT_MAX_FULL_SWEEP_WORDS = 2_000_000
+
+
+def _is_hit_bitmap(value):
+    return isinstance(value, np.ndarray) and value.dtype == np.uint8 and value.ndim == 1
+
+
+def _hit_count(value):
+    """Count hit words for either the compact bitmap format or legacy sets."""
+    if _is_hit_bitmap(value):
+        return int(_POPCOUNT8[value].sum(dtype=np.uint64))
+    return len(value)
+
+
+def _ga_uses_full_sweep(generation, do_subsample, full_sweeps_enabled, every):
+    """Avoid an expensive generation-zero full pass when subsampling is on."""
+    return (not do_subsample) or (
+        bool(full_sweeps_enabled) and int(generation) > 0 and int(generation) % max(1, int(every)) == 0
+    )
+
 
 class GeneticRuleEvolver:
     def __init__(self, gpu_engine, base_words, rule_pool, max_depth,
@@ -85,6 +111,13 @@ class GeneticRuleEvolver:
         # full-sweep boundary), since the id() won't match.
         self._hit_cache = {}
         self._hit_cache_max = 20000
+        # Bound retained hit maps by bytes as well as entry count.  The old
+        # entry-only cap let a large GA population pin gigabytes of Python
+        # sets on a large wordlist.
+        self._hit_cache_max_bytes = 256 * 1024 * 1024
+        self._hit_cache_bytes = 0
+        self._sample_words_view = None
+        self._sample_words_key = None
 
     def _get_sig(self, chain_str):
         if chain_str not in self._sig_cache:
@@ -330,10 +363,9 @@ class GeneticRuleEvolver:
         return tokens
 
     def _eval_on_engine(self, eng, chains, hit_words):
-        """Run one engine's slice of chains against the FULL base_words set (already
-        cached on that engine via set_base_words) using the single high-level
-        evaluate_chains_for_ga() RPC, and merge results (as global word indices)
-        into the shared hit_words dict. Each chain only ever belongs to one
+        """Run one engine's chain slice against the active word view already
+        cached through set_base_words(), and merge compact local-index hit
+        bitmaps into hit_words. Each chain only ever belongs to one
         engine's slice, so different threads never write the same hit_words key
         -- no locking needed.
 
@@ -351,7 +383,7 @@ class GeneticRuleEvolver:
         # anyway (the proxy would need to serialize the accumulated numbers
         # back, which it doesn't do). Single-GPU runs are the common case
         # this detail is meant for.
-        if self._gpu_profile is not None and not isinstance(eng, ProcessEngineProxy):
+        if getattr(self, "_gpu_profile", None) is not None and not isinstance(eng, ProcessEngineProxy):
             result = eng.evaluate_chains_for_ga(chains, _profile=self._gpu_profile)
         else:
             result = eng.evaluate_chains_for_ga(chains)
@@ -361,10 +393,24 @@ class GeneticRuleEvolver:
                 log_warn(
                     f"[S3] GPU returned hits for unrecognized chain string "
                     f"{rule_str!r} (not in the requested batch) — discarding "
-                    f"{len(idx_set)} hit(s) instead of crashing."
+                    f"{_hit_count(idx_set)} hit(s) instead of crashing."
                 )
                 continue
-            bucket |= idx_set
+            if _is_hit_bitmap(idx_set):
+                # Each chain is assigned to exactly one engine. Replace the
+                # initially-empty placeholder with the compact worker result.
+                hit_words[rule_str] = idx_set
+            else:
+                # Compatibility for test doubles and older worker payloads.
+                bucket |= idx_set
+
+    def _eval_counts_on_engine(self, eng, chains):
+        """Exact-verification path that returns counts, never per-word maps."""
+        if getattr(self, "_gpu_profile", None) is not None and not isinstance(eng, ProcessEngineProxy):
+            return eng.evaluate_chains_for_ga(
+                chains, _profile=self._gpu_profile, return_counts=True
+            )
+        return eng.evaluate_chains_for_ga(chains, return_counts=True)
 
     def last_gpu_phase_summary(self):
         """Format this GA run's accumulated GpuPhaseProfile the same way
@@ -393,8 +439,8 @@ class GeneticRuleEvolver:
             self._ga_cached_engines[id(eng)] = self.active_words
 
     def evaluate_population(self, population):
-        """Returns {chain_str: set(local_word_index)} — the set of self.active_words
-        indices each chain successfully hit (indices are local to whatever word set
+        """Returns {chain_str: compact hit bitmap} for self.active_words
+        (indices are local to whatever word set
         is active this generation — see evolve()'s word-subsampling logic — not
         necessarily the full base_words). Tracking word identity (not just a hit
         count) is what makes marginal-coverage-gain fitness possible in evolve().
@@ -423,6 +469,9 @@ class GeneticRuleEvolver:
             cached = self._hit_cache.get(c)
             if cached is not None and cached[0] == aw_id:
                 hit_words[c] = cached[1]
+                # Move a useful elite hit map to the newest end of the cache.
+                self._hit_cache.pop(c, None)
+                self._hit_cache[c] = cached
             else:
                 to_eval.append(c)
         if not to_eval:
@@ -437,10 +486,27 @@ class GeneticRuleEvolver:
 
         def _remember(chains):
             for c in chains:
-                self._hit_cache[c] = (aw_id, hit_words[c])
-            if len(self._hit_cache) > self._hit_cache_max:
-                for k in list(self._hit_cache.keys())[:len(self._hit_cache)-self._hit_cache_max]:
-                    del self._hit_cache[k]
+                value = hit_words[c]
+                size = int(value.nbytes) if _is_hit_bitmap(value) else max(64, len(value) * 72)
+                old = self._hit_cache.pop(c, None)
+                if old is not None:
+                    old_value = old[1]
+                    self._hit_cache_bytes -= (
+                        int(old_value.nbytes) if _is_hit_bitmap(old_value)
+                        else max(64, len(old_value) * 72)
+                    )
+                self._hit_cache[c] = (aw_id, value)
+                self._hit_cache_bytes += size
+            while self._hit_cache and (
+                len(self._hit_cache) > self._hit_cache_max
+                or self._hit_cache_bytes > self._hit_cache_max_bytes
+            ):
+                _old_key, (_old_id, old_value) = self._hit_cache.popitem()
+                self._hit_cache_bytes -= (
+                    int(old_value.nbytes) if _is_hit_bitmap(old_value)
+                    else max(64, len(old_value) * 72)
+                )
+            self._hit_cache_bytes = max(0, self._hit_cache_bytes)
 
         if len(engines) == 1:
             self._eval_on_engine(engines[0], to_eval, hit_words)
@@ -484,19 +550,17 @@ class GeneticRuleEvolver:
     def evolve(self, hot_rules, generations, time_budget,
                word_sample_frac=0.25, full_sweep_every=4):
         """word_sample_frac / full_sweep_every implement Feature 3 (stratified
-        word subsampling): most generations only evaluate the population
-        against a systematic subsample of base_words (every Nth word, with a
-        fresh random phase offset each time the block resamples) instead of
-        the entire wordlist, which is normally the dominant per-generation
-        cost. Every `full_sweep_every` generations (plus generation 0 and the
-        very last generation) we do a full sweep instead, both to keep the
-        fitness landscape honest (avoid drifting toward chains that only look
-        good on a lucky subsample) and to record accurate hit counts. Hit
-        counts recorded from a sampled generation are rescaled by
-        len(base_words)/len(sample) so they stay roughly comparable in
-        magnitude to full-sweep counts in all_new/the signature registry;
-        final counts are corrected with one full-sweep verification pass
-        below once evolution finishes."""
+        word subsampling): most generations evaluate the population against a
+        systematic, phase-shifted sample of base_words instead of the entire
+        wordlist. Generation zero is always sampled when subsampling is active,
+        so a large target never blocks before the first generation progress
+        update. For moderate lists, periodic full sweeps are retained; for very
+        large lists they are disabled and every generation uses a bounded
+        sample. Sampled hit counts are scaled by len(base_words)/len(sample)
+        for selection/bookkeeping, then candidate counts are corrected against
+        the full wordlist in bounded, count-only verification batches. That
+        final exact-verification phase is separate from the GA generation time
+        budget and reports its own progress."""
         if not self.rule_pool: log_warn("[S3] empty rule pool"); return Counter()
         if time_budget<=0: log_warn("[S3] no time budget"); return Counter()
         start = time.time()
@@ -505,9 +569,32 @@ class GeneticRuleEvolver:
         stagnation = 0
         best_ever = 0
         log_info(f"[S3]    pop={self.pop_size}  max_gen={generations}  elite={self.elite_frac:.0%}  budget={time_budget:.0f}s  pool={len(self.rule_pool):,}  known={len(self.known_rules):,}")
-        do_subsample = 0.0 < word_sample_frac < 1.0 and len(self.base_words) >= 2000
+        base_word_count = len(self.base_words)
+        max_sample_words = max(100_000, int(os.environ.get(
+            "RULEST_GA_MAX_SAMPLE_WORDS", str(_GA_DEFAULT_MAX_SAMPLE_WORDS)
+        )))
+        max_full_sweep_words = max(0, int(os.environ.get(
+            "RULEST_GA_MAX_FULL_SWEEP_WORDS", str(_GA_DEFAULT_MAX_FULL_SWEEP_WORDS)
+        )))
+        effective_sample_frac = min(
+            float(word_sample_frac), max_sample_words / max(1, base_word_count)
+        )
+        do_subsample = 0.0 < effective_sample_frac < 1.0 and base_word_count >= 2000
+        full_sweeps_enabled = base_word_count <= max_full_sweep_words
         if do_subsample:
-            log_info(f"[S3]    Word subsampling: ~{word_sample_frac:.0%}/gen, full sweep every {full_sweep_every} gens")
+            estimated_sample = min(base_word_count, max_sample_words,
+                                   max(1, int(round(base_word_count * effective_sample_frac))))
+            log_info(
+                f"[S3]    Word subsampling: ~{effective_sample_frac:.1%}/gen "
+                f"({estimated_sample:,}/{base_word_count:,} words); "
+                f"full sweeps every {full_sweep_every} gens "
+                f"only when wordlist ≤ {max_full_sweep_words:,} words"
+            )
+            if not full_sweeps_enabled:
+                log_info(
+                    "[S3]    Large-wordlist mode: per-generation full sweeps disabled; "
+                    "candidate counts are corrected in the final exact verification pass."
+                )
         pop = self.initial_population(hot_rules)
         last_gen=0
         ncols = shutil.get_terminal_size((80,24)).columns
@@ -516,36 +603,63 @@ class GeneticRuleEvolver:
         self._start_prefetch()
         try:
             with tqdm(total=generations, desc=green("  STAGE 3 "), unit="gen", ncols=ncols,
-                      bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}") as pbar:
+                      bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}] {postfix}") as pbar:
+                budget_stop = threading.Event()
+                def _budget_heartbeat():
+                    while not budget_stop.wait(1.0):
+                        left = max(0.0, time_budget - (time.time() - start))
+                        pbar.set_postfix({"budget": f"{left:.0f}s"}, refresh=True)
+                budget_thread = threading.Thread(
+                    target=_budget_heartbeat, name="ga-budget-heartbeat", daemon=True
+                )
+                budget_thread.start()
+                pbar.set_postfix({"budget": f"{time_budget:.0f}s"}, refresh=True)
                 for gen in range(generations):
                     last_gen=gen
                     if _kb.poll(): break
                     if time.time()-start >= time_budget: break
 
-                    is_full = (not do_subsample) or gen==0 or gen==generations-1 or (gen % full_sweep_every == 0)
+                    # Do not force a full scan on generation zero (or on the
+                    # last generation): on a multi-million-word list that
+                    # means the first visible progress update can be minutes
+                    # away.  Large lists use a bounded sample each generation;
+                    # exact counts are restored in the final candidate pass.
+                    is_full = _ga_uses_full_sweep(
+                        gen, do_subsample, full_sweeps_enabled, full_sweep_every
+                    )
                     if is_full:
                         self.active_words = self.base_words
                         scale = 1.0
+                        phase_label = "full"
                     else:
-                        step = max(2, int(round(1.0/word_sample_frac)))
-                        # Only re-roll the subsample phase offset once per
-                        # full_sweep_every block (at the block's first non-full
-                        # generation), not every single generation. Randomizing
-                        # it every generation created a *new* active_words list
-                        # object each time (new id()), which silently defeated
-                        # _hit_cache (keyed by (id(active_words), chain)) even
-                        # for elites carried over unchanged from the previous
-                        # generation, and in multi-GPU mode forced a fresh
-                        # pickled re-upload of the subsampled wordlist to every
-                        # worker process every generation instead of once per
-                        # block.
-                        if gen % full_sweep_every == 1 or self._sample_offset is None:
-                            self._sample_offset = random.randint(0, step-1)
-                        self.active_words = self.base_words[self._sample_offset::step]
-                        scale = len(self.base_words) / max(1, len(self.active_words))
+                        step = max(2, int(math.ceil(1.0 / effective_sample_frac)))
+                        # Keep the exact same lazy range-view object for all
+                        # generations in a sample block.  Recreating the view
+                        # each generation changed id(active_words), invalidated
+                        # every cache entry, and retained useless stale hit maps.
+                        starts_new_sample_block = (
+                            (full_sweeps_enabled and gen % full_sweep_every == 1)
+                            or (not full_sweeps_enabled and gen % full_sweep_every == 0)
+                        )
+                        if self._sample_offset is None or starts_new_sample_block:
+                            self._sample_offset = random.randint(0, step - 1)
+                        sample_key = (self._sample_offset, step)
+                        if self._sample_words_view is None or self._sample_words_key != sample_key:
+                            self._sample_words_view = self.base_words[self._sample_offset::step]
+                            self._sample_words_key = sample_key
+                        self.active_words = self._sample_words_view
+                        scale = base_word_count / max(1, len(self.active_words))
+                        phase_label = "sample"
 
+                    budget_left = max(0.0, time_budget - (time.time() - start))
+                    pbar.set_postfix({"budget": f"{budget_left:.0f}s", "scan": phase_label}, refresh=True)
+                    log_info(
+                        f"[S3]    Generation {gen + 1}/{generations}: {phase_label} scan "
+                        f"of {len(self.active_words):,}/{base_word_count:,} words; "
+                        f"budget left={budget_left:.0f}s"
+                    )
                     hit_words = self.evaluate_population(pop)
-                    raw = {c: len(s) for c, s in hit_words.items()}
+                    raw = {c: _hit_count(hits) for c, hits in hit_words.items()}
                     raw_scaled = raw if scale==1.0 else {c: int(round(h*scale)) for c,h in raw.items()}
                     self._update_sig_registry(raw_scaled)
                     for cs, hits in raw_scaled.items():
@@ -559,18 +673,42 @@ class GeneticRuleEvolver:
                     # the concentrator/Pareto sense: a chain that duplicates coverage already
                     # provided by a better individual contributes ~0 fitness, regardless of its
                     # own raw hit count, so the population stops rewarding near-duplicates.
-                    # (Uses raw unscaled hit_words — the sets are only ever compared against
-                    # each other within this same generation/same word sample, so scaling
-                    # doesn't matter here, only for the cross-generation bookkeeping above.)
-                    order = sorted(pop, key=lambda ind: -len(hit_words.get(' '.join(ind), ())))
-                    covered = set()
+                    # (Uses raw, unscaled hit_words — bitmaps or legacy sets are only
+                    # compared within this same generation/sample, so scaling matters only
+                    # for cross-generation bookkeeping above.)
+                    order = sorted(pop, key=lambda ind: -_hit_count(hit_words.get(' '.join(ind), ())))
+                    bitmap_mode = any(_is_hit_bitmap(v) for v in hit_words.values())
+                    if bitmap_mode:
+                        exemplar = next(v for v in hit_words.values() if _is_hit_bitmap(v))
+                        covered = np.zeros_like(exemplar)
+                    else:
+                        covered = set()
                     marginal = {}
                     for ind in order:
                         cs_i = ' '.join(ind)
-                        s = hit_words.get(cs_i, set())
-                        gain = len(s - covered)
-                        marginal[cs_i] = gain
-                        covered |= s
+                        hits = hit_words.get(cs_i, set())
+                        if bitmap_mode:
+                            if _is_hit_bitmap(hits):
+                                marginal[cs_i] = _hit_count(np.bitwise_and(hits, np.bitwise_not(covered)))
+                                np.bitwise_or(covered, hits, out=covered)
+                            elif hits:
+                                # Legacy/test engines may still return sets.
+                                # Convert only non-empty fallbacks into the
+                                # same compact representation.
+                                idx = np.fromiter((int(i) for i in hits), dtype=np.uint32)
+                                temp = np.zeros_like(covered)
+                                np.bitwise_or.at(
+                                    temp, idx >> 3,
+                                    np.left_shift(np.uint8(1), (idx & 7).astype(np.uint8)),
+                                )
+                                marginal[cs_i] = _hit_count(np.bitwise_and(temp, np.bitwise_not(covered)))
+                                np.bitwise_or(covered, temp, out=covered)
+                            else:
+                                marginal[cs_i] = 0
+                        else:
+                            gain = len(hits - covered)
+                            marginal[cs_i] = gain
+                            covered |= hits
 
                     # Novelty bonus now checks functional-signature membership (_sig_is_covered)
                     # instead of an exact string match against known_rules. A syntactically
@@ -632,7 +770,7 @@ class GeneticRuleEvolver:
                         keep = [list(ind) for ind,_ in fitness[:self.pop_size-n_ref]]
                         pop = keep+refresh
                         pbar.update(1)
-                        pbar.set_postfix({"best":cyan(str(best)), "new":cyan(str(len(all_new))), "sigs":cyan(str(len(self._sig_to_best))), "spd":green(spd), "stag":yellow("REFRESH")}, refresh=False)
+                        pbar.set_postfix({"budget": f"{max(0.0, time_budget - (time.time()-start)):.0f}s", "best":cyan(str(best)), "new":cyan(str(len(all_new))), "sigs":cyan(str(len(self._sig_to_best))), "spd":green(spd), "stag":yellow("REFRESH")}, refresh=False)
                         continue
                     elites = [list(ind) for ind,_ in fitness[:n_elite]]
                     next_pop = elites[:]
@@ -662,40 +800,64 @@ class GeneticRuleEvolver:
                             next_pop.append(list(ind)); next_set.add(ind)
                     pop = next_pop[:self.pop_size]
                     pbar.update(1)
-                    pbar.set_postfix({"best":cyan(str(best)), "new":cyan(str(len(all_new))), "sigs":cyan(str(len(self._sig_to_best))), "spd":green(spd)}, refresh=False)
+                    pbar.set_postfix({"budget": f"{max(0.0, time_budget - (time.time()-start)):.0f}s", "best":cyan(str(best)), "new":cyan(str(len(all_new))), "sigs":cyan(str(len(self._sig_to_best))), "spd":green(spd)}, refresh=False)
         finally:
+            try:
+                budget_stop.set()
+                budget_thread.join(timeout=2.0)
+            except Exception:
+                pass
             self._stop_prefetch()
 
-        # Final correction pass: re-verify every distinct rule chain we ever
-        # credited against the FULL base_words in one batch, so counts that
-        # came from a subsampled generation (only ever an estimate, scaled by
-        # 1/frac) get replaced with exact figures before we return. This is a
-        # single bounded sweep over the deduped set of winners, not per
-        # generation, so it stays cheap even though it's a full-wordlist pass.
+        # Correct sampled hit estimates against the full wordlist.  Do this
+        # in small candidate batches: keeping a bitmap for every chain ever
+        # seen (potentially thousands) at once can itself exceed RAM on a
+        # multi-million-word target list.
         if do_subsample and all_new and not _kb.quit_requested:
-            log_info(f"[S3]    Verifying {len(all_new):,} candidate chain(s) against the full wordlist...")
-            self.active_words = self.base_words
             verify_chains = list(all_new.keys())
-            hit_words = {}
+            verify_batch_size = max(16, min(64, max(16, self.pop_size // 4)))
+            n_verify_batches = (len(verify_chains) + verify_batch_size - 1) // verify_batch_size
+            log_info(
+                f"[S3]    Exact verification: {len(verify_chains):,} candidate chain(s) "
+                f"against {base_word_count:,} words in {n_verify_batches:,} bounded batch(es)..."
+            )
+            self.active_words = self.base_words
             engines = self.gpu_engine.engines if isinstance(self.gpu_engine, MultiGPUEngine) else [self.gpu_engine]
             engines = [e for e in engines if not getattr(e, 'disabled', False)]
+            exact_counts = Counter()
             if engines:
                 for eng in engines:
                     self._ensure_base_words_cached(eng)
-                hit_words = {c: set() for c in verify_chains}
-                if len(engines) == 1:
-                    self._eval_on_engine(engines[0], verify_chains, hit_words)
-                else:
-                    n = len(engines)
-                    chunk = max(1, (len(verify_chains) + n - 1) // n)
-                    slices = [verify_chains[i*chunk:(i+1)*chunk] for i in range(n)]
-                    with concurrent.futures.ThreadPoolExecutor(max_workers=n) as pool:
-                        futs = [pool.submit(self._eval_on_engine, eng, sl, hit_words)
-                                for eng, sl in zip(engines, slices) if sl]
-                        for f in futs:
-                            try: f.result()
-                            except Exception as exc: log_warn(f"[S3]    Verify worker error: {exc}")
-                all_new = Counter({c: len(s) for c, s in hit_words.items() if s})
+                with tqdm(total=len(verify_chains), desc=green("  S3 VERIFY "), unit="chain",
+                          ncols=ncols, leave=False) as verify_bar:
+                    for offset in range(0, len(verify_chains), verify_batch_size):
+                        if _kb.poll():
+                            break
+                        batch = verify_chains[offset:offset + verify_batch_size]
+                        if len(engines) == 1:
+                            batch_counts = self._eval_counts_on_engine(engines[0], batch)
+                        else:
+                            slices = self.gpu_engine.weighted_split(batch, kind='ga', engines=engines)
+                            batch_counts = {}
+                            def _verify_slice(eng, sl):
+                                return self._eval_counts_on_engine(eng, sl)
+                            with concurrent.futures.ThreadPoolExecutor(max_workers=len(engines)) as pool:
+                                futs = [pool.submit(_verify_slice, eng, sl)
+                                        for eng, sl in zip(engines, slices) if sl]
+                                for f in futs:
+                                    try:
+                                        batch_counts.update(f.result())
+                                    except Exception as exc:
+                                        log_warn(f"[S3]    Verify worker error: {exc}")
+                        for chain, count in batch_counts.items():
+                            if count:
+                                exact_counts[chain] = int(count)
+                        verify_bar.update(len(batch))
+                        verify_bar.set_postfix({
+                            "batch": f"{min(offset + len(batch), len(verify_chains)):,}/{len(verify_chains):,}",
+                            "kept": len(exact_counts),
+                        }, refresh=False)
+            all_new = exact_counts
 
         elapsed = time.time()-start
         log_info(f"[S3]    Evolution complete — {bold(green(str(len(all_new))))} unique chains passed bloom filter  ({bold(cyan(str(len(self._sig_to_best))))} distinct functional signatures)  ({elapsed:.1f}s, {last_gen+1} generation(s))")

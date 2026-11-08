@@ -356,9 +356,40 @@ class MultiGPUEngine:
         self._prune_disabled()
         return results
 
+    def release_word_cache(self):
+        """Release cached packed word views on every active GPU engine."""
+        for eng in list(self.engines):
+            try:
+                release = getattr(eng, "release_word_cache", None)
+                if release is not None:
+                    release()
+            except Exception as exc:
+                log_warn(f"[GPU]  Could not release cached word views: {exc}")
+
+    def release_run_references(self):
+        """Release all run-scoped SharedMemory references on every worker."""
+        for eng in list(self.engines):
+            try:
+                release = getattr(eng, "release_run_references", None)
+                if release is not None:
+                    release()
+                else:
+                    self._release_word_cache_fallback(eng)
+            except Exception as exc:
+                log_warn(f"[GPU]  Could not release run references: {exc}")
+
+    @staticmethod
+    def _release_word_cache_fallback(eng):
+        release = getattr(eng, "release_word_cache", None)
+        if release is not None:
+            release()
+
     def shutdown(self):
         """Cleanly terminate every worker process. Safe to call multiple
         times / on partially-initialised state."""
+        # Release word views and target-capturing callbacks while workers are
+        # responsive, then allow each worker to exit cleanly before hard-kill.
+        self.release_run_references()
         for eng in self.engines:
             try: eng.terminate()
             except Exception: pass

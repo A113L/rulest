@@ -31,7 +31,8 @@ class GPUExtractor:
                  genetic=False, genetic_generations=50, genetic_pop=200, genetic_elite=0.15,
                  token_strip=False, token_strip_min_stem=4, token_strip_max_prefix=4,
                  token_strip_max_suffix=4, token_strip_min_leet_amb=3,
-                 token_strip_workers=0, token_strip_chunk_size=0, rng_seed=None):
+                 token_strip_workers=0, token_strip_chunk_size=0,
+                 token_strip_bloom_mb=0, rng_seed=None):
         self.base_count = base_count
         self.target_count = target_count
         self.user_max_depth = max_depth
@@ -52,6 +53,7 @@ class GPUExtractor:
         self.token_strip_min_leet_amb = token_strip_min_leet_amb
         self.token_strip_workers = token_strip_workers
         self.token_strip_chunk_size = token_strip_chunk_size
+        self.token_strip_bloom_mb = token_strip_bloom_mb
         self.params = calculate_dynamic_parameters(base_count, target_count, None, target_hours,
                                                    bloom_mb_override=bloom_mb, bloom_no_shard=bloom_no_shard)
         self.params['MAX_CHAIN_DEPTH'] = self.user_max_depth
@@ -115,16 +117,20 @@ class GPUExtractor:
         if self.token_strip:
             log_section("STAGE 0 — Token-Strip Rule Extraction (Core + Insert)")
             with stage_profiler.track("STAGE 0 — Token-Strip", unit="word") as _s0t:
-                base_set_ts = set(base_words)
-                log_info(f"[S0]    {len(target_words):,} target words  base {len(base_set_ts):,}  min-stem={self.token_strip_min_stem}  prefix={self.token_strip_max_prefix}  suffix={self.token_strip_max_suffix}  leet-amb={self.token_strip_min_leet_amb}")
+                n_base = len(base_words)
+                log_info(f"[S0]    {len(target_words):,} target words  base {n_base:,}  min-stem={self.token_strip_min_stem}  prefix={self.token_strip_max_prefix}  suffix={self.token_strip_max_suffix}  leet-amb={self.token_strip_min_leet_amb}  bloom-mb={self.token_strip_bloom_mb}")
                 s0_max_depth = min(self.user_max_depth, MAX_HASHCAT_CHAIN)
-                ts_all = extract_token_strip_rules(target_words, base_set_ts, max_depth=s0_max_depth,
+                # Pass the raw list so token_strip can build either an exact set
+                # or a compact Bloom filter (avoids a temporary full set[str]
+                # when the user requested the low-RAM path).
+                ts_all = extract_token_strip_rules(target_words, base_words, max_depth=s0_max_depth,
                                                    min_stem_len=self.token_strip_min_stem,
                                                    max_prefix_len=self.token_strip_max_prefix,
                                                    max_suffix_len=self.token_strip_max_suffix,
                                                    max_leet_ambiguity=self.token_strip_min_leet_amb,
                                                    workers=self.token_strip_workers,
-                                                   chunk_size=self.token_strip_chunk_size)
+                                                   chunk_size=self.token_strip_chunk_size,
+                                                   bloom_mb=self.token_strip_bloom_mb)
                 for r in ts_all:
                     d = len(r.split())
                     if d==1: ts_singles.append(r)
@@ -198,7 +204,6 @@ class GPUExtractor:
         if seed_chains and self.user_max_depth<2: log_warn(f"[SEED] {len(seed_chains)} chain seed(s) ignored — requires --max-depth >= 2")
 
         worker_state.p0_worker_base_set = set()
-        worker_state.p0_worker_base_by_len = {}
 
         if not base_words or not target_words:
             log_warn("Empty wordlist(s), aborting extraction")
