@@ -78,6 +78,7 @@ VALUE_OPTIONS = {
     "token_strip_min_leet_amb": "--token-strip-min-leet-amb",
     "token_strip_workers": "--token-strip-workers",
     "token_strip_chunk_size": "--token-strip-chunk-size",
+    "token_strip_bloom_mb": "--token-strip-bloom-mb",
     "genetic_generations": "--genetic-generations", "genetic_pop": "--genetic-pop",
     "genetic_elite": "--genetic-elite", "select_mode": "--select-mode",
     "select_budget": "--select-budget", "select_budgets": "--select-budgets",
@@ -440,6 +441,20 @@ def build_command(options: dict, run_dir: Path):
         if value is None or value == "":
             continue
         cmd.extend([flag, str(value)])
+    # The engine's --seed option fixes Python/NumPy RNG state and pins
+    # PYTHONHASHSEED via its early re-exec path. Keep it optional so existing
+    # clients retain the engine's default non-deterministic behaviour.
+    rng_seed_raw = options.get("rng_seed")
+    if rng_seed_raw not in (None, ""):
+        if isinstance(rng_seed_raw, bool):
+            raise ValueError("RNG seed must be an integer from 0 to 4294967295.")
+        rng_seed_text = str(rng_seed_raw).strip()
+        if not re.fullmatch(r"[0-9]{1,10}", rng_seed_text):
+            raise ValueError("RNG seed must be an integer from 0 to 4294967295.")
+        rng_seed = int(rng_seed_text)
+        if rng_seed > 0xFFFFFFFF:
+            raise ValueError("RNG seed must be between 0 and 4294967295.")
+        cmd.extend(["--seed", str(rng_seed)])
     seed = UPLOADS_META.get("seed")
     if seed:
         cmd.extend(["--seed-rules", str(seed["path"])])
@@ -550,7 +565,7 @@ class RulestHTTPServer(ThreadingHTTPServer):
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "RulestGUI/1.3"
+    server_version = "RulestGUI/1.4"
 
     def log_message(self, fmt, *args):
         # Keep the terminal clean; application activity is in the browser log.
